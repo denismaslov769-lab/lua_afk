@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Новый рисованный грузовик во вкладке Авто фарм (крутятся колёса, дым, фара, цвета под тему). Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
+-- @changelog: Новый виджет бота во вкладке Авто фарм (дорога, скорость, расстояние, прицеп, прогресс, кнопка запуска). Частицы Arizona и Hearts. ПКМ - Убрать фон у своих частиц. Сцепка: прицеп далеко или за забором - бот едет к нему в объезд и быстрее, без качелей вперёд-назад. Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.4.3')
+script_version('2.4.4')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.4.3'
+local SCRIPT_VERSION = '2.4.4'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -57,6 +57,7 @@ local cfg = inicfg.load({
         rainbow = false,
         mode    = 0,        -- 0 = точки, 1 = свои картинки
         images  = '',       -- выбранные картинки через |
+        cutbg   = '',       -- картинки, у которых убирается фон
         spin    = true,
         tint    = false,
     },
@@ -1132,7 +1133,7 @@ local function hitchControl(car)
     local kx, ky = getOffsetFromCarInWorldCoords(tr, 0, tg.front - 1.4, 0)
     local tfx, tfy = carBasis(tr)
     local hx, hy = getOffsetFromCarInWorldCoords(car, 0, -(g.back - 1.8), 0)
-    local cx, cy = getCarCoordinates(car)
+    local cx, cy, cz = getCarCoordinates(car)
     local fx, fy = carBasis(car)
     local headErr = math.deg(math.acos(clamp(fx * tfx + fy * tfy, -1, 1)))
     local dHK = getDistanceBetweenCoords2d(hx, hy, kx, ky)
@@ -1171,9 +1172,11 @@ local function hitchControl(car)
 
     -- Стоим перед прицепом и смотрим в ту же сторону - сразу задним ходом,
     -- даже если до прицепа далеко (нужен хоть какой-то разгон для выравнивания)
-    if (hitch.phase == 'approach' or hitch.phase == 'align') and along < 120
+    -- (только если до прицепа не дальше 45 м и между седлом и прицепом нет забора/стены)
+    if (hitch.phase == 'approach' or hitch.phase == 'align') and along < 45
         and ((along > 8 and math.abs(e) < eTol and headErr < 30)
-          or (along > 0 and math.abs(e) < 1 and headErr < 10)) then
+          or (along > 0 and math.abs(e) < 1 and headErr < 10))
+        and clearLine(hx, hy, cz + 0.8, kx, ky, cz + 0.8) then
         hitch.phase, hitch.st = 'reverse', {}
         log(string.format('[hitch] на линии, сдаю назад: вдоль %.1f, вбок %.2f, курс %.0f', along, e, headErr))
     end
@@ -1188,6 +1191,31 @@ local function hitchControl(car)
         if st.recover then
             if now < st.recover then keys(0, 0, 0.8) return end
             st.recover, st.moved = nil, now
+        end
+        -- Далеко от прицепа или упёрлись (забор, стена) - едем обычным ботом:
+        -- он объезжает препятствия, ищет дорогу и сам выбирается из упора.
+        local dA = getDistanceBetweenCoords2d(cx, cy, ax, ay)
+        if st.far and dA < st.farExit then
+            st.far, st.moved, st.fails = nil, now, 0
+            bot.wx, bot.vt, bot.man, bot.recover, bot.stuckSince, bot.commit, bot.route, bot.turnAt = nil, nil, nil, nil, nil, nil, nil, nil
+            log(string.format('[hitch] доехал до прицепа ботом, до точки %.0f м', dA))
+        elseif not st.far and dA > 12 and (dA > 40 or (st.fails or 0) >= 2) then
+            st.far, st.farExit = true, (dA > 40) and 22 or 8
+            st.best, st.bestT = dA, now
+            bot.wx, bot.vt, bot.man, bot.recover, bot.stuckSince, bot.commit, bot.route, bot.turnAt = nil, nil, nil, nil, nil, nil, nil, nil
+            bot.nextPlan, bot.manCooldown = 0, 0
+            log(string.format('[hitch] еду к прицепу ботом: до точки %.0f м, упоров %d', dA, st.fails or 0))
+        end
+        if st.far then
+            hitch.start = now                                -- 2.5 минуты считаем от прицепа
+            if dA < st.best - 4 then st.best, st.bestT = dA, now end
+            if now - st.bestT > 40 then return hitchStop('Бот: 40 секунд не получается подъехать к прицепу.') end
+            hitch.status = string.format('Сцепка: еду к прицепу, %d м', math.floor(dA))
+            local rad = cfg.bot.radius
+            cfg.bot.radius = 3                               -- без раннего торможения у точки
+            botControl(car, ax, ay, cz, dA)
+            cfg.bot.radius = rad
+            return
         end
         local proj = (cx - kx) * tfx + (cy - ky) * tfy       -- центр фуры вдоль линии прицепа
         local lat = (cx - kx) * tfy - (cy - ky) * tfx        -- и вбок от неё (> 0 - справа)
@@ -1213,9 +1241,9 @@ local function hitchControl(car)
         st.phase = nil                                       -- сброс разворота
         st.moved = st.moved or now
         if speed > 0.5 then st.moved = now end
-        if now - st.moved > 3 then st.recover = now + 2 return end
-        local v = 6
-        if math.abs(angD) > 25 then v = 3 end                -- крутой поворот - медленно
+        if now - st.moved > 3 then st.recover, st.fails = now + 2, (st.fails or 0) + 1 return end
+        local v = clamp(dA * 0.4, 6, 12)                     -- далеко - быстрее
+        if math.abs(angD) > 25 then v = math.min(v, 4) end   -- крутой поворот - медленно
         if s.fc then v = math.min(v, math.sqrt(2 * 5 * math.max(0, s.fc - 2.5))) end
         local steer = clamp(angD / 28, -1, 1)
         local diff = v - speed
@@ -1269,6 +1297,14 @@ local function hitchControl(car)
     if vf > 0.5 then keys(0, 0, 1) return end
     if speed > 0.4 then hitch.st.moved = now end
     hitch.st.moved = hitch.st.moved or now
+    -- стоим и не едем назад, а до прицепа ещё далеко - упёрлись: заново подъезд (с объездом)
+    if dHK > 4.5 and now - hitch.st.moved > 2.5 then
+        hitch.tries = hitch.tries + 1
+        if hitch.tries > 5 then return hitchStop('Бот: не получилось подъехать к прицепу задом (мешает препятствие).') end
+        log(string.format('[hitch] упёрся задом: до шкворня %.1f', dHK))
+        hitch.phase, hitch.st = 'approach', { fails = 2 }
+        return
+    end
     -- проехали шкворень, но стоим почти на линии - короткая поправка вперёд
     if along < -1 and math.abs(e) < 4 and headErr < 45 then
         hitch.tries = hitch.tries + 1
@@ -1305,8 +1341,8 @@ local function hitchControl(car)
     local steer = clamp((psi - psiD) / 12, -1, 1)
     -- далеко - быстрее, у самого прицепа - аккуратно
     -- плавный профиль: скорость, с которой ещё успеваем затормозить до шкворня
-    local v = clamp(0.8 + math.sqrt(2 * 0.6 * math.max(0, dHK - 2)), 0.8, 4.0)
-    if math.abs(e) > 1 or math.abs(psi - psiD) > 15 then v = math.min(v, 2.0) end
+    local v = clamp(0.8 + math.sqrt(2 * 0.6 * math.max(0, dHK - 2)), 0.8, 6.0)
+    if math.abs(e) > 1 or math.abs(psi - psiD) > 15 then v = math.min(v, (along > 15) and 3.0 or 2.0) end
     local diff = v - speed
     -- быстрее нужного - тормозим газом вперёд (на заднем ходу S - это газ назад)
     local gas = (diff < -0.3) and clamp(-diff * 0.4, 0.25, 1) or 0
@@ -1322,6 +1358,24 @@ end
 local function botThread()
     while true do
         wait((bot.active or hitch.active) and 0 or 100)
+        do -- данные для виджета во вкладке Авто фарм
+            local T = bot.tele or {}
+            bot.tele = T
+            if isCharInAnyCar(PLAYER_PED) then
+                local car = storeCarCharIsInNoSave(PLAYER_PED)
+                T.inCar, T.kmh = true, getCarSpeed(car) * 3.6
+                T.hooked = trailerExists() and isTrailerAttachedToCab(trailer.handle, car)
+            else
+                T.inCar, T.kmh, T.hooked = false, 0, false
+            end
+            T.trailer = trailerExists()
+            if bot.tx and T.inCar then
+                local px, py = getCharCoordinates(PLAYER_PED)
+                T.dist = getDistanceBetweenCoords2d(px, py, bot.tx, bot.ty)
+            else
+                T.dist = nil
+            end
+        end
         if hitch.active then
             -- Сцепка с прицепом (работает и при выключенном боте)
             local typing = sampIsChatInputActive() or sampIsDialogActive() or isSampfuncsConsoleActive()
@@ -1354,7 +1408,7 @@ local function botThread()
                     local manual = cfg.bot.takeover and not typing and (isKeyDown(0x57) or isKeyDown(0x53))
 
                     if not bot.tx or getDistanceBetweenCoords2d(bot.tx, bot.ty, x, y) > 10 then
-                        bot.tx, bot.ty = x, y
+                        bot.tx, bot.ty, bot.dist0 = x, y, dist
                         bot.best, bot.bestTime, bot.gaveUp, bot.arrived = dist, os.clock(), false, false
                         bot.man, bot.recover, bot.wx, bot.commit, bot.turnAt = nil, nil, nil, nil, nil
                     end
@@ -1622,8 +1676,89 @@ local function budget(m)
     if m.cancel then error('cancel', 0) end
 end
 
+-- Убрать фон у картинки частицы: заливка от краёв по похожим соседним пикселям
+-- (работает и с градиентом), потом мелкие островки (искры, надписи) тоже убираются.
+local function cutBackground(src, w, h)
+    local n = w * h
+    local buf = ffi.new('uint8_t[?]', n * 4)
+    ffi.copy(buf, src, n * 4)
+    -- уже прозрачная по краям - не трогаем
+    local border, clear = 0, 0
+    for x = 0, w - 1 do
+        for _, y in ipairs({ 0, h - 1 }) do
+            border = border + 1
+            if buf[(y * w + x) * 4 + 3] < 128 then clear = clear + 1 end
+        end
+    end
+    if clear > border * 0.3 then return buf end
+    local mask = ffi.new('uint8_t[?]', n)                   -- 1 = фон
+    local q = ffi.new('int32_t[?]', n)
+    local qh, qt = 0, 0
+    local function d(i, j)
+        local a, b = i * 4, j * 4
+        return math.abs(buf[a] - buf[b]) + math.abs(buf[a + 1] - buf[b + 1]) + math.abs(buf[a + 2] - buf[b + 2])
+    end
+    local function seed(i) if mask[i] == 0 then mask[i] = 1; q[qt] = i; qt = qt + 1 end end
+    for x = 0, w - 1 do seed(x); seed((h - 1) * w + x) end
+    for y = 0, h - 1 do seed(y * w); seed(y * w + w - 1) end
+    local TH = 34
+    while qh < qt do
+        local i = q[qh]; qh = qh + 1
+        local x, y = i % w, math.floor(i / w)
+        if x > 0 and mask[i - 1] == 0 and d(i, i - 1) < TH then seed(i - 1) end
+        if x < w - 1 and mask[i + 1] == 0 and d(i, i + 1) < TH then seed(i + 1) end
+        if y > 0 and mask[i - w] == 0 and d(i, i - w) < TH then seed(i - w) end
+        if y < h - 1 and mask[i + w] == 0 and d(i, i + w) < TH then seed(i + w) end
+    end
+    -- замкнутые дырки внутри фигуры (не связаны с краем): убираем пиксели,
+    -- цвет которых часто встречается в уже найденном фоне
+    local bins, nbg = {}, 0
+    local function bin(i) local a = i * 4 return math.floor(buf[a] / 32) * 64 + math.floor(buf[a + 1] / 32) * 8 + math.floor(buf[a + 2] / 32) end
+    for i = 0, n - 1 do if mask[i] == 1 then local b = bin(i); bins[b] = (bins[b] or 0) + 1; nbg = nbg + 1 end end
+    local thr = math.max(3, nbg * 0.004)
+    for i = 0, n - 1 do if mask[i] == 0 and (bins[bin(i)] or 0) > thr then mask[i] = 1 end end
+    -- островки: оставляем только крупные куски (>= 10% от самого большого)
+    local comp = ffi.new('int32_t[?]', n)
+    local sizes, nc = {}, 0
+    for i0 = 0, n - 1 do
+        if mask[i0] == 0 and comp[i0] == 0 then
+            nc = nc + 1
+            qh, qt = 0, 1; q[0] = i0; comp[i0] = nc
+            while qh < qt do
+                local i = q[qh]; qh = qh + 1
+                local x, y = i % w, math.floor(i / w)
+                local function go(j) if mask[j] == 0 and comp[j] == 0 then comp[j] = nc; q[qt] = j; qt = qt + 1 end end
+                if x > 0 then go(i - 1) end
+                if x < w - 1 then go(i + 1) end
+                if y > 0 then go(i - w) end
+                if y < h - 1 then go(i + w) end
+            end
+            sizes[nc] = qt
+        end
+    end
+    local big = 0
+    for _, v in ipairs(sizes) do if v > big then big = v end end
+    for i = 0, n - 1 do
+        if mask[i] == 1 or sizes[comp[i]] < big * 0.1 then buf[i * 4 + 3] = 0
+        else
+            -- край: полупрозрачность по похожести на соседний фон
+            local x, y = i % w, math.floor(i / w)
+            local best = 999
+            if x > 0 and mask[i - 1] == 1 then best = math.min(best, d(i, i - 1)) end
+            if x < w - 1 and mask[i + 1] == 1 then best = math.min(best, d(i, i + 1)) end
+            if y > 0 and mask[i - w] == 1 then best = math.min(best, d(i, i - w)) end
+            if y < h - 1 and mask[i + w] == 1 then best = math.min(best, d(i, i + w)) end
+            if best < 999 then
+                buf[i * 4 + 3] = math.floor(buf[i * 4 + 3] * math.min(1, best / 160))
+            end
+        end
+    end
+    return buf
+end
+
 local function addFrame(m, buf, w, h, delay)
     analyze(m, buf, w, h)
+    if m.cutBg then buf = cutBackground(buf, w, h) end
     local tex = makeTexture(buf, w, h)
     if tex == nil then error('не удалось создать текстуру', 0) end
     m.frames[#m.frames + 1], m.delays[#m.delays + 1] = tex, delay
@@ -1894,6 +2029,7 @@ end
 -- Создать объект медиа и поставить загрузку в очередь (идёт по кусочкам в кадрах меню)
 function media.load(path, opt)
     local m = { frames = {}, delays = {}, w = 1, h = 1, done = false, path = path, deadline = 0 }
+    m.cutBg = opt and opt.cutBg or nil
     if not media.ok then m.done, m.err = true, media.err return m end
     local ext = extOf(path)
     m.co = coroutine.create(function()
@@ -2032,6 +2168,68 @@ function media.frame(m, t)
         if cum[mid] < x then lo = mid + 1 else hi = mid end
     end
     return m.frames[lo]
+end
+
+-- Встроенные частицы (белые, без фона): контур рисуется в текстуру со сглаживанием
+local BUILTIN = {
+    arizona = { 1.000,-0.967, 0.802,-0.967, 0.637,-0.949, 0.479,-0.919, 0.240,-0.850, 0.061,-0.776, -0.116,-0.684, -0.284,-0.571, -0.428,-0.450, -0.552,-0.317, -0.666,-0.171, -0.769,-0.006, -0.861,0.185, -0.934,0.398, -0.978,0.593, -1.000,0.802, -1.000,0.963, -0.989,0.967, -0.794,0.879, -0.563,0.806, -0.358,0.761, -0.116,0.736, 0.134,0.736, 0.453,0.776, 0.743,0.853, 0.989,0.952, 0.842,0.817, 0.626,0.666, 0.479,0.589, 0.306,0.519, 0.149,0.472, -0.072,0.431, -0.215,0.420, -0.505,0.431, -0.516,0.424, -0.516,0.409, -0.450,0.207, -0.376,0.053, -0.259,-0.130, -0.123,-0.292, 0.006,-0.409, 0.174,-0.530, 0.376,-0.637, 0.519,-0.692, 0.538,-0.692, 0.541,-0.677, 0.490,-0.461, 0.468,-0.240, 0.468,-0.046, 0.486,0.134, 0.457,0.138, 0.332,0.119, 0.200,0.119, 0.057,0.138, -0.046,0.163, -0.163,0.207, -0.284,0.270, -0.350,0.317, -0.050,0.310, 0.053,0.321, 0.211,0.350, 0.372,0.398, 0.541,0.468, 0.677,0.541, 0.850,0.662, 0.996,0.798, 1.000,0.783, 0.956,0.677, 0.897,0.483, 0.839,0.226, 0.798,-0.094, 0.794,-0.314, 0.813,-0.490, 0.853,-0.651, 0.912,-0.802 },
+}
+do
+    local hp = {}
+    for i = 0, 63 do
+        local t = i / 64 * 2 * math.pi
+        local x = 16 * math.sin(t) ^ 3
+        local y = 13 * math.cos(t) - 5 * math.cos(2 * t) - 2 * math.cos(3 * t) - math.cos(4 * t)
+        hp[#hp + 1] = x / 17; hp[#hp + 1] = -(y + 2.5) / 17
+    end
+    BUILTIN.hearts = hp
+end
+local function rasterPoly(pts, N)
+    local cov = {}
+    for i = 0, N * N - 1 do cov[i] = 0 end
+    local np, SS = #pts / 2, 4
+    for sy = 0, N * SS - 1 do
+        local yy = ((sy + 0.5) / SS) / N * 2 - 1
+        local xs = {}
+        for i = 0, np - 1 do
+            local j = (i + 1) % np
+            local x1, y1, x2, y2 = pts[i * 2 + 1], pts[i * 2 + 2], pts[j * 2 + 1], pts[j * 2 + 2]
+            if (y1 <= yy) ~= (y2 <= yy) then xs[#xs + 1] = x1 + (yy - y1) / (y2 - y1) * (x2 - x1) end
+        end
+        table.sort(xs)
+        local row = math.floor(sy / SS) * N
+        for k = 1, #xs - 1, 2 do
+            local a, b = (xs[k] + 1) / 2 * N, (xs[k + 1] + 1) / 2 * N
+            local ia, ib = math.max(0, math.floor(a)), math.min(N - 1, math.floor(b))
+            for x = ia, ib do
+                local l, r = math.max(a, x), math.min(b, x + 1)
+                if r > l then cov[row + x] = cov[row + x] + (r - l) / SS end
+            end
+        end
+    end
+    local buf = ffi.new('uint8_t[?]', N * N * 4)
+    for i = 0, N * N - 1 do
+        buf[i * 4], buf[i * 4 + 1], buf[i * 4 + 2] = 255, 255, 255
+        buf[i * 4 + 3] = math.floor(math.min(1, cov[i]) * 255 + 0.5)
+    end
+    return buf
+end
+media.builtins = {}
+function media.builtin(kind)
+    local m = media.builtins[kind]
+    if m then return m end
+    m = { frames = {}, delays = { 1 }, w = 96, h = 96, done = true, total = 1, cum = { 1 } }
+    media.builtins[kind] = m
+    local pts = BUILTIN[kind]
+    if not pts then return m end
+    local ok = pcall(function()
+        local px = {}
+        for i = 1, #pts, 2 do px[i], px[i + 1] = pts[i] * 0.94, pts[i + 1] * 0.94 end
+        local tex = makeTexture(rasterPoly(px, 96), 96, 96)
+        if tex ~= nil then m.frames[1] = tex end
+    end)
+    if not ok then m.err = 'не удалось создать' end
+    return m
 end
 
 function media.openFolder(dir)
@@ -2482,17 +2680,27 @@ local function ptSelected()
     return set, order
 end
 
+-- картинки, у которых убирается фон (ПКМ -> Убрать фон)
+function ptState.cutSet()
+    local set = {}
+    for name in tostring(cfg.particles.cutbg or ''):gmatch('[^|]+') do set[name] = true end
+    return set
+end
+
 local function ptReload()
     local _, order = ptSelected()
-    local key = table.concat(order, '|')
+    local cut = ptState.cutSet()
+    local ids = {}
+    for i, name in ipairs(order) do ids[i] = name .. (cut[name] and '#cut' or '') end
+    local key = table.concat(ids, '|')
     if key == ptState.key then return end
     local old = {}
-    for _, e in ipairs(ptState.list) do old[e.name] = e end
+    for _, e in ipairs(ptState.list) do old[e.id or e.name] = e end
     local list = {}
-    for _, name in ipairs(order) do
-        local e = old[name]
-        if e then old[name] = nil
-        else e = { name = name, media = media.load(DIRS.pt .. '\\' .. name, { maxSide = 128, budget = 128 * 128 * 60, maxFrames = 60, fps = 20 }) } end
+    for i, name in ipairs(order) do
+        local e = old[ids[i]]
+        if e then old[ids[i]] = nil
+        else e = { name = name, id = ids[i], media = media.load(DIRS.pt .. '\\' .. name, { maxSide = 128, budget = 128 * 128 * 60, maxFrames = 60, fps = 20, cutBg = cut[name] }) } end
         list[#list + 1] = e
     end
     for _, e in pairs(old) do media.free(e.media) end
@@ -2516,8 +2724,13 @@ local function drawParticles(dl, pos, size)
     local r, g, b = hexToRGB(P.color)
     -- картинки, которые уже загрузились
     local imgs = {}
-    if num(P.mode, 0) == 1 then
+    local mode = num(P.mode, 0)
+    local builtin = mode == 2 or mode == 3                 -- Arizona / Hearts (белые, без фона)
+    if mode == 1 then
         for _, e in ipairs(ptState.list) do if #e.media.frames > 0 then imgs[#imgs + 1] = e.media end end
+    elseif builtin then
+        local m = media.builtin(mode == 2 and 'arizona' or 'hearts')
+        if #m.frames > 0 then imgs[1] = m end
     end
     local spin = P.spin ~= false
     for i = 1, #particles do
@@ -2536,13 +2749,15 @@ local function drawParticles(dl, pos, size)
             local m = imgs[(p.img % #imgs) + 1]
             local tex = media.frame(m, time + p.ph)
             if tex then
-                local tint = (P.tint or P.rainbow) and V4(cr, cg, cb, alpha) or V4(1, 1, 1, alpha)
+                local tint = (P.tint or P.rainbow or builtin) and V4(cr, cg, cb, alpha) or V4(1, 1, 1, alpha)
                 local s = num(P.size, 2) * 7 * p.sz
                 local hw, hh = s, s * m.h / math.max(1, m.w)
                 if hh > s then hw, hh = s * m.w / math.max(1, m.h), s end
                 local cx, cy = pos.x + p.x, pos.y + p.y
                 if spin then
-                    local ca, sa = math.cos(p.rot), math.sin(p.rot)
+                    -- встроенные значки не крутятся целиком, а плавно покачиваются
+                    local rot = builtin and math.sin(time * 1.6 + p.ph) * 0.35 or p.rot
+                    local ca, sa = math.cos(rot), math.sin(rot)
                     local function pt(x, y) return vec(cx + x * ca - y * sa, cy + x * sa + y * ca) end
                     dl:AddImageQuad(tex, pt(-hw, -hh), pt(hw, -hh), pt(hw, hh), pt(-hw, hh),
                         vec(0, 0), vec(1, 0), vec(1, 1), vec(0, 1), U32(tint))
@@ -2558,23 +2773,108 @@ local function drawParticles(dl, pos, size)
 end
 
 -- Вкладки ----------------------------------------------------------------
-local function drawFarmTab()
-    section('Бот дальнобойщик')
+-- Виджет бота: сцена с дорогой и грузовиком, статус, скорость, расстояние,
+-- прицеп, прогресс поездки и кнопка запуска.
+local function botWidget()
     local dl = imgui.GetWindowDrawList()
     local p  = imgui.GetCursorScreenPos()
     local w  = imgui.GetContentRegionAvail().x
-    local h  = 92
-    dl:AddRectFilled(p, vec(p.x + w, p.y + h), U32(V4(ACCENT.x, ACCENT.y, ACCENT.z, LIGHT and 0.16 or 0.10)), 10)
-    local sway = bot.active and math.sin(imgui.GetTime() * 12) * 0.6 or 0
-    drawTruck(dl, p.x + 12, p.y + 12 + sway, 2.25, bot.active)
-    dl:AddText(vec(p.x + 170, p.y + 22), U32(TEXT), 'Статус:')
-    local scol = bot.active and readable(GREEN) or (cfg.bot.enabled == true and readable(YELLOW) or DIM)
-    dl:AddText(vec(p.x + 170, p.y + 44), U32(scol), tostring(bot.status or ''))
+    local h  = 150
+    local time = imgui.GetTime()
+    local T = bot.tele or {}
+    local running = cfg.bot.enabled == true or hitch.active
+    local moving = bot.active and (T.kmh or 0) > 1
+    local rnd = 12
+
+    -- карточка
+    dl:AddRectFilled(p, vec(p.x + w, p.y + h), U32(mixV(CHILD, ACCENT, LIGHT and 0.06 or 0.08, 1)), rnd)
+    dl:AddRect(p, vec(p.x + w, p.y + h), U32(V4(ACCENT.x, ACCENT.y, ACCENT.z, running and 0.55 or 0.25)), rnd)
+
+    -- сцена: небо, холмы, дорога с разметкой (едет, когда едет бот)
+    local sx0, sy0, sx1, sy1 = p.x + 8, p.y + 8, p.x + 8 + math.min(180, w * 0.38), p.y + h - 8
+    anim.roadOff = ((anim.roadOff or 0) + (moving and imgui.GetIO().DeltaTime * (20 + math.min(T.kmh or 0, 120) * 1.2) or 0)) % 1000
+    local off = anim.roadOff
+    dl:AddRectFilled(vec(sx0, sy0), vec(sx1, sy1), U32(mixV(BGV, ACCENT, LIGHT and 0.10 or 0.14, 1)), 9)
+    dl:PushClipRect(vec(sx0, sy0), vec(sx1, sy1), true)
+    local roadY = sy1 - 26
+    for i = 0, 6 do                                         -- дальние холмы
+        local hx = sx0 + ((i * 70 - off * 0.25) % 420) - 60
+        dl:AddCircleFilled(vec(hx, roadY + 18), 46, U32(mixV(BGV, ACCENT, LIGHT and 0.22 or 0.26, 1)), 32)
+    end
+    for i = 0, 8 do                                         -- столбики у дороги
+        local px = sx0 + ((i * 48 - off * 0.6) % 432) - 24
+        dl:AddRectFilled(vec(px, roadY - 14), vec(px + 2, roadY), U32(mixV(BGV, TEXT, 0.35, 1)))
+        dl:AddRectFilled(vec(px - 1, roadY - 15), vec(px + 3, roadY - 12), U32(readable(YELLOW)), 1)
+    end
+    dl:AddRectFilled(vec(sx0, roadY), vec(sx1, sy1), U32(V4(0.20, 0.21, 0.25, 1)))
+    dl:AddRectFilled(vec(sx0, roadY), vec(sx1, roadY + 2), U32(V4(0.45, 0.47, 0.52, 1)))
+    for i = 0, 12 do                                        -- разметка
+        local dx = sx0 + ((i * 30 - off) % 390) - 30
+        dl:AddRectFilled(vec(dx, roadY + 12), vec(dx + 16, roadY + 14), U32(V4(0.95, 0.95, 0.95, 0.85)), 1)
+    end
+    local s = math.min(2.0, (sx1 - sx0 - 16) / 60)
+    local sway = moving and math.sin(time * 14) * 0.5 or 0
+    drawTruck(dl, sx0 + (sx1 - sx0 - 58 * s) / 2, roadY + 9 - 32.2 * s + sway, s, moving)
+    dl:PopClipRect()
+
+    -- правая часть: заголовок, статус, плитки, прогресс
+    local x0, x1 = sx1 + 14, p.x + w - 12
+    dl:PushClipRect(vec(x0, p.y), vec(x1, p.y + h), true)
+    local stateTxt, stateCol
+    if hitch.active then stateTxt, stateCol = 'СЦЕПКА', readable(YELLOW)
+    elseif bot.active then stateTxt, stateCol = 'ЕДЕТ', readable(GREEN)
+    elseif cfg.bot.enabled == true then stateTxt, stateCol = 'ЖДЁТ', readable(YELLOW)
+    else stateTxt, stateCol = 'ВЫКЛ', DIM end
+    local pulse = (bot.active or hitch.active) and (0.5 + 0.5 * math.sin(time * 5)) or 0
+    local dc = vec(x0 + 5, p.y + 21)
+    if pulse > 0 then dl:AddCircleFilled(dc, 5 + pulse * 4, U32(V4(stateCol.x, stateCol.y, stateCol.z, 0.25 * (1 - pulse))), 20) end
+    dl:AddCircleFilled(dc, 5, U32(stateCol), 16)
+    dl:AddText(vec(x0 + 16, p.y + 12), U32(TEXT), 'Дальнобойщик')
+    local cw = imgui.CalcTextSize(stateTxt).x + 16
+    dl:AddRectFilled(vec(x1 - cw, p.y + 10), vec(x1, p.y + 32), U32(V4(stateCol.x, stateCol.y, stateCol.z, 0.18)), 11)
+    dl:AddText(vec(x1 - cw + 8, p.y + 13), U32(stateCol), stateTxt)
+    dl:AddText(vec(x0, p.y + 38), U32(DIM), tostring(bot.status or ''))
+
+    local tiles = {}
+    tiles[1] = { 'Скорость', T.inCar and string.format('%d км/ч', math.floor((T.kmh or 0) + 0.5)) or '-', TEXT }
+    tiles[2] = { 'До цели', (running and T.dist) and (T.dist >= 1000 and string.format('%.1f км', T.dist / 1000) or string.format('%d м', math.floor(T.dist))) or '-', TEXT }
+    if T.hooked then tiles[3] = { 'Прицеп', 'прицеплен', readable(GREEN) }
+    elseif hitch.active then tiles[3] = { 'Прицеп', 'цепляю...', readable(YELLOW) }
+    elseif T.trailer then tiles[3] = { 'Прицеп', 'отцеплен', TEXT }
+    else tiles[3] = { 'Прицеп', 'нет', DIM } end
+    local gap = 8
+    local tw = (x1 - x0 - gap * 2) / 3
+    local ty = p.y + 62
+    for i, t in ipairs(tiles) do
+        local tx = x0 + (i - 1) * (tw + gap)
+        dl:AddRectFilled(vec(tx, ty), vec(tx + tw, ty + 46), U32(V4(SURF.x, SURF.y, SURF.z, LIGHT and 0.55 or 0.65)), 8)
+        dl:AddText(vec(tx + 6, ty + 5), U32(DIM), t[1])
+        dl:AddText(vec(tx + 6, ty + 24), U32(t[3]), t[2])
+    end
+    -- прогресс поездки
+    local py = p.y + 122
+    local prog = 0
+    if running and T.dist and bot.dist0 and bot.dist0 > 1 then prog = clamp(1 - T.dist / bot.dist0, 0, 1) end
+    prog = approach('bw_prog', prog, 4)
+    dl:AddRectFilled(vec(x0, py), vec(x1, py + 6), U32(TRACK), 3)
+    if prog > 0.01 then dl:AddRectFilled(vec(x0, py), vec(x0 + (x1 - x0) * prog, py + 6), U32(ACCENT), 3) end
+    dl:AddText(vec(x0, py + 9), U32(DIM), bot.arrived and 'Прибыл' or string.format('Поездка: %d%%', math.floor(prog * 100 + 0.5)))
+    dl:PopClipRect()
     imgui.Dummy(vec(w, h))
 
-    if toggle('##bot_on', 'Включить бота', ui.botOn) then
-        cfg.bot.enabled = ui.botOn[0]; saveCfg()
+    -- кнопка запуска
+    local on = cfg.bot.enabled == true
+    local clicked
+    if on then clicked = grayButton('Остановить бота##bw_run', vec(-1, 34))
+    else clicked = imgui.Button('Запустить бота##bw_run', vec(-1, 34)) end
+    if clicked then
+        cfg.bot.enabled = not on; ui.botOn[0] = cfg.bot.enabled; saveCfg()
     end
+end
+
+local function drawFarmTab()
+    section('Бот дальнобойщик')
+    botWidget()
 
     section('Куда ехать')
     if segmented('bot_src', ui.botSource, { 'Авто', 'Чекпоинт', 'Метка на карте' }) then
@@ -2725,6 +3025,16 @@ local function ptToggle(name)
     local out = {}
     for _, g in ipairs(scan.pt) do if set[g.name] then out[#out + 1] = g.name end end
     cfg.particles.images = table.concat(out, '|'); saveCfg(); ptReload()
+end
+
+function ptState.cutToggle(name)
+    local set = ptState.cutSet()
+    set[name] = not set[name] or nil
+    local out = {}
+    for k in pairs(set) do out[#out + 1] = k end
+    cfg.particles.cutbg = table.concat(out, '|')
+    if set[name] and not ptSelected()[name] then ptToggle(name) end
+    saveCfg(); ptReload()
 end
 
 -- Подтверждение удаления файла (после пункта "Удалить из папки" в меню на ПКМ)
@@ -2879,26 +3189,34 @@ local function drawParticleSettings()
     local P = cfg.particles
     section('Падающие частицы')
     if toggle('##p_on', 'Включить частицы', ui.pOn) then P.enabled = ui.pOn[0]; saveCfg() end
-    if segmented('p_mode', ui.pMode, { 'Точки', 'Свои картинки' }) then P.mode = ui.pMode[0]; saveCfg(); ptReload() end
+    imgui.Text('Вид частиц:')
+    if segmented('p_mode', ui.pMode, { 'Точки', 'Свои картинки', 'Arizona', 'Hearts' }) then P.mode = ui.pMode[0]; saveCfg(); ptReload() end
+    if ui.pMode[0] >= 2 then
+        hint(ui.pMode[0] == 2 and 'Белый логотип Arizona без фона. Цвет можно поменять ниже.' or 'Белые сердечки без фона. Цвет можно поменять ниже.')
+        if toggle('##p_spin2', 'Покачивание', ui.pSpin) then P.spin = ui.pSpin[0]; saveCfg() end
+    end
     if ui.pMode[0] == 1 then
         imgui.TextDisabled('Отметьте картинки из moonloader\\config\\lua_afk\\particles:')
         imgui.BeginChild('##pt_files', vec(0, 120), true)
         local set = ptSelected()
+        local cut = ptState.cutSet()
         local any = false
         for i, f in ipairs(scan.pt) do
             if not f.dir and not f.video then
                 any = true
-                if imgui.Selectable((set[f.name] and '[x] ' or '[  ] ') .. f.disp .. '##ptf' .. i, set[f.name] == true) then
+                if imgui.Selectable((set[f.name] and '[x] ' or '[  ] ') .. f.disp .. (cut[f.name] and '  (без фона)' or '') .. '##ptf' .. i, set[f.name] == true) then
                     ptToggle(f.name)
                 end
                 contextMenu('##ptctx' .. i, f.disp, {
                     { set[f.name] and 'Убрать из частиц' or 'Добавить в частицы', function() ptToggle(f.name) end },
+                    { cut[f.name] and 'Вернуть фон' or 'Убрать фон', function() ptState.cutToggle(f.name) end },
                     { 'Открыть папку', function() media.openFolder(DIRS.pt) end },
                     { 'Удалить из папки', function() askDelete('pt', f) end },
                 })
             end
         end
         if not any then hint('Папка пуста. Положите туда png/webp/gif (снежинки, сердечки, листья...).') end
+        if any then hint('ПКМ по картинке - Убрать фон: если у картинки есть фон, он вырежется.') end
         imgui.EndChild()
         deleteConfirm('pt')
         folderButtons('pt', DIRS.pt)
