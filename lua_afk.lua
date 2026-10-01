@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Повороты проходит быстрее (точнее считает радиус поворота). Своя карта дорог всего штата (из файлов игры) и свой поиск пути: бот видит маршрут до далёкой метки сразу, учитывает односторонние дороги и трассы, не мечется вперёд-назад. Бот ездит только по дорогам: убрана езда напрямую. Нет продвижения - отъезжает и ищет другой маршрут по дорогам (с разворотом и без), без слепой езды. Метка в стороне от дороги - останавливается у ближайшей точки дороги. Гифки по ссылке или коду встраивания Tenor/Giphy прямо в меню (фон и частицы). Бот больше не сдаётся: если не может приблизиться к метке, пробует другие пути (напрямую вне дорог, отъезд и новый маршрут). Метка вдали от дороги - доезжает до неё по бездорожью. Развязки и развилки: бот едет по самой линии маршрута (не срезает через отбойник), не путает эстакады, быстрее замечает, что ушёл не в ту ветку, и заранее сбрасывает скорость перед изгибами. Сцепка: мало места перед прицепом - бот подъезжает ближе и сдаёт с короткого расстояния, не крутится бесконечно (останавливается с подсказкой). Новый виджет бота во вкладке Авто фарм (дорога, скорость, расстояние, прицеп, прогресс, кнопка запуска). Частицы Arizona и Hearts. ПКМ - Убрать фон у своих частиц. Сцепка: прицеп далеко или за забором - бот едет к нему в объезд и быстрее, без качелей вперёд-назад. Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
+-- @changelog: Бот всегда едет по правой полосе (по данным полос дорог игры), не выезжает на встречку. Повороты проходит быстрее (точнее считает радиус поворота). Своя карта дорог всего штата (из файлов игры) и свой поиск пути: бот видит маршрут до далёкой метки сразу, учитывает односторонние дороги и трассы, не мечется вперёд-назад. Бот ездит только по дорогам: убрана езда напрямую. Нет продвижения - отъезжает и ищет другой маршрут по дорогам (с разворотом и без), без слепой езды. Метка в стороне от дороги - останавливается у ближайшей точки дороги. Гифки по ссылке или коду встраивания Tenor/Giphy прямо в меню (фон и частицы). Бот больше не сдаётся: если не может приблизиться к метке, пробует другие пути (напрямую вне дорог, отъезд и новый маршрут). Метка вдали от дороги - доезжает до неё по бездорожью. Развязки и развилки: бот едет по самой линии маршрута (не срезает через отбойник), не путает эстакады, быстрее замечает, что ушёл не в ту ветку, и заранее сбрасывает скорость перед изгибами. Сцепка: мало места перед прицепом - бот подъезжает ближе и сдаёт с короткого расстояния, не крутится бесконечно (останавливается с подсказкой). Новый виджет бота во вкладке Авто фарм (дорога, скорость, расстояние, прицеп, прогресс, кнопка запуска). Частицы Arizona и Hearts. ПКМ - Убрать фон у своих частиц. Сцепка: прицеп далеко или за забором - бот едет к нему в объезд и быстрее, без качелей вперёд-назад. Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.1')
+script_version('2.5.2')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.1'
+local SCRIPT_VERSION = '2.5.2'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -720,7 +720,7 @@ do
             local X, Y, Z = ffi.new('float[?]', N), ffi.new('float[?]', N), ffi.new('float[?]', N)
             local OFF = ffi.new('uint8_t[?]', N)
             local LS = ffi.new('int32_t[?]', N + 1)
-            local to, len = {}, {}
+            local to, len, lanes = {}, {}, {}
             local E = 0
             for a = 0, 63 do
                 local ar = A[a]
@@ -755,7 +755,7 @@ do
                                     local ta, tn = links[li * 2], links[li * 2 + 1]
                                     local tA = A[ta]
                                     if tA and tn < tA.nv then
-                                        local allow = true
+                                        local allow, lane = true, 0
                                         if nav then
                                             local v = nav[li]
                                             local na, ni = bit.rshift(v, 10), bit.band(v, 1023)
@@ -766,8 +766,9 @@ do
                                                 local lanes = q[11]
                                                 local opp, same = bit.band(lanes, 7), bit.band(bit.rshift(lanes, 3), 7)
                                                 if opp + same > 0 then
-                                                    if att[0] == ta and att[1] == tn then allow = same > 0
-                                                    elseif att[0] == a and att[1] == i then allow = opp > 0 end
+                                                    -- полосы по ходу движения (fwd) и навстречу (back)
+                                                    if att[0] == ta and att[1] == tn then allow, lane = same > 0, 64 + same + opp * 8
+                                                    elseif att[0] == a and att[1] == i then allow, lane = opp > 0, 64 + opp + same * 8 end
                                                 end
                                             end
                                         end
@@ -775,7 +776,7 @@ do
                                             local t = tA.base + tn
                                             local dx, dy, dz = X[t] - X[g], Y[t] - Y[g], Z[t] - Z[g]
                                             E = E + 1
-                                            to[E] = t
+                                            to[E], lanes[E] = t, lane
                                             len[E] = math.sqrt(dx * dx + dy * dy + dz * dz) * ((OFF[t] == 1) and 1.6 or 1)
                                         end
                                     end
@@ -787,8 +788,9 @@ do
                 if a % 8 == 7 then wait(0) end
             end
             LS[N] = E
-            local TO, LEN = ffi.new('int32_t[?]', E + 1), ffi.new('float[?]', E + 1)
-            for e = 1, E do TO[e - 1], LEN[e - 1] = to[e], len[e] end
+            local TO, LEN, LANE = ffi.new('int32_t[?]', E + 1), ffi.new('float[?]', E + 1), ffi.new('uint8_t[?]', E + 1)
+            for e = 1, E do TO[e - 1], LEN[e - 1], LANE[e - 1] = to[e], len[e], lanes[e] end
+            roadmap.LANE = LANE
             roadmap.X, roadmap.Y, roadmap.Z, roadmap.LS, roadmap.TO, roadmap.LEN = X, Y, Z, LS, TO, LEN
             roadmap.n, roadmap.e, roadmap.oneway = N, E, A[0] and A[0].naviLinkOff ~= nil
         end)
@@ -829,7 +831,7 @@ do
         if not goal then return nil end
         local gx, gy, gz = X[goal], Y[goal], Z[goal]
         -- старт: узлы рядом с машиной; те, что позади, - со штрафом за разворот
-        local g, came, closed = {}, {}, {}
+        local g, came, closed, cameE = {}, {}, {}, {}
         local hk, hv, hn = {}, {}, 0
         local function push(v, f)
             hn = hn + 1
@@ -897,7 +899,7 @@ do
                     if not closed[t] then
                         local ng = gv + LEN[e]
                         if not g[t] or ng < g[t] then
-                            g[t], came[t] = ng, v
+                            g[t], came[t], cameE[t] = ng, v, e
                             push(t, ng + h(t))
                         end
                     end
@@ -910,10 +912,22 @@ do
             rev[#rev + 1] = v
             v = came[v]
         end
+        -- смещение вправо от линии дороги на каждом участке (правостороннее движение):
+        -- двусторонняя дорога - правее середины, односторонняя - в правую полосу
+        local LANE, defOff = roadmap.LANE, num(cfg.bot.laneOff, 2.5)
+        local function laneOff(lb)
+            if lb < 64 then return defOff end
+            local fwd, back = bit.band(lb, 7), bit.band(bit.rshift(lb, 3), 7)
+            if back > 0 then return defOff end
+            return (fwd >= 2) and (fwd - 1) * 2.25 or 0
+        end
         local pts = {}
         for k = #rev, 1, -1 do
             local i = rev[k]
-            pts[#pts + 1] = { x = X[i], y = Y[i], z = Z[i] }
+            local nxt = rev[k - 1]
+            local off = defOff
+            if nxt and cameE[nxt] then off = laneOff(LANE[cameE[nxt]]) end
+            pts[#pts + 1] = { x = X[i], y = Y[i], z = Z[i], off = off }
         end
         if #pts < 2 then
             pts[#pts + 1] = { x = tx, y = ty, z = tz }
@@ -1003,7 +1017,7 @@ local function routeUpdate(car, tx, ty, tz, now, speed)
         local k = math.floor(l / 4)
         for j = 1, k - 1 do
             local t = j / k
-            dense[#dense + 1] = { x = a.x + (b.x - a.x) * t, y = a.y + (b.y - a.y) * t, z = a.z + (b.z - a.z) * t }
+            dense[#dense + 1] = { x = a.x + (b.x - a.x) * t, y = a.y + (b.y - a.y) * t, z = a.z + (b.z - a.z) * t, off = a.off }
         end
         dense[#dense + 1] = b
     end
@@ -1044,7 +1058,14 @@ local function routeWaypoint(car, speed, tx, ty)
             local sl = getDistanceBetweenCoords2d(a.x, a.y, b.x, b.y)
             if acc + sl >= L then
                 local t = (sl > 0.01) and (L - acc) / sl or 0
-                return a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, (a.z or cz) + ((b.z or cz) - (a.z or cz)) * t, false
+                local x, y = a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t
+                -- своя (правая) полоса: сдвиг вправо от направления дороги
+                local off = r.noLane and 0 or (a.off or 0)
+                if off ~= 0 and sl > 0.01 then
+                    local ux, uy = (b.x - a.x) / sl, (b.y - a.y) / sl
+                    x, y = x + uy * off, y - ux * off
+                end
+                return x, y, (a.z or cz) + ((b.z or cz) - (a.z or cz)) * t, false
             end
             acc, i = acc + sl, i + 1
         end
@@ -1056,6 +1077,11 @@ local function routeWaypoint(car, speed, tx, ty)
     local px, py, pz, last = at(L)
     while L > 5 do
         if clearLine(cx, cy, cz + 0.6, px, py, pz + 1.2) and corridorClear(car, px, py, pz + 0.4) then break end
+        -- сдвинутая точка в стене (узкая дорога) - пробуем по оси дороги
+        r.noLane = true
+        local qx, qy, qz = at(L)
+        r.noLane = nil
+        if clearLine(cx, cy, cz + 0.6, qx, qy, qz + 1.2) and corridorClear(car, qx, qy, qz + 0.4) then px, py, pz = qx, qy, qz break end
         L = L - 4
         px, py, pz, last = at(L)
     end
@@ -1222,7 +1248,7 @@ local function botControl(car, tx, ty, tz, dist)
 
     if rwx then
         bot.commit, bot.turnAt = nil, nil
-        if cfg.bot.lane then
+        if not (bot.route and bot.route.own) then             -- свой маршрут уже со сдвигом в правую полосу
             local cx, cy, cz = getCarCoordinates(car)
             local dx, dy = rwx - cx, rwy - cy
             local l = math.sqrt(dx * dx + dy * dy)
@@ -1266,7 +1292,7 @@ local function botControl(car, tx, ty, tz, dist)
                 wx, wy = nx, ny
             end
         end
-        if wx and cfg.bot.lane and not direct then
+        if wx and not direct then                            -- всегда правая полоса
             -- Своя полоса: сдвигаем точку вправо от оси дороги (правостороннее движение)
             local cx, cy, cz = getCarCoordinates(car)
             local dx, dy = wx - cx, wy - cy
@@ -3316,15 +3342,11 @@ local function drawFarmTab()
     hint('Визуальный прицеп 591 (виден только вам). Бот на тягаче (Linerunner, Tanker, Roadtrain) встаёт перед прицепом, выравнивается и сдаёт задом до сцепки. Команды: /pricep, /pricep del, /lhitch.')
 
     section('Полоса')
-    if toggle('##bot_lane', 'Держаться своей полосы', ui.botLane) then
-        cfg.bot.lane = ui.botLane[0]; saveCfg()
+    imgui.TextDisabled('Бот всегда едет по правой стороне дороги.')
+    if sliderFloat('Смещение от середины дороги:', '##bot_lane_off', ui.botLaneOff, 1.0, 6.0, '%.1f м') then
+        cfg.bot.laneOff = ui.botLaneOff[0]; saveCfg(); bot.route = nil
     end
-    if ui.botLane[0] then
-        if sliderFloat('Смещение от середины дороги:', '##bot_lane_off', ui.botLaneOff, 1.0, 6.0, '%.1f м') then
-            cfg.bot.laneOff = ui.botLaneOff[0]; saveCfg()
-        end
-        hint('Задевает бордюр - уменьшите смещение, выезжает на встречку - увеличьте.')
-    end
+    hint('Задевает бордюр или обочину - уменьшите смещение, всё ещё заезжает на встречку - увеличьте.')
     hint('Свой автопилот: едет по дорожным узлам игры, светофоров не видит, тормозит перед препятствиями, не срезает углы, разворачивается к метке. Скорость до упора вправо - No Limit. Не работает на Arizona RP.')
 end
 
