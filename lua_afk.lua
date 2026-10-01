@@ -4,7 +4,7 @@
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('0.4.0')
+script_version('0.4.1')
 script_description('Скрипт для Arizona RP: меню, авто спавн, автообновление')
 
 local imgui    = require('mimgui')
@@ -17,12 +17,12 @@ encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
 -- ===================== Настройки =====================
-local SCRIPT_VERSION = '0.4.0'
+local SCRIPT_VERSION = '0.4.1'
 local REPO_RAW    = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/'
 local VERSION_URL = REPO_RAW .. 'version.json'
 local SCRIPT_URL  = REPO_RAW .. 'lua_afk.lua'
 
-local TMP_DIR     = os.getenv('TEMP') or getWorkingDirectory()
+local TMP_DIR     = getWorkingDirectory() .. '\\config'
 local TMP_VERSION = TMP_DIR .. '\\lua_afk_version.json'
 local TMP_SCRIPT  = TMP_DIR .. '\\lua_afk_update.lua'
 
@@ -99,17 +99,29 @@ local upd = {
     error     = nil,
 }
 
+local function ulog(text, manual)
+    print('[update] ' .. u8:decode(text))      -- пишется в moonloader.log
+    if manual then msg(text) end
+end
+
 local function checkUpdates(manual)
+    if not doesDirectoryExist(TMP_DIR) then createDirectory(TMP_DIR) end
     os.remove(TMP_VERSION)
+    ulog('Проверка обновлений...', manual)
     downloadUrlToFile(VERSION_URL .. '?t=' .. os.time(), TMP_VERSION, function(id, status)
         if status ~= dlstatus.STATUS_ENDDOWNLOADDATA then return end
         local data = readFile(TMP_VERSION)
         os.remove(TMP_VERSION)
-        local ok, info = pcall(decodeJson, data or '')
-        if not ok or type(info) ~= 'table' or not info.version then
-            if manual then msg('Не удалось проверить обновления.') end
+        if not data or data == '' then
+            ulog('Ошибка: version.json не скачался (нет доступа к GitHub?).', manual)
             return
         end
+        local ok, info = pcall(decodeJson, data)
+        if not ok or type(info) ~= 'table' or not info.version then
+            ulog('Ошибка: не удалось прочитать version.json.', manual)
+            return
+        end
+        ulog('На GitHub версия ' .. tostring(info.version) .. ', у вас ' .. SCRIPT_VERSION .. '.', manual)
         if isNewer(info.version, SCRIPT_VERSION) then
             upd.latest    = tostring(info.version)
             upd.changelog = info.changelog
@@ -117,7 +129,7 @@ local function checkUpdates(manual)
             upd.state     = 'prompt'
             upd.window[0] = true
         elseif manual then
-            msg('У вас последняя версия: ' .. SCRIPT_VERSION)
+            msg('У вас последняя версия.')
         end
     end)
 end
@@ -138,6 +150,7 @@ local function startDownload()
             else
                 upd.state = 'error'
                 upd.error = 'Не удалось скачать обновление.'
+                ulog('Ошибка: файл скрипта не скачался или повреждён.', true)
             end
         end
     end)
@@ -799,7 +812,8 @@ function main()
 
     -- Проверяем обновления после входа на сервер (когда персонаж заспавнился)
     lua_thread.create(function()
-        while not sampIsLocalPlayerSpawned() do wait(500) end
+        local t = os.clock()
+        while not sampIsLocalPlayerSpawned() and os.clock() - t < 30 do wait(500) end
         wait(1500)
         checkUpdates(false)
     end)
@@ -807,7 +821,7 @@ function main()
     while true do
         wait(0)
 
-        if upd.state == 'installing' and upd.shown >= 0.999 then
+        if upd.state == 'installing' and (upd.shown >= 0.999 or not upd.window[0]) then
             wait(500)
             if installUpdate() then return end
         end
