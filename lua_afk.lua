@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Сцепка в тесноте: вместо кружения вокруг прицепа бот переходит в режим «мало места» - доворачивается вперёд-назад в несколько приёмов и сдаёт седлом прямо на шкворень.
+-- @changelog: Сцепка: режим «мало места» включается только у самого прицепа (до 18 м). Издалека бот снова сначала подъезжает к прицепу обычным автопилотом. Повторный запуск сцепки больше не отменяет её.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.18')
+script_version('2.5.19')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.18'
+local SCRIPT_VERSION = '2.5.19'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1648,8 +1648,11 @@ local function hitchStop(text)
     if text then msg(text) end
 end
 
-local function hitchStart()
-    if hitch.active then hitchStop('Сцепка отменена.') return end
+local function hitchStart(force)
+    if hitch.active then
+        if force then return end                         -- работа: сцепка уже идёт - не отменяем
+        hitchStop('Сцепка отменена.') return
+    end
     if not trailerExists() then msg('Нет прицепа. Заспавните: /pricep') return end
     if not isCharInAnyCar(PLAYER_PED) then msg('Сядьте за руль фуры.') return end
     local car = storeCarCharIsInNoSave(PLAYER_PED)
@@ -1896,7 +1899,7 @@ bot.jobTick = function()
             J.tries, J.given, J.direct = 0, v, nil
             log(string.format('[job] груз уже взят - цепляю выданный прицеп (модель %d)', getCarModel(v)))
             go('hitch', 'Работа: груз уже взят - еду цеплять прицеп.')
-            hitchStart()
+            hitchStart(true)
             return
         elseif now - bot.cargoTaken > 15 then
             bot.cargoTaken = nil
@@ -2027,7 +2030,7 @@ bot.jobTick = function()
                 J.tries, J.given = 0, v
                 log(string.format('[job] выданный прицеп найден: модель %d', getCarModel(v)))
                 go('hitch', 'Работа: нашёл прицеп, цепляю.')
-                hitchStart()
+                hitchStart(true)
                 return
             end
         end
@@ -2056,7 +2059,7 @@ bot.jobTick = function()
             end
             log(string.format('[job] повторная сцепка, попытка %d', J.tries))
             J.t = now
-            hitchStart()
+            hitchStart(true)
         end
     elseif J.phase == 'gate' then
         if not J.scan or now > J.scan then
@@ -2237,6 +2240,11 @@ local function hitchControl(car)
         return
     end
 
+    if now - (hitch.diagT or 0) > 2 then
+        hitch.diagT = now
+        log(string.format('[hitch] сост.: фаза %s%s, до шкворня %.1f, вдоль %.1f, вбок %.1f, курс %.0f, свободно %.0f, скорость %.1f',
+            tostring(hitch.phase), hitch.tightMode and ' (тесно)' or '', dHK, along, e, headErr, hitch.free or -1, speed))
+    end
     if hitch.phase ~= hitch.lastPhase then
         hitch.lastPhase = hitch.phase
         log(string.format('[hitch] фаза %s: до шкворня %.1f, вдоль %.1f, вбок %.2f, курс %.0f', hitch.phase, dHK, along, e, headErr))
@@ -2263,17 +2271,23 @@ local function hitchControl(car)
     if tight then
         -- Нехватку места проверяем только при подъезде. Если уже сдаём назад или
         -- поправляемся, фура сама стоит перед прицепом - место, значит, есть.
-        if maxP < g.back + 2.5 and hitch.phase == 'approach' and not hitch.reversed and not hitch.tightMode then
+        if maxP < g.back + 2.5 and hitch.phase == 'approach' and not hitch.reversed and not hitch.tightMode and dHK < 18 then
             hitch.tightMode, hitch.tt = true, { phase = 'eval', since = now }
             log(string.format('[hitch] перед прицепом %.0f м - режим «мало места»', hitch.free))
         end
-        reach = maxP
+        reach = math.max(maxP, g.back + 2.5)
     end
     -- Крутимся на месте слишком долго - места для разворота нет
     -- Крутимся вокруг прицепа больше 8 с - тоже тесно: переходим в режим «мало места»
-    if not hitch.tightMode and hitch.spin and hitch.spin > 8 and (hitch.phase == 'approach' or hitch.phase == 'align') then
+    if not hitch.tightMode and hitch.spin and hitch.spin > 8 and dHK < 18 and (hitch.phase == 'approach' or hitch.phase == 'align') then
         hitch.tightMode, hitch.tt = true, { phase = 'eval', since = now }
         log(string.format('[hitch] кружусь у прицепа %.0f с - режим «мало места»', hitch.spin))
+    end
+    if hitch.tightMode and dHK > 22 then
+        -- отъехали далеко от прицепа - обычный подъезд автопилотом
+        hitch.tightMode, hitch.tt, hitch.spin = nil, nil, 0
+        hitch.phase, hitch.st = 'approach', { fails = 2 }
+        log(string.format('[hitch] далеко от прицепа (%.0f м) - выхожу из режима «мало места»', dHK))
     end
     if hitch.tightMode then return bot.hitchTight(car, tr, g, kx, ky, hx, hy, tfx, tfy, dHK, headErr, speed, vf, s, now) end
     local ax, ay = kx + tfx * reach, ky + tfy * reach
