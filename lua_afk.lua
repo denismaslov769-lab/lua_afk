@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Сцепка: исправлено торможение у прицепа - раньше бот жал S, а на заднем ходу это газ назад, поэтому он проезжал шкворень и не цеплял. Теперь тормозит газом вперёд и цепляет сразу.
+-- @changelog: Сцепка с дальней дистанции: плавное замедление задним ходом к прицепу и нормальное торможение (раньше пролетал прицеп на ~10 м). При промахе - короткая поправка вперёд вместо полного захода.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.3.6')
+script_version('2.3.7')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.3.6'
+local SCRIPT_VERSION = '2.3.7'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1157,6 +1157,9 @@ local function hitchControl(car)
 
     local speed = getCarSpeed(car)
     local g, tg = geo(car), geo(tr)
+    local cfx, cfy = carBasis(car)
+    local svx, svy = getCarSpeedVector(car)
+    local vf = svx * cfx + svy * cfy                         -- скорость вдоль фуры: < 0 - едем назад
     -- шкворень прицепа (K) и направление прицепа (T); седло тягача (H)
     local kx, ky = getOffsetFromCarInWorldCoords(tr, 0, tg.front - 1.4, 0)
     local tfx, tfy = carBasis(tr)
@@ -1175,8 +1178,6 @@ local function hitchControl(car)
     -- attachTrailerToCab цепляет принудительно, так что точность до сантиметра не нужна
     if ((dHK < 3.2 and math.abs(e) < 1.8) or (dHK < 4.5 and stuck)) and headErr < 25 then
         -- Тормозим против хода: на заднем ходу S - это газ назад, поэтому жмём W.
-        local vx, vy = getCarSpeedVector(car)
-        local vf = vx * fx + vy * fy                          -- < 0 - едем назад
         if vf < -0.3 then keys(0, 0.6, 0)
         elseif vf > 0.3 then keys(0, 0, 0.6)
         else keys(0, 0, 0) end
@@ -1265,7 +1266,9 @@ local function hitchControl(car)
             if speed < 0.5 then hitch.phase, hitch.st = 'reverse', {} end
             return
         end
-        keys(steer, (speed < 3.5) and 0.55 or 0, 0)
+        -- ещё катимся назад (после промаха) - гасим скорость газом вперёд в полную силу
+        local gas = (vf < -0.3) and 1 or (speed < 3.5) and 0.55 or 0
+        keys((vf < -0.3) and 0 or steer, gas, 0)
         return
     end
 
@@ -1275,6 +1278,15 @@ local function hitchControl(car)
     hitch.status = string.format('Сцепка: сдаю назад, %.1f м', dHK)
     if speed > 0.4 then hitch.st.moved = now end
     hitch.st.moved = hitch.st.moved or now
+    -- проехали шкворень, но стоим почти на линии - короткая поправка вперёд
+    if along < -1 and math.abs(e) < 4 and headErr < 45 then
+        hitch.tries = hitch.tries + 1
+        if hitch.tries > 8 then return hitchStop('Бот: не получилось ровно подъехать к прицепу.') end
+        log(string.format('[hitch] проехал шкворень: вдоль %.1f, вбок %.2f, курс %.0f, скорость %.1f', along, e, headErr, speed))
+        hitch.phase, hitch.st = 'pull', {}
+        keys(0, 1, 0)
+        return
+    end
     if along < -3 or (along > 6 and (math.abs(e) > eTol + 1 or headErr > 45)) then
         hitch.tries = hitch.tries + 1
         if hitch.tries > 5 then return hitchStop('Бот: не получилось ровно подъехать к прицепу.') end
@@ -1301,10 +1313,14 @@ local function hitchControl(car)
     local psiD = clamp(math.deg(math.atan2(e, math.max(3, along * 0.7))), -psiMax, psiMax)
     local steer = clamp((psi - psiD) / 12, -1, 1)
     -- далеко - быстрее, у самого прицепа - аккуратно
-    local v = (dHK > 10) and 4.0 or (dHK > 5) and 2.6 or (dHK > 2.5) and 1.6 or 1.0
+    -- плавный профиль: скорость, с которой ещё успеваем затормозить до шкворня
+    local v = clamp(0.8 + math.sqrt(2 * 0.6 * math.max(0, dHK - 2)), 0.8, 4.0)
     if math.abs(e) > 1 or math.abs(psi - psiD) > 15 then v = math.min(v, 2.0) end
     local diff = v - speed
-    keys(steer, (diff < -1) and 0.3 or 0, (diff > 0.2) and clamp(0.45 + diff * 0.15, 0.45, 0.9) or 0)
+    -- быстрее нужного - тормозим газом вперёд (на заднем ходу S - это газ назад)
+    local gas = (diff < -0.3) and clamp(-diff * 0.4, 0.25, 1) or 0
+    local brake = (diff > 0.2) and clamp(0.45 + diff * 0.15, 0.45, 0.9) or 0
+    keys(steer, gas, brake)
     if now - (hitch.logT or 0) > 0.5 then
         hitch.logT = now
         log(string.format('[hitch] назад: до шкворня %.1f, вдоль %.1f, вбок %.2f, угол %.1f (нужно %.1f), руль %.2f, скорость %.1f',
