@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Обновления приходят почти сразу после выхода (раньше GitHub отдавал старую версию до 5 минут).
+-- @changelog: Бот: больше не срезает углы на поворотах - проверяет проезд по ширине машины, видит препятствия у углов кузова и выравнивает руль; если упёрся - быстро отъезжает назад, уводя нос от препятствия, и строит путь заново.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('1.5.3')
+script_version('1.5.4')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '1.5.3'
+local SCRIPT_VERSION = '1.5.4'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/lua_afk.lua'
 local TAG = '{33AAFF}[lua_afk]{FFFFFF} '
 
@@ -826,6 +826,29 @@ end
 -- Выбор следующей точки: дорожные узлы впереди (прямо и под углами), до которых есть
 -- прямой проезд. От узлов прямо по курсу смотрим ещё на шаг вперёд (повороты на перекрёстке),
 -- чтобы заранее увидеть нужный поворот и сбросить скорость.
+-- Проезд по ширине машины: две линии вдоль левого и правого борта до точки, на двух высотах.
+-- Простая линия из центра не видит угол дома, о который цепляется край машины на повороте.
+local function corridorClear(car, x, y, z)
+    local cx, cy, cz = getCarCoordinates(car)
+    local _, _, w = carSize(car)
+    local hw = w + 0.5
+    local dx, dy = x - cx, y - cy
+    local l = math.sqrt(dx * dx + dy * dy)
+    if l < 2 then return true end
+    local px, py = dy / l * hw, -dx / l * hw
+    local found, gz = pcall(getGroundZFor3dCoord, cx, cy, cz + 1)
+    local lift = (found and gz and gz ~= 0 and cz - gz > 0 and cz - gz < 3) and (cz - gz) or 0.8
+    local ez = (z or (cz - lift))
+    for _, sd in ipairs({ -1, 1 }) do
+        for _, h in ipairs({ -0.3, 0.5 }) do
+            if not clearLine(cx + px * sd, cy + py * sd, cz + h, x + px * sd, y + py * sd, ez + lift + h) then
+                return false
+            end
+        end
+    end
+    return true
+end
+
 local ANGLES = { 0, 20, -20, 45, -45, 75, -75, 90, -90 }
 local AHEAD  = { 0, 45, -45, 70, -70, 90, -90 }
 local function nodeNear(sx, sy, z, R)
@@ -873,6 +896,8 @@ local function planWaypoint(car, tx, ty, tz)
                     end
                 end
                 score = score + math.abs(a) * 0.35
+                -- Узел, к которому машина не пролезает по ширине (срежет угол дома) - почти запрещён
+                if not corridorClear(car, nx, ny, nz) then score = score + 1000 end
                 if not bestScore or score < bestScore then
                     bestScore, bx, by = score, nx, ny
                     turn = t and { x = nx, y = ny } or nil
@@ -883,7 +908,7 @@ local function planWaypoint(car, tx, ty, tz)
     bot.turnAt = turn
     -- Цель рядом и к ней прямой проезд - едем прямо к ней
     local dist = getDistanceBetweenCoords2d(cx, cy, tx, ty)
-    if dist < 45 and clearLine(cx, cy, cz + 0.6, tx, ty, tz + 0.6) then bot.turnAt = nil; return tx, ty, true end
+    if dist < 45 and clearLine(cx, cy, cz + 0.6, tx, ty, tz + 0.6) and corridorClear(car, tx, ty, tz) then bot.turnAt = nil; return tx, ty, true end
     return bx, by, false
 end
 
@@ -895,9 +920,13 @@ local function botControl(car, tx, ty, tz, dist)
 
     -- Задний ход после застревания
     if now < bot.reverseUntil then
-        keys(bot.reverseSteer, false, true, false)
-        bot.vt = 0
-        return
+        local rb = rayBack(car, 2)
+        if rb and rb < 1.2 then bot.reverseUntil = 0
+        else
+            keys(bot.reverseSteer, false, (speed < 4) and 0.7 or 0, false)
+            bot.vt = 0
+            return
+        end
     end
 
     -- Метка сзади / сбоку или упёрлись в препятствие - разворот к метке
@@ -977,6 +1006,28 @@ local function botControl(car, tx, ty, tz, dist)
     if l and not r then steer = steer + 0.5 elseif r and not l then steer = steer - 0.5 end
     steer = math.max(-1, math.min(1, steer))
 
+    -- Углы машины в повороте: лучи от центра под 30 и 60 градусов в обе стороны.
+    -- Препятствие сбоку близко к кузову - выравниваем руль (не цепляем угол) и сбавляем.
+    local _, _, w = carSize(car)
+    local gap = 1.0 + math.min(speed, 10) * 0.1      -- до 2 м: отбойники вдоль трассы не мешают
+    local near = {}
+    for _, a in ipairs({ 30, 60 }) do
+        local body = math.min(front / math.cos(math.rad(a)), w / math.sin(math.rad(a)))
+        for _, sd in ipairs({ -1, 1 }) do
+            local d = dirRay(car, a * sd, body + gap + 1)
+            if d and d < body + gap then near[sd] = math.min(near[sd] or 99, d - body) end
+        end
+    end
+    for _, sd in ipairs({ -1, 1 }) do
+        if near[sd] then
+            v = math.min(v, 4 + near[sd] * 4)
+            if steer * sd > 0 then steer = steer * 0.25 end   -- рулили на препятствие - выпрямляем
+            if not near[-sd] then steer = steer - sd * 0.35 end -- отходим от него
+        end
+    end
+    steer = math.max(-1, math.min(1, steer))
+    bot.nearL, bot.nearR = near[-1], near[1]
+
     -- Сглаживание: желаемая скорость меняется плавно, кроме реальной опасности прямо по курсу
     local dt = math.min(0.2, now - (bot.lastCtl or now))
     bot.lastCtl = now
@@ -1000,11 +1051,17 @@ local function botControl(car, tx, ty, tz, dist)
     end
     keys(steer, gas, brake, false)
 
-    -- Застряли: жмём газ, но не едем 2.5 секунды - сдаём назад
-    if gas > 0 and speed < 0.5 then
+    -- Застряли: жмём газ и не едем или стоим носом в препятствие - сдаём назад 2 секунды.
+    -- Руль при заднем ходе в сторону препятствия: нос уходит от него.
+    if speed < 0.5 and (gas > 0 or (c and c < stopGap + 1) or bot.nearL or bot.nearR) then
         bot.stuckSince = bot.stuckSince or now
-        if now - bot.stuckSince > 2.5 then
-            bot.reverseUntil, bot.reverseSteer, bot.stuckSince = now + 1.5, -steer, nil
+        if now - bot.stuckSince > 1.2 then
+            local rs
+            if bot.nearR and not bot.nearL then rs = 1
+            elseif bot.nearL and not bot.nearR then rs = -1
+            else rs = (steer >= 0) and 1 or -1 end
+            bot.reverseUntil, bot.reverseSteer, bot.stuckSince = now + 2, rs, nil
+            bot.wx, bot.nextPlan = nil, 0
         end
     else
         bot.stuckSince = nil
