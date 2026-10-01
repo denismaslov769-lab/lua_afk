@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Прицеп: /pricep спавнит визуальный прицеп фуры (591), /lhitch - бот сам встаёт перед ним, выравнивается, сдаёт задом и цепляет. Кнопки во вкладке Авто фарм.
+-- @changelog: Сцепка: бот сдаёт к прицепу заметно быстрее (до 16 км/ч издалека), у самого прицепа по-прежнему аккуратно.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.3.0')
+script_version('2.3.1')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.3.0'
+local SCRIPT_VERSION = '2.3.1'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1134,7 +1134,7 @@ local function turnToHeading(car, st, ang, s, now, speed)
             keys(0, 0, 1)
             return false
         end
-        keys(dir, (speed < 3) and 0.45 or 0, 0)
+        keys(dir, (speed < 4) and 0.5 or 0, 0)
     else
         local r = senseRear(car)
         local rg, cg = minOf(r.bl, r.bc, r.br), (dir > 0) and r.rl or r.rr
@@ -1143,7 +1143,7 @@ local function turnToHeading(car, st, ang, s, now, speed)
             keys(0, 0, 0)
             return false
         end
-        keys(-dir, 0, (speed < 2.5) and 0.6 or 0)
+        keys(-dir, 0, (speed < 3.5) and 0.7 or 0)
     end
     return false
 end
@@ -1235,8 +1235,10 @@ local function hitchControl(car)
     local px, py = kx + tfx * math.max(0, along - L), ky + tfy * math.max(0, along - L)
     local lx, ly = toLocal(car, px, py)
     local steer = clamp(math.atan2(lx, -ly) / 0.35, -1, 1)   -- задний ход: руль вправо - зад уходит вправо
-    local v = (dHK > 6) and 2.0 or 1.0
-    keys(steer, 0, (speed < v) and 0.5 or 0)
+    -- далеко - быстро, у самого прицепа - аккуратно
+    local v = (dHK > 10) and 4.5 or (dHK > 5) and 3.0 or (dHK > 2.5) and 1.8 or 1.1
+    local diff = v - speed
+    keys(steer, 0, (diff > 0.2) and clamp(0.45 + diff * 0.15, 0.45, 0.9) or 0)
 end
 
 local function botThread()
