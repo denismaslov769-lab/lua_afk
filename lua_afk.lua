@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Бот: скорость без лимита (ползунок до упора), плавный газ и торможение по ситуации вместо резких остановок.
+-- @changelog: Бот: режим езды по своей полосе (правая сторона дороги) с настройкой смещения. Надпись No Limit на ползунке скорости.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('1.3.0')
+script_version('1.4.0')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '1.3.0'
+local SCRIPT_VERSION = '1.4.0'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/lua_afk.lua'
 local TAG = '{33AAFF}[lua_afk]{FFFFFF} '
 
@@ -40,6 +40,8 @@ local cfg = inicfg.load({
         style    = 0,       -- 0 = объезжать машины, 1 = тормозить перед машинами
         radius   = 12,      -- м
         takeover = true,    -- W / S забирают управление
+        lane     = false,   -- держаться своей (правой) полосы
+        laneOff  = 2.5,     -- смещение от оси дороги, м
     },
     theme = {
         accent     = '#3F99FF',
@@ -702,8 +704,8 @@ local function planWaypoint(car, tx, ty, tz)
     end
     -- Цель рядом и к ней прямой проезд - едем прямо к ней
     local dist = getDistanceBetweenCoords2d(cx, cy, tx, ty)
-    if dist < 45 and clearLine(cx, cy, cz + 0.6, tx, ty, tz + 0.6) then return tx, ty end
-    return bx, by
+    if dist < 45 and clearLine(cx, cy, cz + 0.6, tx, ty, tz + 0.6) then return tx, ty, true end
+    return bx, by, false
 end
 
 local function botControl(car, tx, ty, tz, dist)
@@ -721,7 +723,18 @@ local function botControl(car, tx, ty, tz, dist)
 
     if now >= bot.nextPlan or not bot.wx then
         bot.nextPlan = now + 0.2
-        local wx, wy = planWaypoint(car, tx, ty, tz)
+        local wx, wy, direct = planWaypoint(car, tx, ty, tz)
+        if wx and cfg.bot.lane and not direct then
+            -- Своя полоса: сдвигаем точку маршрута вправо от оси дороги (правостороннее движение)
+            local cx, cy, cz = getCarCoordinates(car)
+            local dx, dy = wx - cx, wy - cy
+            local len = math.sqrt(dx * dx + dy * dy)
+            if len > 1 then
+                local off = tonumber(cfg.bot.laneOff) or 2.5
+                local sx, sy = wx + dy / len * off, wy - dx / len * off
+                if clearLine(cx, cy, cz + 0.6, sx, sy, cz + 0.6) then wx, wy = sx, sy end
+            end
+        end
         if wx then bot.wx, bot.wy = wx, wy end
     end
     if not bot.wx then
@@ -873,6 +886,8 @@ local ui = {
     botStyle   = imgui.new.int(tonumber(cfg.bot.style) or 0),
     botRadius  = imgui.new.int(tonumber(cfg.bot.radius) or 12),
     botTake    = imgui.new.bool(cfg.bot.takeover),
+    botLane    = imgui.new.bool(cfg.bot.lane),
+    botLaneOff = imgui.new.float(tonumber(cfg.bot.laneOff) or 2.5),
 
     accent     = f3(cfg.theme.accent),
     bg         = f3(cfg.theme.bg),
@@ -979,7 +994,7 @@ local function drawFarmTab()
         cfg.bot.style = ui.botStyle[0]; saveCfg()
     end
     if sliderInt('Скорость:', '##bot_speed', ui.botSpeed, 5, SPEED_NO_LIMIT,
-                 ui.botSpeed[0] >= SPEED_NO_LIMIT and 'Без лимита' or '%d') then
+                 ui.botSpeed[0] >= SPEED_NO_LIMIT and 'No Limit' or '%d') then
         cfg.bot.speed = ui.botSpeed[0]; saveCfg()
     end
     if sliderInt('Радиус прибытия:', '##bot_radius', ui.botRadius, 3, 40, '%d м') then
@@ -988,7 +1003,18 @@ local function drawFarmTab()
     if toggle('##bot_take', 'W / S забирают управление', ui.botTake) then
         cfg.bot.takeover = ui.botTake[0]; saveCfg()
     end
-    hint('Собственный автопилот: едет по дорожным узлам игры, светофоров не видит, тормозит и объезжает препятствия по лучам. Аккуратный режим медленнее и раньше тормозит. Ползунок скорости до упора вправо - без лимита, бот сбавляет только в поворотах, у препятствий и у метки. Не работает на серверах Arizona RP.')
+
+    section('Полоса')
+    if toggle('##bot_lane', 'Держаться своей полосы', ui.botLane) then
+        cfg.bot.lane = ui.botLane[0]; saveCfg()
+    end
+    if ui.botLane[0] then
+        if sliderFloat('Смещение от середины дороги:', '##bot_lane_off', ui.botLaneOff, 1.0, 6.0, '%.1f м') then
+            cfg.bot.laneOff = ui.botLaneOff[0]; saveCfg()
+        end
+        hint('Бот едет по правой стороне дороги. Если он задевает бордюр - уменьшите смещение, если выезжает на встречку - увеличьте.')
+    end
+    hint('Собственный автопилот: едет по дорожным узлам игры, светофоров не видит, тормозит и объезжает препятствия по лучам. Аккуратный режим медленнее и раньше тормозит. Ползунок скорости до упора вправо - No Limit, бот сбавляет только в поворотах, у препятствий и у метки. Не работает на серверах Arizona RP.')
 end
 
 ------------------------- Оформление ---------------------------
