@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Безопасная установка обновлений: окна закрываются до записи файла, нет двойного перезапуска вместе с AutoReboot. Все загрузки из одного постоянного потока (фикс вылета после спавна).
+-- @changelog: Бот: заранее видит нужный поворот на перекрёстке, сбрасывает скорость и уверенно в него заходит. Если проехал поворот - разворачивается вдоль дороги, а не носом в дома.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.0.4')
+script_version('2.1.0')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.0.4'
+local SCRIPT_VERSION = '2.1.0'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -394,7 +394,7 @@ local function botRelease()
         bot.active = false
     end
     bot.wx, bot.wy, bot.vt, bot.turnAt = nil, nil, nil, nil
-    bot.man, bot.recover, bot.stuckSince = nil, nil, nil
+    bot.man, bot.recover, bot.stuckSince, bot.commit = nil, nil, nil, nil
 end
 
 -- Геометрия -------------------------------------------------------------
@@ -528,9 +528,10 @@ end
 
 -- Маршрут ---------------------------------------------------------------
 -- Дорожные узлы игры впереди (прямо и под углами), до которых есть прямой проезд.
--- Лучей немного (как в стабильных версиях): по одной линии на узел и проверка по
--- ширине машины только для двух лучших узлов.
+-- От узлов прямо по курсу смотрим ещё на шаг вперёд: так бот заранее видит поворот
+-- на перекрёстке, который ведёт к метке, сбрасывает скорость и поворачивает.
 local ANGLES = { 0, 20, -20, 45, -45, 75, -75, 90, -90 }
+local AHEAD  = { 0, 45, -45, 70, -70, 90, -90 }
 
 local function nodeNear(sx, sy, z, R)
     local nx, ny, nz = getClosestCarNode(sx, sy, z)
@@ -541,6 +542,7 @@ end
 
 local function planWaypoint(car, tx, ty, tz)
     local cx, cy, cz = getCarCoordinates(car)
+    bot.turnAt = nil
     -- Цель рядом и к ней есть проезд - едем прямо к ней
     local dist = getDistanceBetweenCoords2d(cx, cy, tx, ty)
     if dist < 45 and clearLine(cx, cy, cz + 0.6, tx, ty, tz + 0.6) and corridorClear(car, tx, ty, tz) then
@@ -558,17 +560,49 @@ local function planWaypoint(car, tx, ty, tz)
         if nx then
             local _, ly = toLocal(car, nx, ny)
             if ly > 3 and clearLine(cx, cy, cz + 0.6, nx, ny, nz + 0.6) then
-                list[#list + 1] = { x = nx, y = ny, z = nz,
-                    score = getDistanceBetweenCoords2d(nx, ny, tx, ty) + math.abs(a) * 0.35 }
+                local c = { x = nx, y = ny, z = nz, a = a, d = getDistanceBetweenCoords2d(nx, ny, tx, ty) }
+                -- Шаг вперёд от узла прямо по курсу: куда можно повернуть дальше
+                if math.abs(a) <= 20 then
+                    local hx, hy = nx - cx, ny - cy
+                    local hl = math.sqrt(hx * hx + hy * hy)
+                    if hl > 1 then
+                        hx, hy = hx / hl, hy / hl
+                        local straight, best, ex, ey, eb = c.d, nil, nil, nil, nil
+                        for _, b in ipairs(AHEAD) do
+                            local br = math.rad(b)
+                            local ux = hx * math.cos(br) + hy * math.sin(br)
+                            local uy = hy * math.cos(br) - hx * math.sin(br)
+                            local mx, my, mz = nodeNear(nx + ux * 18, ny + uy * 18, nz, 18)
+                            if mx and getDistanceBetweenCoords2d(mx, my, nx, ny) > 6
+                                and clearLine(nx, ny, nz + 0.6, mx, my, mz + 0.6) then
+                                local d2 = getDistanceBetweenCoords2d(mx, my, tx, ty)
+                                if b == 0 then straight = math.min(straight, d2) end
+                                if not best or d2 + math.abs(b) * 0.05 < best then
+                                    best, ex, ey, eb = d2 + math.abs(b) * 0.05, mx, my, b
+                                end
+                            end
+                        end
+                        if best and best < c.d then
+                            c.d = best
+                            if math.abs(eb) >= 45 and straight - best >= 8 then
+                                c.turn = { x = nx, y = ny, ex = ex, ey = ey }
+                            end
+                        end
+                    end
+                end
+                c.score = c.d + math.abs(a) * 0.35
+                list[#list + 1] = c
             end
         end
     end
     if #list == 0 then return nil end
     table.sort(list, function(p, q) return p.score < q.score end)
+    local pick = list[1]
     for k = 1, math.min(2, #list) do
-        if corridorClear(car, list[k].x, list[k].y, list[k].z) then return list[k].x, list[k].y, false end
+        if corridorClear(car, list[k].x, list[k].y, list[k].z) then pick = list[k] break end
     end
-    return list[1].x, list[1].y, false
+    bot.turnAt = pick.turn
+    return pick.x, pick.y, false
 end
 
 -- Разворот к метке --------------------------------------------------------
@@ -588,18 +622,35 @@ local function maneuver(car, tx, ty, dist, s, now, speed)
         local frontGap = minOf(s.fl, s.fc, s.fr)
         local behind  = a > 110 and dist < 400 and speed < 12
         local side    = a > 65 and dist < 60 and speed < 6
+        if side then
+            -- сбоку разворачиваемся носом к метке, только если к ней правда можно проехать напрямую
+            local cx, cy, cz = getCarCoordinates(car)
+            side = clearLine(cx, cy, cz + 0.6, tx, ty, cz + 0.6)
+        end
         local blocked = frontGap and frontGap < 4 and a > 30 and speed < 2 and dist < 100
         if not (behind or side or blocked) then return false end
         local dir = ang >= 0 and 1 or -1
         local cornerGap = (dir > 0) and s.cr or s.cl
         local room = (not frontGap or frontGap > 3.5) and (not cornerGap or cornerGap > 1.5)
         m = { dir = dir, phase = room and 'fwd' or 'back', since = now, start = now, n = 0 }
+        -- Метка сзади и далеко (проехали поворот): разворачиваемся вдоль дороги на 180 градусов,
+        -- а не носом в сторону метки (там обычно дома). Дальше поворот найдёт маршрут.
+        if behind and dist > 45 then
+            local cx, cy = getCarCoordinates(car)
+            local fx, fy = carBasis(car)
+            m.gx, m.gy = cx - fx * 60, cy - fy * 60
+        end
         bot.man = m
+    end
+    if m.gx then
+        lx, ly = toLocal(car, m.gx, m.gy)
+        ang = math.deg(math.atan2(lx, ly))
+        a = math.abs(ang)
     end
 
     if a < 25 or now - m.start > 45 or m.n > 16 then
         bot.man = nil
-        bot.manCooldown = now + ((a < 25) and 1.5 or 8)
+        bot.manCooldown = now + ((a < 25) and 3 or 8)
         bot.wx, bot.nextPlan = nil, 0
         return false
     end
@@ -673,8 +724,27 @@ local function botControl(car, tx, ty, tz, dist)
         return
     end
 
-    -- 3. Точка маршрута (5 раз в секунду)
-    if now >= bot.nextPlan or not bot.wx then
+    -- 3. Точка маршрута (4 раза в секунду). На перекрёстке, где нужно повернуть,
+    -- бот "заходит в поворот": едет на узел боковой дороги, пока не повернёт.
+    if bot.commit then
+        local c = bot.commit
+        local cx, cy = getCarCoordinates(car)
+        local _, cly = toLocal(car, c.ex, c.ey)
+        if now > c.till or cly < 2 or getDistanceBetweenCoords2d(cx, cy, c.ex, c.ey) < 6 then
+            bot.commit, bot.nextPlan = nil, 0
+        else
+            bot.wx, bot.wy, bot.nextPlan = c.ex, c.ey, now + 0.25
+        end
+    end
+    if bot.turnAt and not bot.commit then
+        local cx, cy = getCarCoordinates(car)
+        local jd = getDistanceBetweenCoords2d(cx, cy, bot.turnAt.x, bot.turnAt.y)
+        if jd < math.max(7, speed * 0.9) then
+            bot.commit = { ex = bot.turnAt.ex, ey = bot.turnAt.ey, till = now + 4 }
+            bot.wx, bot.wy, bot.turnAt, bot.nextPlan = bot.turnAt.ex, bot.turnAt.ey, nil, now + 0.25
+        end
+    end
+    if not bot.commit and (now >= bot.nextPlan or not bot.wx) then
         bot.nextPlan = now + 0.25
         local wx, wy, direct = planWaypoint(car, tx, ty, tz)
         if wx and cfg.bot.lane and not direct then
@@ -701,6 +771,12 @@ local function botControl(car, tx, ty, tz, dist)
         local wd = math.max(5, math.sqrt(lx * lx + ly * ly))
         local sn = math.abs(math.sin(clamp(ang, -1.5, 1.5)))
         if sn > 0.02 then v = math.min(v, math.max(6, math.sqrt(aLat * wd / (2 * sn)))) end
+    end
+
+    -- Метка позади (проехали) - сбрасываем скорость, чтобы развернуться
+    do
+        local tlx, tly = toLocal(car, tx, ty)
+        if math.abs(math.deg(math.atan2(tlx, tly))) > 110 and dist > num(cfg.bot.radius, 12) then v = math.min(v, 8) end
     end
 
     -- Подъезд к метке и к нужному повороту
@@ -796,7 +872,7 @@ local function botThread()
                     if not bot.tx or getDistanceBetweenCoords2d(bot.tx, bot.ty, x, y) > 10 then
                         bot.tx, bot.ty = x, y
                         bot.best, bot.bestTime, bot.gaveUp, bot.arrived = dist, os.clock(), false, false
-                        bot.man, bot.recover, bot.wx = nil, nil, nil
+                        bot.man, bot.recover, bot.wx, bot.commit, bot.turnAt = nil, nil, nil, nil, nil
                     end
                     if dist < bot.best - 5 then bot.best, bot.bestTime = dist, os.clock() end
 
