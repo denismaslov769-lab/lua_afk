@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Исправлен вылет игры при повторном выборе фона. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
+-- @changelog: Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.4.1')
+script_version('2.4.2')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.4.1'
+local SCRIPT_VERSION = '2.4.2'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1455,6 +1455,7 @@ do
         'long __stdcall lafk_MFCreateMediaType(void **) __asm__("MFCreateMediaType");',
         'long __stdcall lafk_MFCreateSourceReaderFromURL(const uint16_t *, void *, void **) __asm__("MFCreateSourceReaderFromURL");',
         'void * __stdcall lafk_ShellExecuteA(void *, const char *, const char *, const char *, const char *, int) __asm__("ShellExecuteA");',
+        'int __stdcall lafk_RemoveDirectoryA(const char *) __asm__("RemoveDirectoryA");',
     }
     local okAll = true
     for _, d in ipairs(defs) do
@@ -1950,9 +1951,48 @@ local function finish(m)
 end
 
 -- Продолжить загрузки (вызывается каждый кадр меню, ~budgetSec времени на всё)
+-- Удаление файла/папки с диска. Откладывается на пару кадров, чтобы загрузчик,
+-- если он ещё читал этот файл, успел его закрыть.
+media.deletes = {}
+function media.delete(path, isDir, done)
+    media.deletes[#media.deletes + 1] = { path = path, dir = isDir, tick = media.tick, done = done }
+end
+
+local function removePath(path, isDir)
+    if not isDir then return os.remove(path) ~= nil end
+    local names = {}
+    pcall(function()
+        local h, name = findFirstFile(path .. '\\*')
+        if not h then return end
+        while name do
+            if name ~= '.' and name ~= '..' then names[#names + 1] = name end
+            name = findNextFile(h)
+        end
+        findClose(h)
+    end)
+    for _, n in ipairs(names) do os.remove(path .. '\\' .. n) end
+    local ok, r = pcall(function() return ffi.C.lafk_RemoveDirectoryA(path) end)
+    return ok and r ~= 0
+end
+
+local function runDeletes()
+    local i = 1
+    while i <= #media.deletes do
+        local d = media.deletes[i]
+        if media.tick - d.tick >= 3 then
+            local ok = removePath(d.path, d.dir)
+            table.remove(media.deletes, i)
+            if d.done then pcall(d.done, ok) end
+        else
+            i = i + 1
+        end
+    end
+end
+
 function media.pump(budgetSec)
     media.tick = media.tick + 1
     emptyTrash()
+    runDeletes()
     local i = 1
     while i <= #media.loaders do
         local m = media.loaders[i]
@@ -2612,11 +2652,72 @@ local function mediaStatus(m)
     else imgui.TextColored(readable(GREEN), string.format('Картинка %dx%d', m.w, m.h)) end
 end
 
-local function folderButtons(id, dir)
+local function removeBg()
+    cfg.bgimg.enabled, cfg.bgimg.file, ui.bgOn[0] = false, '', false
+    saveCfg(); bgReload()
+end
+
+local function ptToggle(name)
+    local set = ptSelected()
+    set[name] = not set[name] or nil
+    local out = {}
+    for _, g in ipairs(scan.pt) do if set[g.name] then out[#out + 1] = g.name end end
+    cfg.particles.images = table.concat(out, '|'); saveCfg(); ptReload()
+end
+
+-- Подтверждение удаления файла (после пункта "Удалить из папки" в меню на ПКМ)
+local ctxDel = nil
+local function askDelete(kind, f) ctxDel = { kind = kind, name = f.name, disp = f.disp, dir = f.dir } end
+
+local function doDelete(d)
+    local path = ((d.kind == 'bg') and DIRS.bg or DIRS.pt) .. '\\' .. d.name
+    if d.kind == 'bg' and tostring(cfg.bgimg.file) == d.name then removeBg() end
+    if d.kind == 'pt' and ptSelected()[d.name] then ptToggle(d.name) end
+    media.delete(path, d.dir, function(ok)
+        if ok then msg('Удалено: ' .. d.disp) else msg('Не удалось удалить ' .. d.disp .. ' (файл открыт в другой программе?)') end
+        rescan(true)
+    end)
+end
+
+local function deleteConfirm(kind)
+    local d = ctxDel
+    if not d or d.kind ~= kind then return end
+    imgui.TextColored(readable(RED), 'Удалить "' .. d.disp .. '" из папки насовсем?')
     local bw = (imgui.GetContentRegionAvail().x - imgui.GetStyle().ItemSpacing.x) / 2
+    imgui.PushStyleColor(imgui.Col.Button, readable(RED))
+    imgui.PushStyleColor(imgui.Col.ButtonHovered, mixV(readable(RED), TEXT, 0.15))
+    imgui.PushStyleColor(imgui.Col.ButtonActive, mixV(readable(RED), BGV, 0.2))
+    imgui.PushStyleColor(imgui.Col.Text, V4(1, 1, 1, 1))
+    local yes = imgui.Button('Да, удалить##del_' .. kind, vec(bw, 30))
+    imgui.PopStyleColor(4)
+    imgui.SameLine()
+    local no = grayButton('Отмена##del_' .. kind, vec(bw, 30))
+    if yes then ctxDel = nil; doDelete(d) elseif no then ctxDel = nil end
+end
+
+-- Меню на правую кнопку мыши по последнему элементу (как в Windows)
+local function contextMenu(id, title, items)
+    if imgui.BeginPopupContextItem(id, 1) then
+        imgui.TextDisabled(title)
+        imgui.Separator()
+        for _, it in ipairs(items) do
+            if it and imgui.Selectable(it[1] .. id, false) then it[2]() end
+        end
+        imgui.EndPopup()
+    end
+end
+
+local function folderButtons(id, dir)
+    local hasBg = id == 'bg' and tostring(cfg.bgimg.file or '') ~= ''
+    local n = hasBg and 3 or 2
+    local bw = (imgui.GetContentRegionAvail().x - imgui.GetStyle().ItemSpacing.x * (n - 1)) / n
     if imgui.Button('Открыть папку##' .. id, vec(bw, 30)) then media.openFolder(dir) end
     imgui.SameLine()
     if grayButton('Обновить список##' .. id, vec(bw, 30)) then rescan(true) end
+    if hasBg then
+        imgui.SameLine()
+        if grayButton('Убрать фон##' .. id, vec(bw, 30)) then removeBg() end
+    end
 end
 
 local function drawThemeSettings()
@@ -2660,8 +2761,20 @@ local function drawBgSettings()
             saveCfg()
             if not same then bgReload() end -- тот же файл ещё раз - не перезагружаем
         end
+        local cur = tostring(cfg.bgimg.file) == f.name and cfg.bgimg.enabled
+        contextMenu('##bgctx' .. i, f.disp, {
+            not cur and { 'Поставить на фон', function()
+                cfg.bgimg.file, cfg.bgimg.enabled, ui.bgOn[0] = f.name, true, true
+                saveCfg(); bgReload()
+            end } or false,
+            cur and { 'Убрать фон', removeBg } or false,
+            { 'Открыть папку', function() media.openFolder(DIRS.bg) end },
+            { 'Удалить из папки', function() askDelete('bg', f) end },
+        })
     end
     imgui.EndChild()
+    hint('Правая кнопка мыши по файлу - меню: поставить, убрать фон, удалить.')
+    deleteConfirm('bg')
     folderButtons('bg', DIRS.bg)
     mediaStatus(bgState.media)
 
@@ -2714,15 +2827,18 @@ local function drawParticleSettings()
             if not f.dir and not f.video then
                 any = true
                 if imgui.Selectable((set[f.name] and '[x] ' or '[  ] ') .. f.disp .. '##ptf' .. i, set[f.name] == true) then
-                    set[f.name] = not set[f.name] or nil
-                    local out = {}
-                    for _, g in ipairs(scan.pt) do if set[g.name] then out[#out + 1] = g.name end end
-                    P.images = table.concat(out, '|'); saveCfg(); ptReload()
+                    ptToggle(f.name)
                 end
+                contextMenu('##ptctx' .. i, f.disp, {
+                    { set[f.name] and 'Убрать из частиц' or 'Добавить в частицы', function() ptToggle(f.name) end },
+                    { 'Открыть папку', function() media.openFolder(DIRS.pt) end },
+                    { 'Удалить из папки', function() askDelete('pt', f) end },
+                })
             end
         end
         if not any then hint('Папка пуста. Положите туда png/webp/gif (снежинки, сердечки, листья...).') end
         imgui.EndChild()
+        deleteConfirm('pt')
         folderButtons('pt', DIRS.pt)
         for _, e in ipairs(ptState.list) do
             if e.media.err then imgui.TextColored(readable(RED), u8(e.name) .. ': ' .. tostring(e.media.err)) end
