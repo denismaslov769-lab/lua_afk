@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: На точке получения груза бот ждёт 0,3 секунды, нажимает H, выбирает первый пункт CEF и ищет только новый прицеп, появившийся после выбора.
+-- @changelog: Исправлено ложное прибытие к точке груза: бот сбрасывает старое состояние маршрута и нажимает H только когда реально находится рядом с надписью.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.11')
+script_version('2.5.12')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.11'
+local SCRIPT_VERSION = '2.5.12'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1745,6 +1745,10 @@ bot.jobTick = function()
     if not J then
         J = { phase = 'label', t = now, status = 'Работа: ищу базу' }
         bot.job = J
+        -- Не переносим признак прибытия и конец дороги от предыдущей метки/рейса.
+        -- Иначе новый этап сразу нажимает H там, где сейчас стоит машина.
+        bot.tx, bot.ty, bot.arrived, bot.atRoadEnd, bot.route = nil, nil, false, nil, nil
+        bot.wx, bot.wy, bot.best, bot.bestTime = nil, nil, nil, 0
         cfg.bot.enabled = true; if bot.ui then bot.ui.botOn[0] = true end
         msg('Работа дальнобойщика: еду на базу за прицепом.')
     end
@@ -1770,24 +1774,40 @@ bot.jobTick = function()
         end
         -- После перезапуска скрипта CEF мог уже остаться открытым. Считаем это
         -- подтверждением прибытия, иначе бот пытается ехать с перехваченным CEF вводом.
-        if J.x and J.labelDist and J.labelDist < 20 and (sampIsDialogActive() or sampIsCursorActive()) then
+        if J.x and J.labelDist and J.labelDist <= 6 and (sampIsDialogActive() or sampIsCursorActive()) then
             go('take', 'Работа: меню груза уже открыто, выбираю первый пункт.')
             J.known, J.cursorT = bot.trailerSnapshot(), now
             return
         end
-        if bot.arrived and J.x then
+        -- Одного bot.arrived недостаточно: флаг мог относиться к прошлой цели.
+        -- Переходим к H только после проверки текущего расстояния до живой надписи.
+        if bot.arrived and J.x and J.labelDist and J.labelDist <= 6 then
             local _, _, _, _, cached = bot.labelPos('получить загруженный прицеп', 'L')
             if cached then
                 -- приехали к запомненной точке, а надписи нет - она могла сдвинуться, ищем ещё
                 J.status = 'Работа: на базе, ищу надпись «Получить загруженный прицеп»'
             else
+                local ax, ay, az = J.x, J.y, J.z
                 go('open', 'Работа: приехал. Через 0,3 секунды нажму H и открою выбор груза.')
                 J.known, J.actionTries = bot.trailerSnapshot(), 0
+                J.openX, J.openY, J.openZ = ax, ay, az
             end
+        elseif bot.arrived and J.x then
+            -- Защитно снимаем ошибочное прибытие: управление снова получит автопилот.
+            bot.arrived, bot.atRoadEnd = false, nil
         end
     elseif J.phase == 'open' then
         if hooked then return go('gate', 'Работа: прицеп уже прицеплен, еду к воротам.') end
         J.known = J.known or bot.trailerSnapshot()
+        if J.openX then
+            local px, py, pz = getCharCoordinates(PLAYER_PED)
+            local d = getDistanceBetweenCoords3d(px, py, pz, J.openX, J.openY, J.openZ)
+            if d > 8 then
+                go('label', 'Работа: машина не у точки груза, подъезжаю ближе.')
+                J.known = nil
+                return
+            end
+        end
         local menu = sampIsDialogActive() or sampIsCursorActive()
         if menu then
             go('take', 'Работа: меню груза открыто, выбираю первый пункт.')
