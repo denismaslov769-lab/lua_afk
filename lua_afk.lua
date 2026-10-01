@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Сцепка: во время заднего хода бот больше не бросает попытку из-за «не хватает места» и не уезжает вперёд по пустякам - доворачивает заднюю часть фуры к прицепу.
+-- @changelog: Если сервер пишет «Вы уже взяли груз, отвезите сначала его!», бот сразу едет цеплять уже выданный прицеп.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.16')
+script_version('2.5.17')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.16'
+local SCRIPT_VERSION = '2.5.17'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -321,6 +321,13 @@ if hasSampev then
     function sampev.onDisableCheckpoint()       bot.cp = nil end
     function sampev.onSetRaceCheckpoint(t, pos) bot.cp = { pos.x, pos.y, pos.z } end
     function sampev.onDisableRaceCheckpoint()   bot.cp = nil end
+    -- «[Ошибка] Вы уже взяли груз, отвезите сначала его!» - груз уже выдан,
+    -- значит надо не брать новый, а цеплять свой прицеп. Сообщение не блокируем.
+    function sampev.onServerMessage(color, text)
+        if type(text) ~= 'string' then return end
+        local ok, t = pcall(function() return ruLower(u8((text:gsub('{%x%x%x%x%x%x}', '')))) end)
+        if ok and t and t:find('уже взяли груз', 1, true) then bot.cargoTaken = os.clock() end
+    end
 end
 
 local function isArizona()
@@ -1874,6 +1881,31 @@ bot.jobTick = function()
     end
     local hooked = bot.hookedTrailer(car)
     if hooked and not (trailer.handle == hooked) then trailer.handle, trailer.server = hooked, true end
+
+    -- Сервер ответил «Вы уже взяли груз» - сразу к сцепке с уже выданным прицепом
+    if bot.cargoTaken and now - bot.cargoTaken > 20 then bot.cargoTaken = nil end
+    if bot.cargoTaken and (J.phase == 'label' or J.phase == 'open' or J.phase == 'take') then
+        if hooked then
+            bot.cargoTaken = nil
+            return go('gate', 'Работа: прицеп уже прицеплен, еду к воротам.')
+        end
+        local v = (J.given and doesVehicleExist(J.given)) and J.given or bot.findTrailer(car, J.known, false)
+        if v then
+            bot.cargoTaken = nil
+            trailer.handle, trailer.server = v, true
+            J.tries, J.given, J.direct = 0, v, nil
+            log(string.format('[job] груз уже взят - цепляю выданный прицеп (модель %d)', getCarModel(v)))
+            go('hitch', 'Работа: груз уже взят - еду цеплять прицеп.')
+            hitchStart()
+            return
+        elseif now - bot.cargoTaken > 15 then
+            bot.cargoTaken = nil
+            msg('Работа: сервер пишет, что груз уже взят, но прицепа рядом не видно. Подъедьте к нему ближе.')
+        else
+            J.status = 'Работа: груз уже взят - ищу свой прицеп'
+            return
+        end
+    end
 
     if J.phase == 'label' then
         if hooked then return go('gate', 'Работа: прицеп уже прицеплен, еду к воротам.') end
