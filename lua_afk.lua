@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Сцепка: мало места перед прицепом - бот подъезжает ближе и сдаёт с короткого расстояния, не крутится бесконечно (останавливается с подсказкой). Новый виджет бота во вкладке Авто фарм (дорога, скорость, расстояние, прицеп, прогресс, кнопка запуска). Частицы Arizona и Hearts. ПКМ - Убрать фон у своих частиц. Сцепка: прицеп далеко или за забором - бот едет к нему в объезд и быстрее, без качелей вперёд-назад. Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
+-- @changelog: Развязки и развилки: бот едет по самой линии маршрута (не срезает через отбойник), не путает эстакады, быстрее замечает, что ушёл не в ту ветку, и заранее сбрасывает скорость перед изгибами. Сцепка: мало места перед прицепом - бот подъезжает ближе и сдаёт с короткого расстояния, не крутится бесконечно (останавливается с подсказкой). Новый виджет бота во вкладке Авто фарм (дорога, скорость, расстояние, прицеп, прогресс, кнопка запуска). Частицы Arizona и Hearts. ПКМ - Убрать фон у своих частиц. Сцепка: прицеп далеко или за забором - бот едет к нему в объезд и быстрее, без качелей вперёд-назад. Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.4.5')
+script_version('2.4.6')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.4.5'
+local SCRIPT_VERSION = '2.4.6'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -659,7 +659,7 @@ end
 local function routeUpdate(car, tx, ty, tz, now, speed)
     local r = bot.route
     local moved = r and getDistanceBetweenCoords2d(r.tx, r.ty, tx, ty) > 10
-    local nearEnd = r and (#r.pts - r.idx) < 4 and getDistanceBetweenCoords2d(r.pts[#r.pts].x, r.pts[#r.pts].y, tx, ty) > 40
+    local nearEnd = r and routeLen(r.pts, r.idx) < 30 and getDistanceBetweenCoords2d(r.pts[#r.pts].x, r.pts[#r.pts].y, tx, ty) > 40
     local periodic = r and now - r.t > 8
     if r and not (r.off or moved or nearEnd or periodic) then return end
     if r and r.fail and now - r.fail < 2 then return end
@@ -702,58 +702,100 @@ local function routeUpdate(car, tx, ty, tz, now, speed)
     if r and not r.off and not moved and not nearEnd then
         if routeLen(pts) > routeLen(r.pts, r.idx) * 0.85 then r.t = now return end
     end
-    bot.route = { pts = pts, t = now, tx = tx, ty = ty, idx = 1 }
+    -- точки через ~4 м: бот едет по самой линии маршрута
+    local dense = { pts[1] }
+    for i = 2, #pts do
+        local a, b = pts[i - 1], pts[i]
+        local l = getDistanceBetweenCoords2d(a.x, a.y, b.x, b.y)
+        local k = math.floor(l / 4)
+        for j = 1, k - 1 do
+            local t = j / k
+            dense[#dense + 1] = { x = a.x + (b.x - a.x) * t, y = a.y + (b.y - a.y) * t, z = a.z + (b.z - a.z) * t }
+        end
+        dense[#dense + 1] = b
+    end
+    bot.route = { pts = dense, t = now, tx = tx, ty = ty, idx = 1 }
 end
 
--- Точка маршрута для руления + расстояние до ближайшего крутого поворота по маршруту
+-- Точка маршрута для руления + безопасная скорость по изгибам дороги впереди.
+-- Маршрут разбит на точки через ~4 м, бот едет по самой линии маршрута (точка на
+-- линии впереди на расстоянии упреждения), а не напрямую к дальнему узлу - поэтому
+-- на развилках и съездах развязок не срезает через отбойник и не уходит не в ту ветку.
+-- Ближайшая точка ищется с учётом высоты: эстакада над/под нами не путает.
 local function routeWaypoint(car, speed, tx, ty)
     local r = bot.route
     if not r then return nil end
     local now = os.clock()
-    if r.cache and now < r.cache.till then return r.cache.x, r.cache.y, r.cache.turn end
+    if r.cache and now < r.cache.till then return r.cache.x, r.cache.y, r.cache.vcap end
     local pts = r.pts
+    local n = #pts
     local cx, cy, cz = getCarCoordinates(car)
-    -- ближайшая точка маршрута (ищем вперёд от прошлой)
-    local bi, bd = r.idx, 1e9
-    for i = math.max(1, r.idx - 2), math.min(#pts, r.idx + 25) do
-        local d = getDistanceBetweenCoords2d(cx, cy, pts[i].x, pts[i].y)
-        if d < bd then bi, bd = i, d end
+    local bi, bd, b2 = r.idx, 1e9, 1e9
+    for i = math.max(1, r.idx - 3), math.min(n, r.idx + 40) do
+        local p = pts[i]
+        local d2 = getDistanceBetweenCoords2d(cx, cy, p.x, p.y)
+        local dz = math.abs((p.z or cz) - cz)
+        local d = d2 + math.max(0, dz - 1.5) * 3
+        if d < bd then bi, bd, b2 = i, d, d2 end
     end
     r.idx = bi
-    if bd > 30 then r.off, r.cache = true, nil return nil end
-    -- первая точка дальше R, затем назад до той, к которой есть проезд
-    local R = clamp(8 + speed * 0.7, 10, 28)
-    local pick = #pts
-    for i = bi, #pts do
-        if getDistanceBetweenCoords2d(cx, cy, pts[i].x, pts[i].y) >= R then pick = i break end
+    -- ушли с маршрута (не та ветка развилки, другой уровень развязки) - перестроить
+    -- (пока ещё не выехали на маршрут, например со стоянки, - допуск больше)
+    if bd < 8 then r.on = true end
+    if bd > (r.on and 14 or 35) then r.off, r.cache = true, nil return nil end
+    -- точка на линии маршрута впереди на расстоянии L (по самой дороге)
+    local function at(L)
+        local acc, i = 0, bi
+        while i < n do
+            local a, b = pts[i], pts[i + 1]
+            local sl = getDistanceBetweenCoords2d(a.x, a.y, b.x, b.y)
+            if acc + sl >= L then
+                local t = (sl > 0.01) and (L - acc) / sl or 0
+                return a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, (a.z or cz) + ((b.z or cz) - (a.z or cz)) * t, false
+            end
+            acc, i = acc + sl, i + 1
+        end
+        local p = pts[n]
+        return p.x, p.y, p.z or cz, true
     end
-    while pick > bi + 1 do
-        local p = pts[pick]
-        if clearLine(cx, cy, cz + 0.6, p.x, p.y, p.z + 1.2) and corridorClear(car, p.x, p.y, p.z + 0.4) then break end
-        pick = pick - 1
+    -- упреждение растёт со скоростью; если сбоку от маршрута - короче, чтобы сначала вернуться на линию
+    local L = clamp(6 + speed * 0.55, 8, 22) + math.min(b2, 6) * 0.5
+    local px, py, pz, last = at(L)
+    while L > 5 do
+        if clearLine(cx, cy, cz + 0.6, px, py, pz + 1.2) and corridorClear(car, px, py, pz + 0.4) then break end
+        L = L - 4
+        px, py, pz, last = at(L)
     end
-    if pick == bi and bi < #pts and bd < 6 then pick = bi + 1 end
-    local p = pts[pick]
     -- конец маршрута рядом с меткой - дальше едем прямо к метке
-    if pick == #pts and getDistanceBetweenCoords2d(p.x, p.y, tx, ty) < 40 and getDistanceBetweenCoords2d(cx, cy, p.x, p.y) < 12 then
+    if last and getDistanceBetweenCoords2d(px, py, tx, ty) < 40 and getDistanceBetweenCoords2d(cx, cy, px, py) < 12 then
         return nil
     end
-    -- крутой поворот впереди (до 70 м по маршруту)
-    local fx, fy = carBasis(car)
-    local along, turnDist = bd, nil
-    for i = bi, math.min(#pts - 1, bi + 20) do
-        local a, b = pts[i], pts[i + 1]
-        local sx, sy = b.x - a.x, b.y - a.y
-        local sl = math.sqrt(sx * sx + sy * sy)
-        if sl > 2 then
-            local cosv = (sx * fx + sy * fy) / sl
-            if cosv < 0.7 then turnDist = along break end   -- больше ~45 градусов от курса
+    -- скорость по изгибам: на каждом участке впереди радиус поворота -> допустимая
+    -- скорость, и успеваем ли до него затормозить (с запасом для фуры с прицепом)
+    local careful = num(cfg.bot.style, 0) == 1
+    local aLat, decel = careful and 3.0 or 4.5, careful and 4 or 5.5
+    local look = 40 + speed * speed / (2 * decel)
+    local vcap, acc = nil, 0
+    for i = bi + 2, n - 2 do
+        local p0, p1, p2 = pts[i - 2], pts[i], pts[i + 2]
+        local ux, uy = p1.x - p0.x, p1.y - p0.y
+        local vx, vy = p2.x - p1.x, p2.y - p1.y
+        local lu, lv = math.sqrt(ux * ux + uy * uy), math.sqrt(vx * vx + vy * vy)
+        acc = acc + getDistanceBetweenCoords2d(pts[i - 1].x, pts[i - 1].y, p1.x, p1.y)
+        if acc > look then break end
+        if lu > 1 and lv > 1 then
+            local cosv = clamp((ux * vx + uy * vy) / (lu * lv), -1, 1)
+            local ang = math.acos(cosv)
+            if ang > 0.05 then
+                local radius = (lu + lv) / 2 / ang
+                local vc = math.max(5, math.sqrt(aLat * radius))
+                local vAllow = math.sqrt(vc * vc + 2 * decel * math.max(0, acc - 4))
+                if not vcap or vAllow < vcap then vcap = vAllow end
+            end
         end
-        along = along + sl
-        if along > 70 then break end
     end
-    r.cache = { x = p.x, y = p.y, turn = turnDist, till = now + 0.15 }
-    return p.x, p.y, turnDist
+    r.cache = { x = px, y = py, vcap = vcap, till = now + 0.1 }
+    return px, py, vcap
 end
 
 -- Разворот к метке --------------------------------------------------------
@@ -961,9 +1003,7 @@ local function botControl(car, tx, ty, tz, dist)
         local jd = getDistanceBetweenCoords2d(cx, cy, bot.turnAt.x, bot.turnAt.y)
         v = math.min(v, math.sqrt(2 * decel * math.max(0, jd - 4)) + (careful and 6 or 8))
     end
-    if rturn then
-        v = math.min(v, math.sqrt(2 * decel * math.max(0, rturn - 3)) + (careful and 6 or 8))
-    end
+    if rturn then v = math.min(v, rturn) end                 -- скорость по изгибам маршрута
 
     -- Препятствие прямо по курсу - настоящее торможение
     local danger = false
