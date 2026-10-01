@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Бот ездит только по дорогам: убрана езда напрямую. Нет продвижения - отъезжает и ищет другой маршрут по дорогам (с разворотом и без), без слепой езды. Метка в стороне от дороги - останавливается у ближайшей точки дороги. Гифки по ссылке или коду встраивания Tenor/Giphy прямо в меню (фон и частицы). Бот больше не сдаётся: если не может приблизиться к метке, пробует другие пути (напрямую вне дорог, отъезд и новый маршрут). Метка вдали от дороги - доезжает до неё по бездорожью. Развязки и развилки: бот едет по самой линии маршрута (не срезает через отбойник), не путает эстакады, быстрее замечает, что ушёл не в ту ветку, и заранее сбрасывает скорость перед изгибами. Сцепка: мало места перед прицепом - бот подъезжает ближе и сдаёт с короткого расстояния, не крутится бесконечно (останавливается с подсказкой). Новый виджет бота во вкладке Авто фарм (дорога, скорость, расстояние, прицеп, прогресс, кнопка запуска). Частицы Arizona и Hearts. ПКМ - Убрать фон у своих частиц. Сцепка: прицеп далеко или за забором - бот едет к нему в объезд и быстрее, без качелей вперёд-назад. Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
+-- @changelog: Своя карта дорог всего штата (из файлов игры) и свой поиск пути: бот видит маршрут до далёкой метки сразу, учитывает односторонние дороги и трассы, не мечется вперёд-назад. Бот ездит только по дорогам: убрана езда напрямую. Нет продвижения - отъезжает и ищет другой маршрут по дорогам (с разворотом и без), без слепой езды. Метка в стороне от дороги - останавливается у ближайшей точки дороги. Гифки по ссылке или коду встраивания Tenor/Giphy прямо в меню (фон и частицы). Бот больше не сдаётся: если не может приблизиться к метке, пробует другие пути (напрямую вне дорог, отъезд и новый маршрут). Метка вдали от дороги - доезжает до неё по бездорожью. Развязки и развилки: бот едет по самой линии маршрута (не срезает через отбойник), не путает эстакады, быстрее замечает, что ушёл не в ту ветку, и заранее сбрасывает скорость перед изгибами. Сцепка: мало места перед прицепом - бот подъезжает ближе и сдаёт с короткого расстояния, не крутится бесконечно (останавливается с подсказкой). Новый виджет бота во вкладке Авто фарм (дорога, скорость, расстояние, прицеп, прогресс, кнопка запуска). Частицы Arizona и Hearts. ПКМ - Убрать фон у своих частиц. Сцепка: прицеп далеко или за забором - бот едет к нему в объезд и быстрее, без качелей вперёд-назад. Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.4.9')
+script_version('2.5.0')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.4.9'
+local SCRIPT_VERSION = '2.5.0'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -633,6 +633,295 @@ local function gpsSearch(x1, y1, z1, x2, y2, z2)
     return pts
 end
 
+-- Карта дорог всего штата ---------------------------------------------------
+-- Игра держит в памяти дороги только вокруг игрока, поэтому её поиск пути не
+-- видит далёкую метку и бот метался. Здесь дороги читаются целиком из файлов игры
+-- (nodes0..63.dat в models\gta3.img) один раз при запуске, а маршрут ищется своим
+-- A* по всей карте. Учитываются односторонние дороги (на трассах встречка - это
+-- отдельная дорога, по ней не поедем) и курс машины (без лишних разворотов).
+local roadmap = { state = 'none', n = 0 }
+do
+    local function imgEntries(path)
+        local f = io.open(path, 'rb')
+        if not f then return nil end
+        local hdr = f:read(8)
+        if not hdr or #hdr < 8 or hdr:sub(1, 4) ~= 'VER2' then f:close() return nil end
+        local cnt = ffi.cast('const uint32_t *', ffi.cast('const uint8_t *', hdr) + 4)[0]
+        if cnt <= 0 or cnt > 100000 then f:close() return nil end
+        local dir = f:read(cnt * 32)
+        if not dir or #dir < cnt * 32 then f:close() return nil end
+        local p = ffi.cast('const uint8_t *', dir)
+        local out = {}
+        for i = 0, cnt - 1 do
+            local e = p + i * 32
+            local name = ffi.string(e + 8, 24):match('^[^%z]*'):lower()
+            local a = name:match('^nodes(%d+)%.dat$')
+            if a then
+                local s16 = ffi.cast('const uint16_t *', e + 4)
+                local sz = (s16[1] ~= 0) and s16[1] or s16[0]
+                out[tonumber(a)] = { off = ffi.cast('const uint32_t *', e)[0] * 2048, size = sz * 2048 }
+            end
+        end
+        return f, out
+    end
+
+    function roadmap.load()
+        roadmap.state = 'loading'
+        local ok, err = pcall(function()
+            local gd = getGameDirectory()
+            local f, ent = imgEntries(gd .. '\\models\\gta3.img')
+            local files = {}
+            for a = 0, 63 do
+                local d
+                if f and ent[a] then f:seek('set', ent[a].off); d = f:read(ent[a].size) end
+                if not d then
+                    local lf = io.open(gd .. '\\data\\paths\\nodes' .. a .. '.dat', 'rb')
+                    if lf then d = lf:read('*a'); lf:close() end
+                end
+                files[a] = d
+                if a % 8 == 7 then wait(0) end
+            end
+            if f then f:close() end
+            -- разметка файлов
+            local A, N = {}, 0
+            for a = 0, 63 do
+                local d = files[a]
+                if d and #d >= 20 then
+                    local p = ffi.cast('const uint8_t *', d)
+                    local h = ffi.cast('const uint32_t *', p)
+                    local nn, nv, nnavi, nl = tonumber(h[0]), tonumber(h[1]), tonumber(h[3]), tonumber(h[4])
+                    local navOff = 20 + nn * 28
+                    local linkOff = navOff + nnavi * 14
+                    if nn < 30000 and nv <= nn and linkOff + nl * 4 <= #d
+                        and (nv == 0 or ffi.cast('const uint16_t *', p + 20 + 18)[0] == a) then
+                        A[a] = { d = d, p = p, nv = nv, nnavi = nnavi, nl = nl, navOff = navOff, linkOff = linkOff, base = N }
+                        N = N + nv
+                    end
+                end
+            end
+            if N < (roadmap.minNodes or 500) then error('нет данных дорог (' .. N .. ')') end
+            -- где лежат ссылки на "навигационные" узлы (с полосами): после ссылок есть
+            -- 768 байт запаса - проверяем оба варианта по правдоподобию
+            for a, ar in pairs(A) do
+                local best, bestOff = -1, nil
+                for _, off in ipairs({ ar.linkOff + ar.nl * 4 + 768, ar.linkOff + ar.nl * 4 }) do
+                    if off + ar.nl * 2 <= #ar.d then
+                        local q, good = ffi.cast('const uint16_t *', ar.p + off), 0
+                        for i = 0, math.min(ar.nl, 200) - 1 do
+                            local v = q[i]
+                            local na, ni = bit.rshift(v, 10), bit.band(v, 1023)
+                            if A[na] and ni < A[na].nnavi then good = good + 1 end
+                        end
+                        if good > best then best, bestOff = good, off end
+                    end
+                end
+                ar.naviLinkOff = (best >= math.min(ar.nl, 200) * 0.9) and bestOff or nil
+            end
+            local X, Y, Z = ffi.new('float[?]', N), ffi.new('float[?]', N), ffi.new('float[?]', N)
+            local OFF = ffi.new('uint8_t[?]', N)
+            local LS = ffi.new('int32_t[?]', N + 1)
+            local to, len = {}, {}
+            local E = 0
+            for a = 0, 63 do
+                local ar = A[a]
+                if ar then
+                    for i = 0, ar.nv - 1 do
+                        local np = ar.p + 20 + i * 28
+                        local s16 = ffi.cast('const int16_t *', np + 8)
+                        local g = ar.base + i
+                        X[g], Y[g], Z[g] = s16[0] / 8, s16[1] / 8, s16[2] / 8
+                        local flags = ffi.cast('const uint32_t *', np + 24)[0]
+                        if bit.band(flags, 0x20) ~= 0 then OFF[g] = 1 end
+                    end
+                end
+                if a % 16 == 15 then wait(0) end
+            end
+            for a = 0, 63 do
+                local ar = A[a]
+                if ar then
+                    local links = ffi.cast('const uint16_t *', ar.p + ar.linkOff)
+                    local nav = ar.naviLinkOff and ffi.cast('const uint16_t *', ar.p + ar.naviLinkOff)
+                    for i = 0, ar.nv - 1 do
+                        local np = ar.p + 20 + i * 28
+                        local g = ar.base + i
+                        LS[g] = E
+                        local bl = ffi.cast('const uint16_t *', np + 16)[0]
+                        local flags = ffi.cast('const uint32_t *', np + 24)[0]
+                        local nlk = bit.band(flags, 15)
+                        if bit.band(flags, 0x80) == 0 then           -- не водный узел
+                            for k = 0, nlk - 1 do
+                                local li = bl + k
+                                if li < ar.nl then
+                                    local ta, tn = links[li * 2], links[li * 2 + 1]
+                                    local tA = A[ta]
+                                    if tA and tn < tA.nv then
+                                        local allow = true
+                                        if nav then
+                                            local v = nav[li]
+                                            local na, ni = bit.rshift(v, 10), bit.band(v, 1023)
+                                            local nA = A[na]
+                                            if nA and ni < nA.nnavi then
+                                                local q = nA.p + nA.navOff + ni * 14
+                                                local att = ffi.cast('const uint16_t *', q + 4)
+                                                local lanes = q[11]
+                                                local opp, same = bit.band(lanes, 7), bit.band(bit.rshift(lanes, 3), 7)
+                                                if opp + same > 0 then
+                                                    if att[0] == ta and att[1] == tn then allow = same > 0
+                                                    elseif att[0] == a and att[1] == i then allow = opp > 0 end
+                                                end
+                                            end
+                                        end
+                                        if allow then
+                                            local t = tA.base + tn
+                                            local dx, dy, dz = X[t] - X[g], Y[t] - Y[g], Z[t] - Z[g]
+                                            E = E + 1
+                                            to[E] = t
+                                            len[E] = math.sqrt(dx * dx + dy * dy + dz * dz) * ((OFF[t] == 1) and 1.6 or 1)
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+                if a % 8 == 7 then wait(0) end
+            end
+            LS[N] = E
+            local TO, LEN = ffi.new('int32_t[?]', E + 1), ffi.new('float[?]', E + 1)
+            for e = 1, E do TO[e - 1], LEN[e - 1] = to[e], len[e] end
+            roadmap.X, roadmap.Y, roadmap.Z, roadmap.LS, roadmap.TO, roadmap.LEN = X, Y, Z, LS, TO, LEN
+            roadmap.n, roadmap.e, roadmap.oneway = N, E, A[0] and A[0].naviLinkOff ~= nil
+        end)
+        if ok then
+            roadmap.state = 'ok'
+            log(string.format('[roads] карта дорог загружена: узлов %d, связей %d, односторонние: %s', roadmap.n, roadmap.e, tostring(roadmap.oneway)))
+        else
+            roadmap.state = 'fail'
+            log('[roads] карта дорог не загружена: ' .. tostring(err))
+        end
+    end
+
+    local function nearest(x, y, z, maxDz)
+        local X, Y, Z = roadmap.X, roadmap.Y, roadmap.Z
+        local best, bi = 1e18, nil
+        for i = 0, roadmap.n - 1 do
+            local dx, dy = X[i] - x, Y[i] - y
+            local d = dx * dx + dy * dy
+            if d < best then
+                local dz = math.abs(Z[i] - z)
+                if not maxDz or dz < maxDz then
+                    if dz > 3 then d = d + (dz - 3) * (dz - 3) * 9 end
+                    if d < best then best, bi = d, i end
+                end
+            end
+        end
+        return bi, math.sqrt(best)
+    end
+
+    -- Маршрут от машины до метки по дорогам: список точек или nil
+    function roadmap.route(car, tx, ty, tz, allowBehind)
+        if roadmap.state ~= 'ok' then return nil end
+        local X, Y, Z, LS, TO, LEN = roadmap.X, roadmap.Y, roadmap.Z, roadmap.LS, roadmap.TO, roadmap.LEN
+        local cx, cy, cz = getCarCoordinates(car)
+        local fx, fy = carBasis(car)
+        if not tz or tz == 0 or not fin(tz) then tz = cz end
+        local goal = nearest(tx, ty, tz)
+        if not goal then return nil end
+        local gx, gy, gz = X[goal], Y[goal], Z[goal]
+        -- старт: узлы рядом с машиной; те, что позади, - со штрафом за разворот
+        local g, came, closed = {}, {}, {}
+        local hk, hv, hn = {}, {}, 0
+        local function push(v, f)
+            hn = hn + 1
+            local i = hn
+            while i > 1 do
+                local pi = math.floor(i / 2)
+                if hk[pi] <= f then break end
+                hk[i], hv[i] = hk[pi], hv[pi]
+                i = pi
+            end
+            hk[i], hv[i] = f, v
+        end
+        local function pop()
+            local rv = hv[1]
+            local lk, lv = hk[hn], hv[hn]
+            hk[hn], hv[hn] = nil, nil
+            hn = hn - 1
+            if hn > 0 then
+                local i = 1
+                while true do
+                    local c = i * 2
+                    if c > hn then break end
+                    if c < hn and hk[c + 1] < hk[c] then c = c + 1 end
+                    if hk[c] >= lk then break end
+                    hk[i], hv[i] = hk[c], hv[c]
+                    i = c
+                end
+                hk[i], hv[i] = lk, lv
+            end
+            return rv
+        end
+        local function h(v)
+            local dx, dy = X[v] - gx, Y[v] - gy
+            return math.sqrt(dx * dx + dy * dy)
+        end
+        local starts = 0
+        for i = 0, roadmap.n - 1 do
+            local dx, dy = X[i] - cx, Y[i] - cy
+            local d2 = dx * dx + dy * dy
+            if d2 < 28 * 28 and math.abs(Z[i] - cz) < 7 then
+                -- до узла едем без дороги - это дорого (иначе срежет на соседнюю дорогу)
+                local d = math.sqrt(d2)
+                local ahead = dx * fx + dy * fy
+                local cost = d * 2.5 + ((ahead < -4 and not allowBehind) and 150 or 0)
+                if d > 6 and not clearLine(cx, cy, cz + 1, X[i], Y[i], Z[i] + 1) then cost = cost + 300 end
+                if not g[i] or cost < g[i] then g[i] = cost; push(i, cost + h(i)); starts = starts + 1 end
+            end
+        end
+        if starts == 0 then
+            local s, d = nearest(cx, cy, cz)
+            if not s or d > 150 then return nil end
+            g[s] = d; push(s, d + h(s))
+        end
+        local found, iter = false, 0
+        while hn > 0 do
+            local v = pop()
+            if not closed[v] then
+                closed[v] = true
+                if v == goal then found = true break end
+                iter = iter + 1
+                if iter > 80000 then break end
+                local gv = g[v]
+                for e = LS[v], LS[v + 1] - 1 do
+                    local t = TO[e]
+                    if not closed[t] then
+                        local ng = gv + LEN[e]
+                        if not g[t] or ng < g[t] then
+                            g[t], came[t] = ng, v
+                            push(t, ng + h(t))
+                        end
+                    end
+                end
+            end
+        end
+        if not found then return nil end
+        local rev, v = {}, goal
+        while v do
+            rev[#rev + 1] = v
+            v = came[v]
+        end
+        local pts = {}
+        for k = #rev, 1, -1 do
+            local i = rev[k]
+            pts[#pts + 1] = { x = X[i], y = Y[i], z = Z[i] }
+        end
+        if #pts < 2 then
+            pts[#pts + 1] = { x = tx, y = ty, z = tz }
+        end
+        return pts
+    end
+end
+
 local function routeLen(pts, i0)
     local L = 0
     for i = math.max(1, i0 or 1), #pts - 1 do
@@ -661,14 +950,17 @@ local function routeUpdate(car, tx, ty, tz, now, speed)
     local r = bot.route
     local moved = r and getDistanceBetweenCoords2d(r.tx, r.ty, tx, ty) > 10
     local nearEnd = r and routeLen(r.pts, r.idx) < 30 and getDistanceBetweenCoords2d(r.pts[#r.pts].x, r.pts[#r.pts].y, tx, ty) > 40
-    local periodic = r and now - r.t > 8
+    local periodic = r and now - r.t > (r.own and 20 or 8)
     if r and not (r.off or moved or nearEnd or periodic) then return end
     if r and r.fail and now - r.fail < 2 then return end
     if not r and bot.routeFail and now - bot.routeFail < 1 then return end
 
     local cx, cy, cz = getCarCoordinates(car)
     local gx, gy, gz = tx, ty, tz
-    local pts = gpsSearch(cx, cy, cz, gx, gy, gz)
+    -- свой маршрут по всей карте дорог; если карта не загрузилась - поиск игры
+    local pts = roadmap.route(car, tx, ty, tz, bot.allowBehind and now < bot.allowBehind)
+    local own = pts ~= nil
+    if not own then pts = gpsSearch(cx, cy, cz, gx, gy, gz) end
     local D = getDistanceBetweenCoords2d(cx, cy, tx, ty)
     if not pts and D > 300 then
         -- метка слишком далеко (дороги там ещё не загружены) - промежуточная цель 300 м в её сторону
@@ -681,7 +973,7 @@ local function routeUpdate(car, tx, ty, tz, now, speed)
     end
 
     -- Путь требует разворота - пробуем путь от точки впереди машины
-    if pts and startsBehind(car, pts) and not (bot.allowBehind and now < bot.allowBehind) then
+    if not own and pts and startsBehind(car, pts) and not (bot.allowBehind and now < bot.allowBehind) then
         local fx, fy = carBasis(car)
         local ax, ay = cx + fx * 25, cy + fy * 25
         local alt = gpsSearch(ax, ay, cz, gx, gy, gz)
@@ -715,7 +1007,7 @@ local function routeUpdate(car, tx, ty, tz, now, speed)
         end
         dense[#dense + 1] = b
     end
-    bot.route = { pts = dense, t = now, tx = tx, ty = ty, idx = 1, partial = (gx ~= tx or gy ~= ty) }
+    bot.route = { pts = dense, t = now, tx = tx, ty = ty, idx = 1, partial = (gx ~= tx or gy ~= ty), own = own }
 end
 
 -- Точка маршрута для руления + безопасная скорость по изгибам дороги впереди.
@@ -915,7 +1207,7 @@ local function botControl(car, tx, ty, tz, dist)
 
     -- 2. Маршрут по дорогам GTA
     local rwx, rwy, rturn
-    if cfg.bot.gps ~= false and gps.ok then
+    if cfg.bot.gps ~= false and (gps.ok or roadmap.state == 'ok') then
         routeUpdate(car, tx, ty, tz, now, speed)
         rwx, rwy, rturn = routeWaypoint(car, speed, tx, ty)
     end
@@ -3009,7 +3301,7 @@ local function drawFarmTab()
     if toggle('##bot_gps', 'Маршрут по дорогам GTA (как у трафика)', ui.botGps) then
         cfg.bot.gps = ui.botGps[0]; saveCfg(); bot.route = nil
     end
-    if not gps.ok then hint('Маршрут по дорогам GTA недоступен в этой версии игры, используется обычный способ.') end
+    if not gps.ok and roadmap.state ~= 'ok' then hint('Маршрут по дорогам GTA недоступен в этой версии игры, используется обычный способ.') end
 
     section('Прицеп')
     local bw = (imgui.GetContentRegionAvail().x - imgui.GetStyle().ItemSpacing.x * 2) / 3
@@ -3650,6 +3942,7 @@ function main()
 
     lua_thread.create(netThread)
     lua_thread.create(botThread)
+    lua_thread.create(roadmap.load)
     lua_thread.create(updateScheduler)
 
     local beat = os.clock()
