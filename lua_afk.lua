@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Сцепка: точнее и быстрее - ровный задний ход по линии прицепа от седла, короткая поправка вперёд вместо полного захода, сцепка с запасом по расстоянию, быстрее подъезд.
+-- @changelog: Сцепка: новый регулятор заднего хода по углу и смещению относительно прицепа (раньше мог уводить мимо). Запись хода сцепки в moonloader.log для настройки.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.3.2')
+script_version('2.3.3')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.3.2'
+local SCRIPT_VERSION = '2.3.3'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1181,6 +1181,10 @@ local function hitchControl(car)
         return
     end
 
+    if hitch.phase ~= hitch.lastPhase then
+        hitch.lastPhase = hitch.phase
+        log(string.format('[hitch] фаза %s: до шкворня %.1f, вдоль %.1f, вбок %.2f, курс %.0f', hitch.phase, dHK, along, e, headErr))
+    end
     local s = senseFront(car, 8)
     local reach = g.front + g.back + 14                      -- стартовая точка перед прицепом (запас на выравнивание)
     local ax, ay = kx + tfx * reach, ky + tfy * reach
@@ -1199,7 +1203,7 @@ local function hitchControl(car)
             hitch.phase, hitch.st = 'align', {}
             return
         end
-        local v = math.min(11, math.sqrt(2 * 5 * math.max(0, da - 2)) + 2)
+        local v = math.min(8, math.sqrt(2 * 4 * math.max(0, da - 2)) + 1.5)
         if s.fc then v = math.min(v, math.sqrt(2 * 5 * math.max(0, s.fc - 2.5))) end
         local steer = clamp(ang / 0.5, -1, 1)
         if math.abs(math.deg(ang)) > 100 then
@@ -1233,9 +1237,10 @@ local function hitchControl(car)
         local st = hitch.st
         st.from = st.from or along
         -- точка на линии прицепа впереди машины
-        local px, py = kx + tfx * (along + 12), ky + tfy * (along + 12)
-        local lx, ly = toLocal(car, px, py)
-        local steer = clamp(math.atan2(lx, ly) / 0.4, -1, 1)
+        -- вперёд: чтобы седло ушло влево (e > 0), нос влево; руль вперёд = поворот носа
+        local psi = math.deg(math.atan2(fx * tfy - fy * tfx, fx * tfx + fy * tfy))
+        local psiD = clamp(-math.deg(math.atan2(e, 6)), -30, 30)
+        local steer = clamp((psiD - psi) / 12, -1, 1)
         if along - st.from > 7 or (math.abs(e) < 0.4 and headErr < 6 and along - st.from > 3)
             or (s.fc and s.fc < 2) then
             keys(0, 0, (speed > 0.5) and 0.7 or 0)
@@ -1266,17 +1271,23 @@ local function hitchControl(car)
         keys(0, 0, 0)
         return
     end
-    local L = clamp(along * 0.6, 4, 10)
-    local px, py = kx + tfx * math.max(0, along - L), ky + tfy * math.max(0, along - L)
-    local hlx, hly = toLocal(car, hx, hy)
-    local lx, ly = toLocal(car, px, py)
-    lx, ly = lx - hlx, ly - hly                               -- цель относительно седла
-    local steer = clamp(math.atan2(lx, -ly) / 0.5, -1, 1)
-    -- далеко - быстро, у самого прицепа - аккуратно
-    local v = (dHK > 10) and 4.5 or (dHK > 5) and 3.0 or (dHK > 2.5) and 1.8 or 1.1
-    if math.abs(e) > 1 then v = math.min(v, 2.5) end
+    -- Каскадный регулятор: psi - угол фуры относительно прицепа (> 0 - нос правее),
+    -- e - смещение седла вправо от линии прицепа. Чтобы при заднем ходе седло ушло
+    -- влево (e > 0), нос должен смотреть вправо: нужный угол psiD = atan(e / дистанция).
+    -- Задним ходом руль вправо поворачивает нос влево, поэтому руль = (psi - psiD).
+    local psi = math.deg(math.atan2(fx * tfy - fy * tfx, fx * tfx + fy * tfy))
+    local psiD = clamp(math.deg(math.atan2(e, math.max(3, along * 0.7))), -30, 30)
+    local steer = clamp((psi - psiD) / 12, -1, 1)
+    -- далеко - быстрее, у самого прицепа - аккуратно
+    local v = (dHK > 10) and 4.0 or (dHK > 5) and 2.6 or (dHK > 2.5) and 1.6 or 1.0
+    if math.abs(e) > 1 or math.abs(psi - psiD) > 15 then v = math.min(v, 2.0) end
     local diff = v - speed
     keys(steer, (diff < -1) and 0.3 or 0, (diff > 0.2) and clamp(0.45 + diff * 0.15, 0.45, 0.9) or 0)
+    if now - (hitch.logT or 0) > 0.5 then
+        hitch.logT = now
+        log(string.format('[hitch] назад: до шкворня %.1f, вдоль %.1f, вбок %.2f, угол %.1f (нужно %.1f), руль %.2f, скорость %.1f',
+            dHK, along, e, psi, psiD, steer, speed))
+    end
 end
 
 local function botThread()
