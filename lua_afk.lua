@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Ворота: бот запоминает надпись «Посигнальте» в любой момент, когда она рядом; точку ворот можно задать вручную командой /lgate. Новая команда /ljobinfo показывает, на каком этапе работа и почему бот стоит.
+-- @changelog: Ворота: бот больше не стоит, если ворота не на дороге - последние 60 м едет к ним напрямую (с прицепом, без заднего хода), потом сигналит. /ljobinfo показывает и статус автопилота.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.21')
+script_version('2.5.22')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.21'
+local SCRIPT_VERSION = '2.5.22'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1849,6 +1849,31 @@ bot.jobApproach = function(car)
     local A = J.ap
     if not A then A = { best = d, progT = now, tries = 0 }; J.ap = A end
     if d < A.best - 0.3 then A.best, A.progT = d, now end
+    if J.phase == 'gate' then
+        -- К воротам с прицепом: без заднего хода (прицеп сложится), стоп в 7 м
+        local lx, ly = toLocal(car, J.x, J.y)
+        if d <= 7 or (ly < 0 and d <= 15) or (now - A.progT > 6 and d <= 20) then
+            if speed > 0.4 then keys(0, 0, 1) else keys(0, 0, 0); J.reached = true end
+            bot.status = 'Работа: у ворот'
+            return
+        end
+        if now - A.progT > 6 then
+            -- не приближаемся - отдаём управление обычному автопилоту
+            J.direct, J.ap, J.noDirectUntil = nil, nil, now + 20
+            log(string.format('[job] напрямую к воротам не проехать (%.0f м) - еду автопилотом', d))
+            return
+        end
+        local steer = clamp(math.atan2(lx, ly) / 0.6, -1, 1)
+        local vt = clamp(d * 0.3, 2.5, 7)
+        if math.abs(steer) > 0.7 then vt = math.min(vt, 3) end
+        local fs = senseFront(car, 10)
+        if fs.fc then vt = math.min(vt, math.max(0, (fs.fc - 3) * 0.6)) end
+        local gas, brake = 0, 0
+        if speed < vt then gas = 0.5 elseif speed > vt + 1 then brake = 0.6 end
+        keys(steer, gas, brake)
+        bot.status = string.format('Работа: еду к воротам напрямую, %d м', math.floor(d))
+        return
+    end
     if d <= 1.0 or (A.tries >= 4 and d <= 4) then
         if d > 1.0 and not A.logged then
             A.logged = true
@@ -1916,6 +1941,7 @@ bot.jobTick = function()
     end
     local function go(phase, text)
         J.phase, J.t, J.x, J.y, J.z, J.r, J.scan = phase, now, nil, nil, nil, nil, nil
+        J.direct, J.ap, J.reached = nil, nil, nil
         bot.tx, bot.arrived, bot.route = nil, false, nil
         if text then msg(text) end
         log('[job] этап: ' .. phase)
@@ -2110,6 +2136,15 @@ bot.jobTick = function()
             J.scan = now + 1
             local x, y, z, d, cached = bot.labelPos('посигнальте', 'G')
             J.x, J.y, J.z, J.r, J.name = x, y, z, 9, 'ворота'
+            -- Ворота обычно не на дороге: автопилот по дорогам туда не строит путь и стоит.
+            -- Последние 60 м едем напрямую.
+            if x and d <= 60 and not J.direct and now > (J.noDirectUntil or 0) then
+                J.direct, J.ap, J.reached = true, nil, nil
+                bot.tx, bot.route, bot.arrived = nil, nil, false
+                log(string.format('[job] ворота в %.0f м - еду напрямую', d))
+            elseif J.direct and (not x or d > 80) then
+                J.direct, J.ap, J.reached = nil, nil, nil
+            end
             J.status = x and string.format('Работа: еду к воротам%s, %d м', cached and ' (запомненная точка)' or '', math.floor(d)) or 'Работа: не знаю, где ворота - проедьте мимо надписи «Посигнальте» или встаньте у ворот и введите /lgate'
             if not x and bot.cp then return go('cp', 'Работа: еду по чекпоинтам.') end
             -- ворота ни разу не видели и чекпоинта нет - сигналим на месте, дальше ждём чекпоинт
@@ -2119,9 +2154,10 @@ bot.jobTick = function()
                 return go('honk', 'Работа: не вижу ворота - сигналю на месте и жду чекпоинт.')
             end
         end
-        if bot.arrived and J.x then
+        if (J.direct and J.reached) or (not J.direct and bot.arrived and J.x) then
             J.honks = (J.honks or 0) + 1
-            go('honk')
+            J.direct = nil
+            go('honk', 'Работа: у ворот - сигналю.')
         end
     elseif J.phase == 'honk' then
         J.status = 'Работа: сигналю у ворот'
@@ -2588,7 +2624,7 @@ local function botThread()
                 botRelease(); bot.status = 'Сядьте за руль'
             else
                 local x, y, z, name = botTarget()
-                if bot.job and bot.job.phase == 'label' and bot.job.direct and bot.job.x then
+                if bot.job and (bot.job.phase == 'label' or bot.job.phase == 'gate') and bot.job.direct and bot.job.x then
                     bot.jobApproach(car)
                 elseif not x then
                     botRelease(); bot.status = (bot.job and bot.job.status) or 'Нет метки'; bot.arrived = false
@@ -4798,7 +4834,7 @@ function main()
                 tostring(getTargetBlipCoordinates() and true or false), tostring(bot.cp and true or false)))
             return
         end
-        msg(string.format('Этап: %s | %s', tostring(J.phase), tostring(J.status or bot.status)))
+        msg(string.format('Этап: %s | %s | автопилот: %s (бот %s)', tostring(J.phase), tostring(J.status), tostring(bot.status), (cfg.bot.enabled == true) and 'вкл' or 'выкл'))
         local gx, gy = num(cfg.bot.jobGx, 0), num(cfg.bot.jobGy, 0)
         local px, py, pz = getCharCoordinates(PLAYER_PED)
         msg(string.format('Прицеплен: %s | сцепка идёт: %s | ворота: %s | цель: %s',
