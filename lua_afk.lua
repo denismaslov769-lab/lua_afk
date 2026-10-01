@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Бот: разворот доводится до конца - назад сдаёт до упора или пока нос не смотрит на метку, вперёд едет до препятствия; видит низкие препятствия (бордюры, заборы); больше попыток на тесный разворот.
+-- @changelog: Обновления приходят почти сразу после выхода (раньше GitHub отдавал старую версию до 5 минут).
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('1.5.2')
+script_version('1.5.3')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '1.5.2'
+local SCRIPT_VERSION = '1.5.3'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/lua_afk.lua'
 local TAG = '{33AAFF}[lua_afk]{FFFFFF} '
 
@@ -154,6 +154,12 @@ end
 -- Автообновление
 --==============================================================
 local TMP_CHECK  = TMP_DIR .. '\\lua_afk_check.tmp'
+local TMP_SHA    = TMP_DIR .. '\\lua_afk_sha.tmp'
+-- raw.githubusercontent.com по ветке main кэшируется до 5 минут. Поэтому сначала узнаём
+-- хэш последнего коммита через API (кэш ~1 минута) и качаем файл по этому хэшу - такая
+-- ссылка всегда свежая. Если API недоступен - старый способ через main.
+local API_COMMIT = 'https://api.github.com/repos/denismaslov769-lab/lua_afk/commits/main'
+local RAW_BY_SHA = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/%s/lua_afk.lua'
 local TMP_SCRIPT = TMP_DIR .. '\\lua_afk_update.tmp'
 
 local upd = {
@@ -179,7 +185,7 @@ local function checkUpdates(manual, periodic)
     if upd.state == 'prompt' or upd.state == 'downloading' or upd.state == 'installing' then return end
     if manual then msg('Проверка обновлений...') end
 
-    local started = download(SCRIPT_URL .. '?t=' .. os.time(), TMP_CHECK, nil, function(data)
+    local function onScript(data)
         if not isScript(data) then
             log('[update] не удалось получить скрипт с GitHub')
             if manual then msg('Не удалось связаться с GitHub. Попробуйте позже.') end
@@ -197,13 +203,22 @@ local function checkUpdates(manual, periodic)
         elseif manual then
             msg('У вас последняя версия (' .. SCRIPT_VERSION .. ').')
         end
+    end
+
+    local started = download(API_COMMIT .. '?t=' .. os.time(), TMP_SHA, nil, function(info)
+        local sha = info and info:match('"sha"%s*:%s*"(%x+)"')
+        upd.url = sha and RAW_BY_SHA:format(sha) or (SCRIPT_URL .. '?t=' .. os.time())
+        log('[update] источник: ' .. upd.url)
+        if not download(upd.url, TMP_CHECK, nil, onScript) and manual then
+            msg('Загрузка уже идёт, подождите пару секунд.')
+        end
     end)
     if not started and manual then msg('Загрузка уже идёт, подождите пару секунд.') end
 end
 
 local function startDownload()
     upd.state, upd.progress, upd.shown, upd.error, upd.newCode = 'downloading', 0.0, 0.0, nil, nil
-    local started = download(SCRIPT_URL .. '?t=' .. os.time(), TMP_SCRIPT,
+    local started = download(upd.url or (SCRIPT_URL .. '?t=' .. os.time()), TMP_SCRIPT,
         function(f) upd.progress = math.min(f, 0.99) end,
         function(data)
             if isScript(data) then
