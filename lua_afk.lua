@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Бот: заранее видит нужный поворот на перекрёстке, сбрасывает скорость и уверенно в него заходит. Если проехал поворот - разворачивается вдоль дороги, а не носом в дома.
+-- @changelog: Бот строит маршрут встроенным поиском пути GTA (как машины трафика): знает все перекрёстки и поворачивает туда, куда ведёт дорога к метке. Отключается в меню.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.1.0')
+script_version('2.2.0')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.1.0'
+local SCRIPT_VERSION = '2.2.0'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -46,6 +46,7 @@ local cfg = inicfg.load({
         lane     = false,   -- держаться своей (правой) полосы
         laneOff  = 2.5,     -- смещение от оси дороги, м
         turn     = true,    -- разворот к метке
+        gps      = true,    -- маршрут по дорогам GTA (встроенный поиск пути игры)
     },
     theme = {
         accent     = '#3F99FF',
@@ -394,7 +395,7 @@ local function botRelease()
         bot.active = false
     end
     bot.wx, bot.wy, bot.vt, bot.turnAt = nil, nil, nil, nil
-    bot.man, bot.recover, bot.stuckSince, bot.commit = nil, nil, nil, nil
+    bot.man, bot.recover, bot.stuckSince, bot.commit, bot.route = nil, nil, nil, nil, nil
 end
 
 -- Геометрия -------------------------------------------------------------
@@ -605,12 +606,131 @@ local function planWaypoint(car, tx, ty, tz)
     return pick.x, pick.y, false
 end
 
+-- Маршрут по дорогам GTA (как у машин трафика) ---------------------------------
+-- Встроенный поиск пути игры CPathFind::DoPathSearch (GTA SA 1.0 US). Он знает все
+-- дороги и перекрёстки вокруг, поэтому бот поворачивает туда, куда реально ведёт дорога.
+-- Только чтение и вызов функции игры, память игры не меняется. Если что-то не так -
+-- функция отключается и бот ездит по старому способу.
+ffi.cdef[[
+typedef struct { uint16_t area; uint16_t node; } lafk_naddr;
+]]
+local GPS_FN, PATHS = 0x4515D0, 0x96F050
+local gps = { ok = true, res = nil, cnt = nil, dist = nil, fn = nil }
+
+local function gpsSearch(x1, y1, z1, x2, y2, z2)
+    if not gps.ok then return nil end
+    if not gps.fn then
+        local ok = pcall(function()
+            gps.fn = ffi.cast('void(__thiscall*)(void*, uint32_t, float, float, float, uint32_t, float, float, float, '
+                .. 'lafk_naddr*, int16_t*, int32_t, float*, float, lafk_naddr*, float, uint32_t, uint32_t, uint32_t, uint32_t)', GPS_FN)
+            gps.res  = ffi.new('lafk_naddr[?]', 512)
+            gps.cnt  = ffi.new('int16_t[1]')
+            gps.dist = ffi.new('float[1]')
+        end)
+        if not ok then gps.ok = false return nil end
+    end
+    gps.cnt[0] = 0
+    gps.fn(ffi.cast('void*', PATHS), 0, x1, y1, z1, 0xFFFFFFFF, x2, y2, z2,
+           gps.res, gps.cnt, 500, gps.dist, 999999.0, nil, 999999.0, 0, 0xFFFFFFFF, 0, 0)
+    local n = tonumber(gps.cnt[0]) or 0
+    if n <= 0 or n > 500 then return nil end
+    local lists = ffi.cast('uint8_t**', PATHS + 0x804)
+    local pts = {}
+    for i = 0, n - 1 do
+        local a = gps.res[i]
+        if a.area >= 72 then break end
+        local base = lists[a.area]
+        if base == nil then break end
+        local node = base + a.node * 0x1C
+        -- проверка, что структура узла та, что мы ожидаем (номер области и узла внутри узла)
+        local ids = ffi.cast('uint16_t*', node + 0x12)
+        if ids[0] ~= a.area or ids[1] ~= a.node then
+            log('[gps] неожиданная структура узлов, маршрут по дорогам GTA отключён')
+            gps.ok = false
+            return nil
+        end
+        local p = ffi.cast('int16_t*', node + 0x8)
+        pts[#pts + 1] = { x = p[0] / 8, y = p[1] / 8, z = p[2] / 8 }
+    end
+    if #pts < 2 then return nil end
+    -- порядок: от машины к цели
+    local f, l = pts[1], pts[#pts]
+    if getDistanceBetweenCoords2d(f.x, f.y, x1, y1) > getDistanceBetweenCoords2d(l.x, l.y, x1, y1) then
+        local r = {}
+        for i = #pts, 1, -1 do r[#r + 1] = pts[i] end
+        pts = r
+    end
+    return pts
+end
+
+-- Обновить маршрут (раз в 1.5 с, при новой цели или если машина ушла с маршрута)
+local function routeUpdate(car, tx, ty, tz, now)
+    local r = bot.route
+    local cx, cy, cz = getCarCoordinates(car)
+    local need = not r or now - r.t > 1.5 or getDistanceBetweenCoords2d(r.tx, r.ty, tx, ty) > 10 or r.off
+    if not need then return end
+    local pts = gpsSearch(cx, cy, cz, tx, ty, tz)
+    if pts then
+        bot.route = { pts = pts, t = now, tx = tx, ty = ty, idx = 1 }
+    else
+        bot.route = nil
+    end
+end
+
+-- Точка маршрута для руления + расстояние до ближайшего крутого поворота по маршруту
+local function routeWaypoint(car, speed, tx, ty)
+    local r = bot.route
+    if not r then return nil end
+    local pts = r.pts
+    local cx, cy, cz = getCarCoordinates(car)
+    -- ближайшая точка маршрута (ищем вперёд от прошлой)
+    local bi, bd = r.idx, 1e9
+    for i = math.max(1, r.idx - 2), math.min(#pts, r.idx + 25) do
+        local d = getDistanceBetweenCoords2d(cx, cy, pts[i].x, pts[i].y)
+        if d < bd then bi, bd = i, d end
+    end
+    r.idx = bi
+    if bd > 30 then r.off = true return nil end
+    -- первая точка дальше R, затем назад до той, к которой есть проезд
+    local R = clamp(8 + speed * 0.7, 10, 28)
+    local pick = #pts
+    for i = bi, #pts do
+        if getDistanceBetweenCoords2d(cx, cy, pts[i].x, pts[i].y) >= R then pick = i break end
+    end
+    while pick > bi + 1 do
+        local p = pts[pick]
+        if clearLine(cx, cy, cz + 0.6, p.x, p.y, p.z + 1.2) and corridorClear(car, p.x, p.y, p.z + 0.4) then break end
+        pick = pick - 1
+    end
+    if pick == bi and bi < #pts and bd < 6 then pick = bi + 1 end
+    local p = pts[pick]
+    -- конец маршрута рядом с меткой - дальше едем прямо к метке
+    if pick == #pts and getDistanceBetweenCoords2d(p.x, p.y, tx, ty) < 40 and getDistanceBetweenCoords2d(cx, cy, p.x, p.y) < 12 then
+        return nil
+    end
+    -- крутой поворот впереди (до 70 м по маршруту)
+    local fx, fy = carBasis(car)
+    local along, turnDist = bd, nil
+    for i = bi, math.min(#pts - 1, bi + 20) do
+        local a, b = pts[i], pts[i + 1]
+        local sx, sy = b.x - a.x, b.y - a.y
+        local sl = math.sqrt(sx * sx + sy * sy)
+        if sl > 2 then
+            local cosv = (sx * fx + sy * fy) / sl
+            if cosv < 0.7 then turnDist = along break end   -- больше ~45 градусов от курса
+        end
+        along = along + sl
+        if along > 70 then break end
+    end
+    return p.x, p.y, turnDist
+end
+
 -- Разворот к метке --------------------------------------------------------
 -- Метка сзади или сбоку (или впереди стена). Если перед машиной есть место -
 -- разворачиваемся вперёд с полным рулём. Иначе сдаём назад с рулём в обратную
 -- сторону (нос уходит к метке). Фаза меняется, когда до препятствия меньше метра,
 -- когда машина упёрлась (педаль нажата, а не едет) или когда нос уже смотрит на метку.
-local function maneuver(car, tx, ty, dist, s, now, speed)
+local function maneuver(car, tx, ty, dist, s, now, speed, routed)
     if cfg.bot.turn == false then bot.man = nil return false end
     local lx, ly = toLocal(car, tx, ty)
     local ang = math.deg(math.atan2(lx, ly))   -- > 0 справа, 180 - сзади
@@ -635,7 +755,7 @@ local function maneuver(car, tx, ty, dist, s, now, speed)
         m = { dir = dir, phase = room and 'fwd' or 'back', since = now, start = now, n = 0 }
         -- Метка сзади и далеко (проехали поворот): разворачиваемся вдоль дороги на 180 градусов,
         -- а не носом в сторону метки (там обычно дома). Дальше поворот найдёт маршрут.
-        if behind and dist > 45 then
+        if behind and dist > 45 and not routed then
             local cx, cy = getCarCoordinates(car)
             local fx, fy = carBasis(car)
             m.gx, m.gy = cx - fx * 60, cy - fy * 60
@@ -718,15 +838,39 @@ local function botControl(car, tx, ty, tz, dist)
     local len = math.min(60, 6 + speed * speed / (2 * decel) + speed * 0.3)
     local s = senseFront(car, len)
 
-    -- 2. Разворот к метке
-    if maneuver(car, tx, ty, dist, s, now, speed) then
+    -- 2. Маршрут по дорогам GTA
+    local rwx, rwy, rturn
+    if cfg.bot.gps ~= false and gps.ok then
+        routeUpdate(car, tx, ty, tz, now)
+        rwx, rwy, rturn = routeWaypoint(car, speed, tx, ty)
+    end
+
+    -- 3. Разворот: к точке маршрута (если она сзади) или к метке
+    local goalX, goalY = tx, ty
+    if rwx then goalX, goalY = rwx, rwy end
+    if maneuver(car, goalX, goalY, dist, s, now, speed, rwx ~= nil) then
         bot.vt, bot.stuckSince, bot.bestTime = 0, nil, now
         return
     end
 
+    if rwx then
+        bot.commit, bot.turnAt = nil, nil
+        if cfg.bot.lane then
+            local cx, cy, cz = getCarCoordinates(car)
+            local dx, dy = rwx - cx, rwy - cy
+            local l = math.sqrt(dx * dx + dy * dy)
+            if l > 1 then
+                local off = num(cfg.bot.laneOff, 2.5)
+                local sx, sy = rwx + dy / l * off, rwy - dx / l * off
+                if clearLine(cx, cy, cz + 0.6, sx, sy, cz + 0.6) then rwx, rwy = sx, sy end
+            end
+        end
+        bot.wx, bot.wy, bot.nextPlan = rwx, rwy, now + 0.25
+    end
+
     -- 3. Точка маршрута (4 раза в секунду). На перекрёстке, где нужно повернуть,
     -- бот "заходит в поворот": едет на узел боковой дороги, пока не повернёт.
-    if bot.commit then
+    if not rwx and bot.commit then
         local c = bot.commit
         local cx, cy = getCarCoordinates(car)
         local _, cly = toLocal(car, c.ex, c.ey)
@@ -736,7 +880,7 @@ local function botControl(car, tx, ty, tz, dist)
             bot.wx, bot.wy, bot.nextPlan = c.ex, c.ey, now + 0.25
         end
     end
-    if bot.turnAt and not bot.commit then
+    if not rwx and bot.turnAt and not bot.commit then
         local cx, cy = getCarCoordinates(car)
         local jd = getDistanceBetweenCoords2d(cx, cy, bot.turnAt.x, bot.turnAt.y)
         if jd < math.max(7, speed * 0.9) then
@@ -744,7 +888,7 @@ local function botControl(car, tx, ty, tz, dist)
             bot.wx, bot.wy, bot.turnAt, bot.nextPlan = bot.turnAt.ex, bot.turnAt.ey, nil, now + 0.25
         end
     end
-    if not bot.commit and (now >= bot.nextPlan or not bot.wx) then
+    if not rwx and not bot.commit and (now >= bot.nextPlan or not bot.wx) then
         bot.nextPlan = now + 0.25
         local wx, wy, direct = planWaypoint(car, tx, ty, tz)
         if wx and cfg.bot.lane and not direct then
@@ -773,9 +917,9 @@ local function botControl(car, tx, ty, tz, dist)
         if sn > 0.02 then v = math.min(v, math.max(6, math.sqrt(aLat * wd / (2 * sn)))) end
     end
 
-    -- Метка позади (проехали) - сбрасываем скорость, чтобы развернуться
+    -- Цель позади (проехали) - сбрасываем скорость, чтобы развернуться
     do
-        local tlx, tly = toLocal(car, tx, ty)
+        local tlx, tly = toLocal(car, goalX, goalY)
         if math.abs(math.deg(math.atan2(tlx, tly))) > 110 and dist > num(cfg.bot.radius, 12) then v = math.min(v, 8) end
     end
 
@@ -785,6 +929,9 @@ local function botControl(car, tx, ty, tz, dist)
         local cx, cy = getCarCoordinates(car)
         local jd = getDistanceBetweenCoords2d(cx, cy, bot.turnAt.x, bot.turnAt.y)
         v = math.min(v, math.sqrt(2 * decel * math.max(0, jd - 4)) + (careful and 6 or 8))
+    end
+    if rturn then
+        v = math.min(v, math.sqrt(2 * decel * math.max(0, rturn - 3)) + (careful and 6 or 8))
     end
 
     -- Препятствие прямо по курсу - настоящее торможение
@@ -928,6 +1075,7 @@ local ui = {
     botRadius  = imgui.new.int(num(cfg.bot.radius, 12)),
     botTake    = imgui.new.bool(cfg.bot.takeover ~= false),
     botTurn    = imgui.new.bool(cfg.bot.turn ~= false),
+    botGps     = imgui.new.bool(cfg.bot.gps ~= false),
     botLane    = imgui.new.bool(cfg.bot.lane == true),
     botLaneOff = imgui.new.float(num(cfg.bot.laneOff, 2.5)),
 
@@ -1276,6 +1424,10 @@ local function drawFarmTab()
     if toggle('##bot_turn', 'Разворот к метке (вперёд или задним ходом)', ui.botTurn) then
         cfg.bot.turn = ui.botTurn[0]; saveCfg()
     end
+    if toggle('##bot_gps', 'Маршрут по дорогам GTA (как у трафика)', ui.botGps) then
+        cfg.bot.gps = ui.botGps[0]; saveCfg(); bot.route = nil
+    end
+    if not gps.ok then hint('Маршрут по дорогам GTA недоступен в этой версии игры, используется обычный способ.') end
 
     section('Полоса')
     if toggle('##bot_lane', 'Держаться своей полосы', ui.botLane) then
