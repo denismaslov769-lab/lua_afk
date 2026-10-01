@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Работа дальнобойщика без метки: бот сам едет к «Получить загруженный прицеп» (бот на фуре без метки и чекпоинта включает работу сам), запоминает место базы и ворот (едет к ним даже издалека), ждёт выбора груза в окне, цепляет только настоящий прицеп сервера той же модели, что и визуальный (не свой визуальный), и только потом едет к «Посигнальте». Работа дальнобойщика (/ljob): бот сам едет на базу к надписи «Получить загруженный прицеп», цепляет прицеп, сигналит у ворот и едет по чекпоинтам, после рейса - снова на базу. Бот не разворачивается и не зацикливается, когда дорога временно уводит от метки (продвижение считается по пути по дороге). Исправлено направление односторонних дорог: бот больше не едет по встречной половине трассы. Команда /lafkdbg - показывает линию маршрута и полосу бота на экране. Правая полоса по самой дороге: бот находит правый край асфальта (бордюр, разделительная, газон) и держится своей полосы. Правая полоса: сдвиг как у машин трафика игры (крайняя правая полоса, с учётом разделительной), в поворотах не срезает угол через встречку. Повороты проходит быстрее (точнее считает радиус поворота). Своя карта дорог всего штата (из файлов игры) и свой поиск пути: бот видит маршрут до далёкой метки сразу, учитывает односторонние дороги и трассы, не мечется вперёд-назад. Бот ездит только по дорогам: убрана езда напрямую. Нет продвижения - отъезжает и ищет другой маршрут по дорогам (с разворотом и без), без слепой езды. Метка в стороне от дороги - останавливается у ближайшей точки дороги. Гифки по ссылке или коду встраивания Tenor/Giphy прямо в меню (фон и частицы). Бот больше не сдаётся: если не может приблизиться к метке, пробует другие пути (напрямую вне дорог, отъезд и новый маршрут). Метка вдали от дороги - доезжает до неё по бездорожью. Развязки и развилки: бот едет по самой линии маршрута (не срезает через отбойник), не путает эстакады, быстрее замечает, что ушёл не в ту ветку, и заранее сбрасывает скорость перед изгибами. Сцепка: мало места перед прицепом - бот подъезжает ближе и сдаёт с короткого расстояния, не крутится бесконечно (останавливается с подсказкой). Новый виджет бота во вкладке Авто фарм (дорога, скорость, расстояние, прицеп, прогресс, кнопка запуска). Частицы Arizona и Hearts. ПКМ - Убрать фон у своих частиц. Сцепка: прицеп далеко или за забором - бот едет к нему в объезд и быстрее, без качелей вперёд-назад. Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
+-- @changelog: Бот дальнобойщика автоматически выбирает первый груз в CEF-окне «Выбор груза» и продолжает к выданному прицепу.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.9')
+script_version('2.5.10')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.9'
+local SCRIPT_VERSION = '2.5.10'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1697,6 +1697,40 @@ bot.trailerSnapshot = function()
     return t
 end
 
+-- CEF показывает первый груз уже выделенным и подтверждает его Enter.
+-- Нажатие делаем коротким импульсом в отдельном потоке, чтобы не задерживать botTick.
+pcall(ffi.cdef, [[
+void __stdcall keybd_event(unsigned char bVk, unsigned char bScan, unsigned long dwFlags, unsigned long dwExtraInfo);
+]])
+local cefUser32
+do
+    local ok, lib = pcall(ffi.load, 'user32')
+    if ok then cefUser32 = lib end
+end
+local cefEnterBusy = false
+local function pressCefEnter()
+    if cefEnterBusy then return false end
+    cefEnterBusy = true
+    lua_thread.create(function()
+        local key = rawget(_G, 'setVirtualKeyDown')
+        if cefUser32 then
+            -- В отличие от одной лишь подмены состояния клавиши, Windows-событие
+            -- доходит до Chromium/CEF.
+            pcall(cefUser32.keybd_event, 0x0D, 0x1C, 0, 0)
+            wait(90)
+            pcall(cefUser32.keybd_event, 0x0D, 0x1C, 0x0002, 0)
+        elseif type(key) == 'function' then
+            pcall(key, 0x0D, true)
+            wait(90)
+            pcall(key, 0x0D, false)
+        else
+            log('[job] setVirtualKeyDown недоступен - не могу выбрать груз в CEF')
+        end
+        cefEnterBusy = false
+    end)
+    return true
+end
+
 bot.jobTick = function()
     local J = bot.job
     if not isCharInAnyCar(PLAYER_PED) then
@@ -1728,9 +1762,16 @@ bot.jobTick = function()
             local x, y, z, d, cached = bot.labelPos('получить загруженный прицеп', 'L')
             -- издалека (по запомненной точке) - ко входу на базу, рядом - точно к надписи
             if J.x and x and getDistanceBetweenCoords2d(J.x, J.y, x, y) < 3 then x, y, z = J.x, J.y, J.z end
-            J.x, J.y, J.z, J.r, J.name = x, y, z, 3.5, 'база дальнобойщика'
+            J.x, J.y, J.z, J.r, J.name, J.labelDist = x, y, z, 3.5, 'база дальнобойщика', d
             J.status = x and string.format('Работа: еду на базу%s, %d м', cached and ' (запомненная точка)' or '', math.floor(d))
                 or 'Работа: не знаю, где база - подъедьте один раз к надписи «Получить загруженный прицеп», бот запомнит'
+        end
+        -- После перезапуска скрипта CEF мог уже остаться открытым. Считаем это
+        -- подтверждением прибытия, иначе бот пытается ехать с перехваченным CEF вводом.
+        if J.x and J.labelDist and J.labelDist < 20 and (sampIsDialogActive() or sampIsCursorActive()) then
+            go('take', 'Работа: меню груза уже открыто, выбираю первый пункт.')
+            J.known, J.cursorT = bot.trailerSnapshot(), now
+            return
         end
         if bot.arrived and J.x then
             local _, _, _, _, cached = bot.labelPos('получить загруженный прицеп', 'L')
@@ -1745,10 +1786,25 @@ bot.jobTick = function()
     elseif J.phase == 'take' then
         if hooked then return go('gate', 'Работа: прицеп прицеплен, еду к воротам.') end
         J.known = J.known or bot.trailerSnapshot()
-        -- окно выбора груза (CEF) - с курсором; пока оно открыто, ждём
+        -- Окно выбора груза (CEF): первый пункт выделен по умолчанию.
+        -- Автоматически подтверждаем его Enter; если CEF не принял импульс,
+        -- повторяем ещё два раза с паузой.
         local menu = sampIsDialogActive() or sampIsCursorActive()
-        if menu then J.cursorT = now end
-        J.status = menu and 'Работа: выберите груз в окне' or 'Работа: жду прицеп'
+        if menu then
+            J.cursorT = now
+            J.menuSeen = J.menuSeen or now
+            J.pickTries = J.pickTries or 0
+            if now - J.menuSeen >= 0.8 and J.pickTries < 3 and now >= (J.nextPick or 0) then
+                if pressCefEnter() then
+                    J.pickTries = J.pickTries + 1
+                    J.nextPick = now + 2.0
+                    log(string.format('[job] CEF: подтверждаю груз №1, попытка %d', J.pickTries))
+                end
+            end
+        end
+        J.status = menu
+            and (J.pickTries and J.pickTries > 0 and 'Работа: выбираю груз №1' or 'Работа: открылось меню груза')
+            or 'Работа: жду прицеп'
         if not menu and now - J.t > 1.5 then
             -- сначала ждём новый (выданный) прицеп; старый ближайший - только если нового нет 10 с
             local since = J.cursorT or J.t
@@ -4402,4 +4458,5 @@ function onScriptTerminate(s, quit)
         pcall(deleteTrailer)
     end
 end
+
 
