@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Бот строит маршрут встроенным поиском пути GTA (как машины трафика): знает все перекрёстки и поворачивает туда, куда ведёт дорога к метке. Отключается в меню.
+-- @changelog: Бот больше не мечется между дорогами: держится выбранного маршрута, не разворачивается без большой выгоды, для далёкой метки едет через промежуточные точки.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.2.0')
+script_version('2.2.1')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.2.0'
+local SCRIPT_VERSION = '2.2.1'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -663,24 +663,85 @@ local function gpsSearch(x1, y1, z1, x2, y2, z2)
     return pts
 end
 
--- Обновить маршрут (раз в 1.5 с, при новой цели или если машина ушла с маршрута)
-local function routeUpdate(car, tx, ty, tz, now)
-    local r = bot.route
-    local cx, cy, cz = getCarCoordinates(car)
-    local need = not r or now - r.t > 1.5 or getDistanceBetweenCoords2d(r.tx, r.ty, tx, ty) > 10 or r.off
-    if not need then return end
-    local pts = gpsSearch(cx, cy, cz, tx, ty, tz)
-    if pts then
-        bot.route = { pts = pts, t = now, tx = tx, ty = ty, idx = 1 }
-    else
-        bot.route = nil
+local function routeLen(pts, i0)
+    local L = 0
+    for i = math.max(1, i0 or 1), #pts - 1 do
+        L = L + getDistanceBetweenCoords2d(pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y)
     end
+    return L
+end
+
+-- Маршрут начинается назад (нужен разворот)?
+local function startsBehind(car, pts)
+    local cx, cy = getCarCoordinates(car)
+    for i = 1, math.min(#pts, 8) do
+        if getDistanceBetweenCoords2d(cx, cy, pts[i].x, pts[i].y) >= 10 then
+            local lx, ly = toLocal(car, pts[i].x, pts[i].y)
+            return math.abs(math.deg(math.atan2(lx, ly))) > 100
+        end
+    end
+    return false
+end
+
+-- Обновление маршрута. Маршрут НЕ меняется без причины: только если машина ушла с него,
+-- сменилась метка, он заканчивается, или раз в 8 с - и то лишь если новый заметно короче.
+-- Так бот не мечется между несколькими почти одинаковыми дорогами к метке.
+-- Разворот назад выбирается, только если путь вперёд длиннее больше чем на 250 м.
+local function routeUpdate(car, tx, ty, tz, now, speed)
+    local r = bot.route
+    local moved = r and getDistanceBetweenCoords2d(r.tx, r.ty, tx, ty) > 10
+    local nearEnd = r and (#r.pts - r.idx) < 4 and getDistanceBetweenCoords2d(r.pts[#r.pts].x, r.pts[#r.pts].y, tx, ty) > 40
+    local periodic = r and now - r.t > 8
+    if r and not (r.off or moved or nearEnd or periodic) then return end
+    if r and r.fail and now - r.fail < 2 then return end
+    if not r and bot.routeFail and now - bot.routeFail < 1 then return end
+
+    local cx, cy, cz = getCarCoordinates(car)
+    local gx, gy, gz = tx, ty, tz
+    local pts = gpsSearch(cx, cy, cz, gx, gy, gz)
+    local D = getDistanceBetweenCoords2d(cx, cy, tx, ty)
+    if not pts and D > 300 then
+        -- метка слишком далеко (дороги там ещё не загружены) - промежуточная цель 300 м в её сторону
+        local ix, iy = cx + (tx - cx) / D * 300, cy + (ty - cy) / D * 300
+        local nx, ny, nz = getClosestCarNode(ix, iy, cz)
+        if nx and fin(nx) and (nx ~= 0 or ny ~= 0) then
+            gx, gy, gz = nx, ny, nz or cz
+            pts = gpsSearch(cx, cy, cz, gx, gy, gz)
+        end
+    end
+
+    -- Путь требует разворота - пробуем путь от точки впереди машины
+    if pts and startsBehind(car, pts) then
+        local fx, fy = carBasis(car)
+        local ax, ay = cx + fx * 25, cy + fy * 25
+        local alt = gpsSearch(ax, ay, cz, gx, gy, gz)
+        if alt and getDistanceBetweenCoords2d(alt[1].x, alt[1].y, ax, ay) < 15
+            and clearLine(cx, cy, cz + 0.6, alt[1].x, alt[1].y, alt[1].z + 1.2)
+            and not startsBehind(car, alt)
+            and routeLen(alt) + 25 <= routeLen(pts) + 250 then
+            pts = alt
+        end
+    end
+
+    if not pts then
+        bot.routeFail = now
+        if r then r.fail = now end
+        if not r or r.off then bot.route = nil end
+        return
+    end
+    -- Держимся текущего маршрута, если новый не короче хотя бы на 15%
+    if r and not r.off and not moved and not nearEnd then
+        if routeLen(pts) > routeLen(r.pts, r.idx) * 0.85 then r.t = now return end
+    end
+    bot.route = { pts = pts, t = now, tx = tx, ty = ty, idx = 1 }
 end
 
 -- Точка маршрута для руления + расстояние до ближайшего крутого поворота по маршруту
 local function routeWaypoint(car, speed, tx, ty)
     local r = bot.route
     if not r then return nil end
+    local now = os.clock()
+    if r.cache and now < r.cache.till then return r.cache.x, r.cache.y, r.cache.turn end
     local pts = r.pts
     local cx, cy, cz = getCarCoordinates(car)
     -- ближайшая точка маршрута (ищем вперёд от прошлой)
@@ -690,7 +751,7 @@ local function routeWaypoint(car, speed, tx, ty)
         if d < bd then bi, bd = i, d end
     end
     r.idx = bi
-    if bd > 30 then r.off = true return nil end
+    if bd > 30 then r.off, r.cache = true, nil return nil end
     -- первая точка дальше R, затем назад до той, к которой есть проезд
     local R = clamp(8 + speed * 0.7, 10, 28)
     local pick = #pts
@@ -722,6 +783,7 @@ local function routeWaypoint(car, speed, tx, ty)
         along = along + sl
         if along > 70 then break end
     end
+    r.cache = { x = p.x, y = p.y, turn = turnDist, till = now + 0.15 }
     return p.x, p.y, turnDist
 end
 
@@ -841,7 +903,7 @@ local function botControl(car, tx, ty, tz, dist)
     -- 2. Маршрут по дорогам GTA
     local rwx, rwy, rturn
     if cfg.bot.gps ~= false and gps.ok then
-        routeUpdate(car, tx, ty, tz, now)
+        routeUpdate(car, tx, ty, tz, now, speed)
         rwx, rwy, rturn = routeWaypoint(car, speed, tx, ty)
     end
 
