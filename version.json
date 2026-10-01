@@ -1,5 +1,5 @@
 {
-  "version": "0.4.1",
+  "version": "0.5.0",
   "url": "https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/lua_afk.lua",
-  "changelog": "Исправления автообновления, подробные сообщения в /lafkupd."
+  "changelog": "Новая вкладка Авто фар: бот дальнобойщик (едет по дорогам к чекпоинту или метке на карте). Команда /ltruck."
 }

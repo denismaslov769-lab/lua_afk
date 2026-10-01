@@ -4,7 +4,7 @@
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('0.4.1')
+script_version('0.5.0')
 script_description('Скрипт для Arizona RP: меню, авто спавн, автообновление')
 
 local imgui    = require('mimgui')
@@ -17,7 +17,7 @@ encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
 -- ===================== Настройки =====================
-local SCRIPT_VERSION = '0.4.1'
+local SCRIPT_VERSION = '0.5.0'
 local REPO_RAW    = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/'
 local VERSION_URL = REPO_RAW .. 'version.json'
 local SCRIPT_URL  = REPO_RAW .. 'lua_afk.lua'
@@ -43,6 +43,14 @@ local cfg = inicfg.load({
         bg         = '#12141C', -- цвет фона окна
         childAlpha = 0.80,      -- прозрачность панелей
         rounding   = 12,        -- скругление
+    },
+    bot = {
+        enabled  = false,
+        source   = 0,     -- 0 = авто, 1 = только чекпоинт, 2 = только метка на карте
+        speed    = 25,
+        style    = 0,     -- 0 = объезжать машины, 1 = тормозить перед машинами (светофоры игнорируются всегда)
+        radius   = 12,    -- радиус прибытия, м
+        takeover = true,  -- W/S забирают управление
     },
     particles = {
         enabled = true,
@@ -428,6 +436,36 @@ local function iconInfo(dl, c, col)
     dl:AddRectFilled(vec(c.x - 1, c.y - 1), vec(c.x + 1, c.y + 4.5), col)
 end
 
+-- Фура: x, y - левый верхний угол, s - масштаб (размер примерно 58s x 26s)
+local function drawTruck(dl, x, y, s, body, cab, alpha)
+    alpha = alpha or 1
+    local function R(a, b, c, d, col, r)
+        dl:AddRectFilled(vec(x + a * s, y + b * s), vec(x + c * s, y + d * s), col, (r or 0) * s)
+    end
+    local dark   = U32(V4(0.05, 0.06, 0.08, alpha))
+    local wheel  = U32(V4(0.16, 0.17, 0.20, alpha))
+    local hub    = U32(V4(0.70, 0.72, 0.78, alpha))
+    local glass  = U32(V4(0.55, 0.80, 1.00, 0.85 * alpha))
+    local light  = U32(V4(1.00, 0.85, 0.35, alpha))
+
+    R(0, 0, 38, 18, body, 2)            -- прицеп
+    R(2, 2, 36, 4, U32(V4(1, 1, 1, 0.12 * alpha)), 1) -- блик на прицепе
+    R(38, 14, 41, 19, dark)             -- сцепка
+    R(41, 3, 54, 19, cab, 2.5)          -- кабина
+    R(54, 10, 58, 19, cab, 1.5)         -- капот
+    R(47, 5, 53, 11, glass, 1)          -- окно
+    R(56.5, 12, 58, 14, light)          -- фара
+    R(0, 18.5, 58, 21, dark, 1)         -- рама
+    for _, wx in ipairs({ 7, 15, 49 }) do
+        dl:AddCircleFilled(vec(x + wx * s, y + 22 * s), 3.6 * s, wheel, 16)
+        dl:AddCircleFilled(vec(x + wx * s, y + 22 * s), 1.4 * s, hub, 12)
+    end
+end
+
+local function iconTruck(dl, c, col)
+    drawTruck(dl, c.x - 9.3, c.y - 6, 0.32, col, col)
+end
+
 local function iconClose(dl, c, col)
     dl:AddLine(vec(c.x - 5, c.y - 5), vec(c.x + 5, c.y + 5), col, 2)
     dl:AddLine(vec(c.x + 5, c.y - 5), vec(c.x - 5, c.y + 5), col, 2)
@@ -508,6 +546,167 @@ local function drawSpawnTab()
     imgui.PopItemWidth()
 end
 
+-- ===================== Бот дальнобойщик =====================
+local bot = { status = 'Выключен', driving = false, cp = nil, tx = nil, ty = nil,
+              lastTask = 0, stuckSince = nil, pauseUntil = 0, arrived = false }
+
+-- Чекпоинты сервера (красные метки) - нужна библиотека SAMP.Lua (lib/samp/events)
+local hasSampev, sampev = pcall(require, 'lib.samp.events')
+if hasSampev then
+    function sampev.onSetCheckpoint(pos, radius)      bot.cp = { pos.x, pos.y, pos.z } end
+    function sampev.onDisableCheckpoint()             bot.cp = nil end
+    function sampev.onSetRaceCheckpoint(t, pos, nxt, size) bot.cp = { pos.x, pos.y, pos.z } end
+    function sampev.onDisableRaceCheckpoint()         bot.cp = nil end
+end
+
+local function isArizona()
+    local ok, name = pcall(sampGetCurrentServerName)
+    if not ok or type(name) ~= 'string' then return false end
+    local n = u8(name):lower()
+    return n:find('arizona', 1, true) ~= nil or n:find('аризона', 1, true) ~= nil or n:find('Аризона', 1, true) ~= nil
+end
+
+local function botTarget()
+    local src = tonumber(cfg.bot.source) or 0
+    if src ~= 2 and bot.cp then return bot.cp[1], bot.cp[2], bot.cp[3], 'чекпоинт' end
+    if src ~= 1 then
+        local ok, x, y, z = getTargetBlipCoordinates()
+        if ok then
+            if not z or z == 0 then z = getGroundZFor3dCoord(x, y, 1000.0) end
+            return x, y, z, 'метка на карте'
+        end
+    end
+end
+
+local function botStop()
+    if bot.driving then
+        clearCharTasks(PLAYER_PED)
+        bot.driving = false
+    end
+end
+
+local function botDrive(car, x, y, z)
+    -- Встроенный ИИ водителя GTA: едет по дорогам (path nodes), объезжает транспорт.
+    -- Стиль 2 = объезжать машины, 4 = тормозить перед машинами; оба игнорируют светофоры.
+    local style = (tonumber(cfg.bot.style) or 0) == 1 and 4 or 2
+    local speed = tonumber(cfg.bot.speed) or 25
+    setCarCruiseSpeed(car, speed)
+    taskCarDriveToCoord(PLAYER_PED, car, x, y, z, speed, 0, 0, style)
+    bot.driving, bot.lastTask, bot.tx, bot.ty = true, os.clock(), x, y
+end
+
+local function botThread()
+    while true do
+        wait(100)
+        if not cfg.bot.enabled then
+            botStop(); bot.status = 'Выключен'
+        elseif isArizona() then
+            botStop(); bot.status = 'Недоступно на Arizona RP'
+        elseif not isCharInAnyCar(PLAYER_PED) then
+            botStop(); bot.status = 'Сядьте в транспорт'
+        else
+            local car = storeCarCharIsInNoSave(PLAYER_PED)
+            if getDriverOfCar(car) ~= PLAYER_PED then
+                botStop(); bot.status = 'Сядьте за руль'
+            else
+                local x, y, z, name = botTarget()
+                if not x then
+                    botStop(); bot.status = 'Нет метки'; bot.arrived = false
+                else
+                    local px, py = getCharCoordinates(PLAYER_PED)
+                    local dist = getDistanceBetweenCoords2d(px, py, x, y)
+                    local typing = sampIsChatInputActive() or sampIsDialogActive() or isSampfuncsConsoleActive()
+                    local manual = cfg.bot.takeover and not typing and (isKeyDown(0x57) or isKeyDown(0x53))
+
+                    if dist <= (tonumber(cfg.bot.radius) or 12) then
+                        botStop()
+                        if not bot.arrived then msg('Бот: прибыли (' .. name .. ').') end
+                        bot.arrived, bot.status = true, 'Прибыл'
+                    elseif manual then
+                        botStop(); bot.pauseUntil = os.clock() + 3
+                        bot.status = 'Управление у вас'
+                    elseif os.clock() >= bot.pauseUntil then
+                        bot.arrived = false
+                        local moved = not bot.tx or getDistanceBetweenCoords2d(bot.tx, bot.ty, x, y) > 3
+                        -- Застревание: почти не едем дольше 3 секунд - перестраиваем маршрут
+                        if getCarSpeed(car) < 1.0 then
+                            bot.stuckSince = bot.stuckSince or os.clock()
+                        else
+                            bot.stuckSince = nil
+                        end
+                        local stuck = bot.stuckSince and os.clock() - bot.stuckSince > 3
+                        if not bot.driving or moved or stuck then
+                            botDrive(car, x, y, z)
+                            bot.stuckSince = nil
+                        end
+                        bot.status = string.format('Едет: %s, %d м', name, math.floor(dist))
+                    end
+                end
+            end
+        end
+    end
+end
+
+local bui = {
+    enabled  = imgui.new.bool(cfg.bot.enabled),
+    source   = imgui.new.int(tonumber(cfg.bot.source) or 0),
+    speed    = imgui.new.int(tonumber(cfg.bot.speed) or 25),
+    style    = imgui.new.int(tonumber(cfg.bot.style) or 0),
+    radius   = imgui.new.int(tonumber(cfg.bot.radius) or 12),
+    takeover = imgui.new.bool(cfg.bot.takeover),
+}
+
+local function drawFarmTab()
+    section('Бот дальнобойщик')
+
+    -- Карточка с нарисованной фурой и статусом
+    local dl = imgui.GetWindowDrawList()
+    local p  = imgui.GetCursorScreenPos()
+    local w  = imgui.GetContentRegionAvail().x
+    local h  = 92
+    dl:AddRectFilled(p, vec(p.x + w, p.y + h), U32(V4(ACCENT.x, ACCENT.y, ACCENT.z, 0.10)), 10)
+    dl:AddLine(vec(p.x + 14, p.y + h - 16), vec(p.x + 150, p.y + h - 16), U32(V4(1, 1, 1, 0.10)), 2) -- дорога
+    local sway = cfg.bot.enabled and bot.driving and math.sin(imgui.GetTime() * 12) * 0.6 or 0
+    drawTruck(dl, p.x + 14, p.y + 14 + sway, 2.3, U32(V4(0.85, 0.87, 0.92, 1)), U32(ACCENT))
+    local tx = p.x + 170
+    dl:AddText(vec(tx, p.y + 22), U32(V4(1, 1, 1, 1)), 'Статус:')
+    local scol = bot.driving and COLOR_GREEN or (cfg.bot.enabled and V4(1.0, 0.8, 0.35, 1) or COLOR_GRAY)
+    dl:AddText(vec(tx, p.y + 44), U32(scol), bot.status)
+    imgui.Dummy(vec(w, h))
+
+    if toggle('##bot_on', 'Включить бота', bui.enabled) then
+        cfg.bot.enabled = bui.enabled[0]; saveCfg()
+        if not cfg.bot.enabled then botStop() end
+    end
+
+    section('Куда ехать')
+    if segmented('bot_src', bui.source, { 'Авто', 'Чекпоинт', 'Метка на карте' }) then
+        cfg.bot.source = bui.source[0]; saveCfg(); bot.tx = nil
+    end
+    if not hasSampev then
+        hint('Для красных чекпоинтов сервера установите библиотеку SAMP.Lua (lib/samp/events). Метка на карте работает и без неё.')
+    end
+
+    section('Вождение')
+    if segmented('bot_style', bui.style, { 'Объезжать машины', 'Тормозить перед машинами' }) then
+        cfg.bot.style = bui.style[0]; saveCfg(); bot.tx = nil
+    end
+    imgui.PushItemWidth(-1)
+    imgui.Text('Скорость:')
+    if imgui.SliderInt('##bot_speed', bui.speed, 5, 60, '%d') then
+        cfg.bot.speed = bui.speed[0]; saveCfg(); bot.tx = nil
+    end
+    imgui.Text('Радиус прибытия:')
+    if imgui.SliderInt('##bot_radius', bui.radius, 3, 40, '%d м') then
+        cfg.bot.radius = bui.radius[0]; saveCfg()
+    end
+    imgui.PopItemWidth()
+    if toggle('##bot_take', 'W / S забирают управление', bui.takeover) then
+        cfg.bot.takeover = bui.takeover[0]; saveCfg()
+    end
+    hint('Бот едет по дорогам встроенным ИИ водителя GTA и светофоры не учитывает. Не работает на серверах Arizona RP.')
+end
+
 local function drawInfoTab()
     section('Скрипт')
     imgui.Text('Версия:');  imgui.SameLine(110); imgui.TextColored(COLOR_GREEN, SCRIPT_VERSION)
@@ -519,6 +718,7 @@ local function drawInfoTab()
     section('Команды')
     imgui.Text('/lafk');    imgui.SameLine(110); imgui.TextDisabled('открыть / закрыть меню')
     imgui.Text('/lafkupd'); imgui.SameLine(110); imgui.TextDisabled('проверить обновления')
+    imgui.Text('/ltruck');  imgui.SameLine(110); imgui.TextDisabled('вкл / выкл бота дальнобойщика')
 end
 
 -- ===================== Падающие частицы =====================
@@ -689,6 +889,7 @@ end
 
 local TABS = {
     { name = 'Авто спавн', icon = iconPerson, draw = drawSpawnTab },
+    { name = 'Авто фар',   icon = iconTruck,  draw = drawFarmTab  },
     { name = 'Оформление', icon = iconPalette, draw = drawThemeTab },
     { name = 'Информация', icon = iconInfo,  draw = drawInfoTab  },
 }
@@ -809,6 +1010,12 @@ function main()
     msg('Загружен v' .. SCRIPT_VERSION .. '. Меню: /lafk')
 
     lua_thread.create(autoSpawnThread)
+    lua_thread.create(botThread)
+    sampRegisterChatCommand('ltruck', function()
+        cfg.bot.enabled = not cfg.bot.enabled; bui.enabled[0] = cfg.bot.enabled; saveCfg()
+        if not cfg.bot.enabled then botStop() end
+        msg(cfg.bot.enabled and 'Бот дальнобойщик включён.' or 'Бот дальнобойщик выключен.')
+    end)
 
     -- Проверяем обновления после входа на сервер (когда персонаж заспавнился)
     lua_thread.create(function()
@@ -826,4 +1033,8 @@ function main()
             if installUpdate() then return end
         end
     end
+end
+
+function onScriptTerminate(s, quit)
+    if s == thisScript() and not quit and bot and bot.driving then clearCharTasks(PLAYER_PED) end
 end
