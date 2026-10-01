@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Бот снова едет к надписи «Получить загруженный прицеп»: последние метры подъезжает напрямую, затем пауза 0,3 с, H и пункт 1 в меню. Своё меню скрипта больше не принимается за CEF.
+-- @changelog: Бот подъезжает к надписи груза ближе 1 метра (при перелёте сдаёт назад). Исправлена сцепка: ищутся все модели рабочих прицепов, выданный прицеп не теряется после неудачной попытки, допуск сцепки увеличен.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.13')
+script_version('2.5.14')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.13'
+local SCRIPT_VERSION = '2.5.14'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1670,7 +1670,7 @@ bot.findTrailer = function(car, known, onlyNew)
         if v ~= car and doesVehicleExist(v) and TRACTORS[getCarModel(v)] then cabs[#cabs + 1] = v end
     end
     for _, v in ipairs(getAllVehicles()) do
-        if v ~= car and doesVehicleExist(v) and getCarModel(v) == TRAILER_MODEL and bot.isServerVeh(v) then
+        if v ~= car and doesVehicleExist(v) and (getCarModel(v) == TRAILER_MODEL or bot.JOBTRAILERS[getCarModel(v)]) and bot.isServerVeh(v) then
             local x, y, z = getCarCoordinates(v)
             local d = getDistanceBetweenCoords3d(cx, cy, cz, x, y, z)
             local free = true
@@ -1692,7 +1692,7 @@ end
 bot.trailerSnapshot = function()
     local t = {}
     for _, v in ipairs(getAllVehicles()) do
-        if doesVehicleExist(v) and getCarModel(v) == TRAILER_MODEL then t[v] = true end
+        if doesVehicleExist(v) and (getCarModel(v) == TRAILER_MODEL or bot.JOBTRAILERS[getCarModel(v)]) then t[v] = true end
     end
     return t
 end
@@ -1748,8 +1748,12 @@ bot.jobApproach = function(car)
     local speed = getCarSpeed(car)
     local A = J.ap
     if not A then A = { best = d, progT = now, tries = 0 }; J.ap = A end
-    if d < A.best - 1 then A.best, A.progT = d, now end
-    if d <= 4 or (A.tries >= 3 and d <= 12) then
+    if d < A.best - 0.3 then A.best, A.progT = d, now end
+    if d <= 1.0 or (A.tries >= 4 and d <= 4) then
+        if d > 1.0 and not A.logged then
+            A.logged = true
+            log(string.format('[job] ближе %.1f м подъехать не получилось - нажимаю H отсюда', d))
+        end
         if speed > 0.4 then keys(0, 0, 1) else keys(0, 0, 0); J.reached = true end
         bot.status = 'Работа: останавливаюсь у надписи'
         return
@@ -1770,13 +1774,22 @@ bot.jobApproach = function(car)
         return
     end
     local lx, ly = toLocal(car, J.x, J.y)
+    -- Проехали точку (она сзади и рядом) - аккуратно сдаём назад прямо на неё
+    if ly < 0 and d < 6 then
+        local rs = clamp(math.atan2(lx, -ly) / 0.5, -1, 1)
+        keys(rs, 0, (speed < 1.2) and 0.45 or 0)
+        bot.status = string.format('Работа: сдаю назад к надписи, %.1f м', d)
+        return
+    end
     local steer = clamp(math.atan2(lx, ly) / 0.5, -1, 1)
-    local vt = clamp(d * 0.35, 2, 7)
-    if math.abs(steer) > 0.8 then vt = math.min(vt, 3) end
+    -- у самой точки ползём, чтобы остановиться ближе 1 метра
+    local vt = clamp(d * 0.45, 0.7, 7)
+    if math.abs(steer) > 0.8 then vt = math.min(vt, 2.5) end
     local gas, brake = 0, 0
-    if speed < vt then gas = 0.55 elseif speed > vt + 1.5 then brake = 0.6 end
+    local over = (d < 4) and 0.5 or 1.5
+    if speed < vt then gas = (d < 4) and 0.4 or 0.55 elseif speed > vt + over then brake = 0.7 end
     keys(steer, gas, brake)
-    bot.status = string.format('Работа: подъезжаю к надписи, %d м', math.floor(d))
+    bot.status = string.format('Работа: подъезжаю к надписи, %.1f м', d)
 end
 
 local function pressCefEnter() return pressCefKey(0x0D, 0x1C) end
@@ -1927,7 +1940,8 @@ bot.jobTick = function()
             local v = bot.findTrailer(car, J.known, true)
             if v then
                 trailer.handle, trailer.server = v, true
-                J.tries = 0
+                J.tries, J.given = 0, v
+                log(string.format('[job] выданный прицеп найден: модель %d', getCarModel(v)))
                 go('hitch', 'Работа: нашёл прицеп, цепляю.')
                 hitchStart()
                 return
@@ -1942,16 +1956,21 @@ bot.jobTick = function()
         end
         if not hitch.active and now - J.t > 2 then
             J.tries = (J.tries or 0) + 1
-            if J.tries > 3 then
-                go('take', 'Работа: не получилось прицепиться, жду новый прицеп.')
-                J.known = bot.trailerSnapshot()
+            if J.tries > 6 then
+                go('label', 'Работа: не получилось прицепиться, беру груз заново.')
+                J.known, J.given = nil, nil
                 return
             end
-            if not trailerExists() then
+            -- Тот же выданный прицеп: в снимке J.known он уже есть, поэтому
+            -- повторный поиск "только новых" его бы не нашёл.
+            if J.given and doesVehicleExist(J.given) then
+                trailer.handle, trailer.server = J.given, true
+            elseif not trailerExists() then
                 local v = bot.findTrailer(car, J.known, true)
                 if not v then return go('take') end
-                trailer.handle, trailer.server = v, true
+                trailer.handle, trailer.server, J.given = v, true, v
             end
+            log(string.format('[job] повторная сцепка, попытка %d', J.tries))
             J.t = now
             hitchStart()
         end
@@ -2054,7 +2073,7 @@ local function hitchControl(car)
     -- Рядом и ровно - цепляем (с запасом: точки седла и шкворня у моделей примерные)
     local stuck = hitch.phase == 'reverse' and speed < 0.3 and now - (hitch.st.moved or now) > 0.7
     -- attachTrailerToCab цепляет принудительно, так что точность до сантиметра не нужна
-    if ((dHK < 3.2 and math.abs(e) < 1.8) or (dHK < 4.5 and stuck)) and headErr < 25 then
+    if ((dHK < 4.0 and math.abs(e) < 2.2) or (dHK < 6.0 and stuck)) and headErr < 30 then
         -- Тормозим против хода: на заднем ходу S - это газ назад, поэтому жмём W.
         if vf < -0.3 then keys(0, 0.6, 0)
         elseif vf > 0.3 then keys(0, 0, 0.6)
