@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Сцепка: режим «мало места» включается только у самого прицепа (до 18 м). Издалека бот снова сначала подъезжает к прицепу обычным автопилотом. Повторный запуск сцепки больше не отменяет её.
+-- @changelog: Проверка сцепки по расстоянию: прицеп считается прицепленным, если между фурой и прицепом от 10,49 до 12 м и он стоит ровно сзади. Исправлено: после сцепки бот едет к воротам.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.19')
+script_version('2.5.20')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.19'
+local SCRIPT_VERSION = '2.5.20'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1691,11 +1691,49 @@ bot.findLabel = function(word)
     return bx, by, bz, bd
 end
 
+-- Прицеплен ли прицеп v к фуре car. Кроме флага игры (на сервере он бывает
+-- ложным) - проверка по расстоянию: у прицепленного прицепа центр в 10,49 м и
+-- дальше от центра фуры. Верхняя граница 12 м и проверка «ровно сзади» нужны,
+-- чтобы не принять за прицепленный любой прицеп, стоящий дальше.
+bot.HOOK_DIST_MIN, bot.HOOK_DIST_MAX = 10.49, 12.0
+bot.isHooked = function(v, car)
+    if not v or not doesVehicleExist(v) then return false end
+    if isTrailerAttachedToCab(v, car) then return true end
+    local cx, cy, cz = getCarCoordinates(car)
+    local x, y, z = getCarCoordinates(v)
+    local d = getDistanceBetweenCoords3d(cx, cy, cz, x, y, z)
+    if d < bot.HOOK_DIST_MIN or d > bot.HOOK_DIST_MAX then return false end
+    local lx, ly = toLocal(car, x, y)
+    if ly > -8 or math.abs(lx) > 2.5 then return false end
+    -- курс прицепа почти как у фуры
+    local fx, fy = carBasis(car)
+    local tfx, tfy = carBasis(v)
+    return fx * tfx + fy * tfy > 0.8
+end
+
 -- Прицеп, уже прицепленный к нашей фуре
 bot.hookedTrailer = function(car)
+    local now = os.clock()
     for _, v in ipairs(getAllVehicles()) do
-        if v ~= car and doesVehicleExist(v) and bot.JOBTRAILERS[getCarModel(v)] and isTrailerAttachedToCab(v, car) then return v end
+        if v ~= car and doesVehicleExist(v) and bot.JOBTRAILERS[getCarModel(v)] then
+            if isTrailerAttachedToCab(v, car) then return v end
+            -- по расстоянию - только наш (выданный) прицеп и только если держится 1 с
+            local mine = (bot.job and bot.job.given == v) or (trailer.server and trailer.handle == v)
+            if mine and bot.isHooked(v, car) then
+                bot.hookSince = (bot.hookFor == v and bot.hookSince) or now
+                bot.hookFor = v
+                if now - bot.hookSince >= 1.0 then
+                    if not bot.hookLogged then
+                        bot.hookLogged = true
+                        log('[job] прицеп прицеплен (проверка по расстоянию)')
+                    end
+                    return v
+                end
+                return nil
+            end
+        end
     end
+    bot.hookSince, bot.hookFor, bot.hookLogged = nil, nil, nil
 end
 
 -- Надпись с запоминанием места: 3D-текст виден только рядом (стрим),
@@ -2068,6 +2106,11 @@ bot.jobTick = function()
             J.x, J.y, J.z, J.r, J.name = x, y, z, 9, 'ворота'
             J.status = x and string.format('Работа: еду к воротам%s, %d м', cached and ' (запомненная точка)' or '', math.floor(d)) or 'Работа: не вижу ворота «Посигнальте»'
             if not x and bot.cp then return go('cp', 'Работа: еду по чекпоинтам.') end
+            -- ворота ни разу не видели и чекпоинта нет - сигналим на месте, дальше ждём чекпоинт
+            if not x and now - J.t > 6 then
+                log('[job] ворота «Посигнальте» не найдены - сигналю на месте')
+                return go('honk', 'Работа: не вижу ворота - сигналю на месте и жду чекпоинт.')
+            end
         end
         if bot.arrived and J.x then
             J.honks = (J.honks or 0) + 1
@@ -2201,7 +2244,7 @@ local function hitchControl(car)
     local now = os.clock()
     if not trailerExists() then return hitchStop('Прицеп пропал, сцепка отменена.') end
     local tr = trailer.handle
-    if isTrailerAttachedToCab(tr, car) then return hitchStop('Бот: прицеп прицеплен!') end
+    if isTrailerAttachedToCab(tr, car) or (trailer.server and bot.hookedTrailer(car) == tr) then return hitchStop('Бот: прицеп прицеплен!') end
     if now - hitch.start > 150 then return hitchStop('Бот: не получилось прицепиться за 2.5 минуты.') end
 
     local speed = getCarSpeed(car)
@@ -2499,7 +2542,7 @@ local function botThread()
             if isCharInAnyCar(PLAYER_PED) then
                 local car = storeCarCharIsInNoSave(PLAYER_PED)
                 T.inCar, T.kmh = true, getCarSpeed(car) * 3.6
-                T.hooked = trailerExists() and isTrailerAttachedToCab(trailer.handle, car)
+                T.hooked = trailerExists() and (isTrailerAttachedToCab(trailer.handle, car) or (trailer.server and bot.isHooked(trailer.handle, car)))
             else
                 T.inCar, T.kmh, T.hooked = false, 0, false
             end
