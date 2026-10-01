@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Бот: больше не срезает углы на поворотах - проверяет проезд по ширине машины, видит препятствия у углов кузова и выравнивает руль; если упёрся - быстро отъезжает назад, уводя нос от препятствия, и строит путь заново.
+-- @changelog: Исправлен вылет скрипта (cannot resume non-suspended coroutine в processLineOfSight). Плюс всё из 1.5.4: бот не срезает углы и отъезжает от препятствий.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('1.5.4')
+script_version('1.5.5')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '1.5.4'
+local SCRIPT_VERSION = '1.5.5'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/lua_afk.lua'
 local TAG = '{33AAFF}[lua_afk]{FFFFFF} '
 
@@ -678,9 +678,27 @@ local function toLocal(car, x, y)
     return dx * rx + dy * ry, dx * fx + dy * fy
 end
 
+-- Безопасный луч. processLineOfSight иногда падает с ошибкой "cannot resume non-suspended
+-- coroutine" (из-за этого скрипт умирал). Проверяем координаты, не пускаем нулевые и слишком
+-- длинные лучи, а ошибку ловим через pcall - тогда считаем, что препятствия нет.
+local function fin(v) return type(v) == 'number' and v == v and v > -1e5 and v < 1e5 end
+local function los(x1, y1, z1, x2, y2, z2, ...)
+    if not (fin(x1) and fin(y1) and fin(z1) and fin(x2) and fin(y2) and fin(z2)) then return false end
+    local dx, dy, dz = x2 - x1, y2 - y1, z2 - z1
+    local l2 = dx * dx + dy * dy + dz * dz
+    if l2 < 0.01 or l2 > 200 * 200 then return false end
+    local ok, hit, cp = pcall(processLineOfSight, x1, y1, z1, x2, y2, z2, ...)
+    if not ok then
+        bot.losErrors = (bot.losErrors or 0) + 1
+        if bot.losErrors == 1 then log('[bot] ошибка луча (пропущено): ' .. tostring(hit)) end
+        return false
+    end
+    return hit, cp
+end
+
 -- Прямая видимость между точками (здания и объекты), без учёта машин
 local function clearLine(x1, y1, z1, x2, y2, z2)
-    local hit = processLineOfSight(x1, y1, z1, x2, y2, z2, true, false, false, true, false, false, false, false)
+    local hit = los(x1, y1, z1, x2, y2, z2, true, false, false, true, false, false, false, false)
     return not hit
 end
 
@@ -691,7 +709,7 @@ local function ray(car, side, len)
     local front = (maxY or 3) + 0.3
     local x1, y1, z1 = getOffsetFromCarInWorldCoords(car, half, front, 0.3)
     local x2, y2, z2 = getOffsetFromCarInWorldCoords(car, half * 1.6, front + len, 0.3)
-    local hit, cp = processLineOfSight(x1, y1, z1, x2, y2, z2, true, true, true, true, false, false, false, false)
+    local hit, cp = los(x1, y1, z1, x2, y2, z2, true, true, true, true, false, false, false, false)
     if not hit or not cp or not cp.pos then return nil end
     if cp.normal and cp.normal[3] and cp.normal[3] > 0.7 then return nil end
     return getDistanceBetweenCoords3d(x1, y1, z1, cp.pos[1], cp.pos[2], cp.pos[3])
@@ -706,7 +724,7 @@ local function rayBack(car, len)
         local half = ((maxX or 1.2) - 0.2) * side
         local x1, y1, z1 = getOffsetFromCarInWorldCoords(car, half, back, 0.3)
         local x2, y2, z2 = getOffsetFromCarInWorldCoords(car, half * 1.3, back - len, 0.3)
-        local hit, cp = processLineOfSight(x1, y1, z1, x2, y2, z2, true, true, true, true, false, false, false, false)
+        local hit, cp = los(x1, y1, z1, x2, y2, z2, true, true, true, true, false, false, false, false)
         if hit and cp and cp.pos and not (cp.normal and cp.normal[3] and cp.normal[3] > 0.7) then
             local d = getDistanceBetweenCoords3d(x1, y1, z1, cp.pos[1], cp.pos[2], cp.pos[3])
             if not best or d < best then best = d end
@@ -719,13 +737,20 @@ end
 -- (свою машину не задевает). Возвращает расстояние от центра или nil.
 local function dirRay(car, deg, len)
     local r = math.rad(deg)
+    local sn, cs = math.sin(r), math.cos(r)
+    -- Луч начинается у края кузова (не изнутри машины), но расстояние считаем от центра
+    local minX, minY, _, maxX, maxY = getModelDimensions(getCarModel(car))
+    local hy = (cs >= 0) and (maxY or 3) or math.abs(minY or -3)
+    local hx = (sn >= 0) and (maxX or 1.2) or math.abs(minX or -1.2)
+    local body = math.min(math.abs(cs) > 0.01 and hy / math.abs(cs) or 99, math.abs(sn) > 0.01 and hx / math.abs(sn) or 99)
+    local st = math.max(0, math.min(body - 0.3, len - 0.5))
     local best
-    for _, h in ipairs({ -0.35, 0.4 }) do              -- низкие (бордюры, заборы) и высокие препятствия
-        local x1, y1, z1 = getOffsetFromCarInWorldCoords(car, 0, 0, h)
-        local x2, y2, z2 = getOffsetFromCarInWorldCoords(car, math.sin(r) * len, math.cos(r) * len, h)
-        local hit, cp = processLineOfSight(x1, y1, z1, x2, y2, z2, true, false, false, true, false, false, false, false)
+    for _, h in ipairs({ -0.1, 0.45 }) do              -- низкие (бордюры, заборы) и высокие препятствия
+        local x1, y1, z1 = getOffsetFromCarInWorldCoords(car, sn * st, cs * st, h)
+        local x2, y2, z2 = getOffsetFromCarInWorldCoords(car, sn * len, cs * len, h)
+        local hit, cp = los(x1, y1, z1, x2, y2, z2, true, false, false, true, false, false, false, false)
         if hit and cp and cp.pos and not (cp.normal and cp.normal[3] and cp.normal[3] > 0.7) then
-            local d = getDistanceBetweenCoords2d(x1, y1, cp.pos[1], cp.pos[2])
+            local d = st + getDistanceBetweenCoords2d(x1, y1, cp.pos[1], cp.pos[2])
             if not best or d < best then best = d end
         end
     end
