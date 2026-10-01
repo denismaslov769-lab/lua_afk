@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Развязки и развилки: бот едет по самой линии маршрута (не срезает через отбойник), не путает эстакады, быстрее замечает, что ушёл не в ту ветку, и заранее сбрасывает скорость перед изгибами. Сцепка: мало места перед прицепом - бот подъезжает ближе и сдаёт с короткого расстояния, не крутится бесконечно (останавливается с подсказкой). Новый виджет бота во вкладке Авто фарм (дорога, скорость, расстояние, прицеп, прогресс, кнопка запуска). Частицы Arizona и Hearts. ПКМ - Убрать фон у своих частиц. Сцепка: прицеп далеко или за забором - бот едет к нему в объезд и быстрее, без качелей вперёд-назад. Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
+-- @changelog: Бот больше не сдаётся: если не может приблизиться к метке, пробует другие пути (напрямую вне дорог, отъезд и новый маршрут). Метка вдали от дороги - доезжает до неё по бездорожью. Развязки и развилки: бот едет по самой линии маршрута (не срезает через отбойник), не путает эстакады, быстрее замечает, что ушёл не в ту ветку, и заранее сбрасывает скорость перед изгибами. Сцепка: мало места перед прицепом - бот подъезжает ближе и сдаёт с короткого расстояния, не крутится бесконечно (останавливается с подсказкой). Новый виджет бота во вкладке Авто фарм (дорога, скорость, расстояние, прицеп, прогресс, кнопка запуска). Частицы Arizona и Hearts. ПКМ - Убрать фон у своих частиц. Сцепка: прицеп далеко или за забором - бот едет к нему в объезд и быстрее, без качелей вперёд-назад. Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.4.6')
+script_version('2.4.7')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.4.6'
+local SCRIPT_VERSION = '2.4.7'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -767,7 +767,10 @@ local function routeWaypoint(car, speed, tx, ty)
         px, py, pz, last = at(L)
     end
     -- конец маршрута рядом с меткой - дальше едем прямо к метке
-    if last and getDistanceBetweenCoords2d(px, py, tx, ty) < 40 and getDistanceBetweenCoords2d(cx, cy, px, py) < 12 then
+    if last and getDistanceBetweenCoords2d(cx, cy, px, py) < 12 then
+        -- дорога кончилась, а до метки ещё есть путь - дальше вне дорог прямо к ней
+        local de = getDistanceBetweenCoords2d(px, py, tx, ty)
+        if de >= 40 then bot.offroadUntil, bot.roadEnd = now + 15, de end
         return nil
     end
     -- скорость по изгибам: на каждом участке впереди радиус поворота -> допустимая
@@ -882,6 +885,35 @@ local function maneuver(car, tx, ty, dist, s, now, speed, routed)
 end
 
 -- Управление (каждый кадр) -------------------------------------------------
+-- Езда вне дорог: из направлений вокруг "прямо на метку" берём ближайшее к ней,
+-- где на 18 м нет стен и заборов (машины объезжают датчики); прошлое направление в приоритете (без рысканья).
+local function offroadWaypoint(car, tx, ty, tz)
+    local cx, cy, cz = getCarCoordinates(car)
+    local dx, dy = tx - cx, ty - cy
+    local d = math.sqrt(dx * dx + dy * dy)
+    if d < 1 then return tx, ty end
+    dx, dy = dx / d, dy / d
+    local L = math.min(18, d)
+    if d < 25 and corridorClear(car, tx, ty, tz) then return tx, ty end
+    local prev = bot.offDa or 0
+    local best, bx, by, bda
+    for da = -150, 150, 15 do
+        local score = math.abs(da) + math.abs(da - prev) * 0.5
+        if not best or score < best then
+            local r = math.rad(da)
+            local ux, uy = dx * math.cos(r) - dy * math.sin(r), dx * math.sin(r) + dy * math.cos(r)
+            local px, py = cx + ux * L, cy + uy * L
+            local pz = getGroundZFor3dCoord(px, py, cz + 15)
+            if not pz or pz == 0 or math.abs(pz - cz) > 8 then pz = cz end
+            if clearLine(cx, cy, cz + 0.8, px, py, pz + 0.8) and corridorClear(car, px, py, pz) then
+                best, bx, by, bda = score, px, py, da
+            end
+        end
+    end
+    if bda then bot.offDa = bda end
+    return bx, by
+end
+
 local function botControl(car, tx, ty, tz, dist)
     local now = os.clock()
     local careful = num(cfg.bot.style, 0) == 1
@@ -913,7 +945,12 @@ local function botControl(car, tx, ty, tz, dist)
 
     -- 2. Маршрут по дорогам GTA
     local rwx, rwy, rturn
-    if cfg.bot.gps ~= false and gps.ok then
+    local offroad = bot.offroadUntil and now < bot.offroadUntil
+    -- уже съехали с конца дороги к метке и ближе к ней, чем конец дороги - продолжаем вне дорог
+    if not offroad and bot.roadEnd and dist < bot.roadEnd + 5 then
+        bot.offroadUntil, offroad = now + 5, true
+    end
+    if cfg.bot.gps ~= false and gps.ok and not offroad then
         routeUpdate(car, tx, ty, tz, now, speed)
         rwx, rwy, rturn = routeWaypoint(car, speed, tx, ty)
     end
@@ -963,7 +1000,14 @@ local function botControl(car, tx, ty, tz, dist)
     end
     if not rwx and not bot.commit and (now >= bot.nextPlan or not bot.wx) then
         bot.nextPlan = now + 0.25
-        local wx, wy, direct = planWaypoint(car, tx, ty, tz)
+        local wx, wy, direct
+        if offroad then
+            wx, wy = offroadWaypoint(car, tx, ty, tz); direct = true
+        else
+            wx, wy, direct = planWaypoint(car, tx, ty, tz)
+            -- дорог рядом нет (метка в поле, на стоянке) - едем вне дорог
+            if not wx then wx, wy = offroadWaypoint(car, tx, ty, tz); direct = true end
+        end
         if wx and cfg.bot.lane and not direct then
             -- Своя полоса: сдвигаем точку вправо от оси дороги (правостороннее движение)
             local cx, cy, cz = getCarCoordinates(car)
@@ -1483,24 +1527,43 @@ local function botThread()
                     if not bot.tx or getDistanceBetweenCoords2d(bot.tx, bot.ty, x, y) > 10 then
                         bot.tx, bot.ty, bot.dist0 = x, y, dist
                         bot.best, bot.bestTime, bot.gaveUp, bot.arrived = dist, os.clock(), false, false
+                        bot.progT, bot.tries, bot.offroadUntil, bot.altUntil, bot.roadEnd = os.clock(), 0, nil, nil, nil
                         bot.man, bot.recover, bot.wx, bot.commit, bot.turnAt = nil, nil, nil, nil, nil
                     end
-                    if dist < bot.best - 5 then bot.best, bot.bestTime = dist, os.clock() end
+                    if dist < bot.best - 5 then bot.best, bot.bestTime, bot.progT = dist, os.clock(), os.clock() end
+                    if manual or os.clock() < bot.pauseUntil then bot.progT = os.clock() end
 
                     if dist <= num(cfg.bot.radius, 12) then
                         if getCarSpeed(car) > 1 then keys(0, 0, 1) else botRelease() end
                         if not bot.arrived then msg('Бот: прибыли (' .. name .. ').') end
                         bot.arrived, bot.status = true, 'Прибыл'
-                    elseif bot.gaveUp then
-                        botRelease(); bot.status = 'Ближе по дороге не подъехать'
-                    elseif os.clock() - bot.bestTime > 45 then
-                        botRelease(); bot.gaveUp = true
-                        msg('Бот: 45 секунд не получается приблизиться к метке, остановился.')
                     elseif manual then
                         botRelease(); bot.pauseUntil = os.clock() + 3
                         bot.status = 'Управление у вас'
                     elseif os.clock() >= bot.pauseUntil then
-                        bot.status = string.format('Едет: %s, %d м', name, math.floor(dist))
+                        -- Не сдаёмся: 20 с без приближения к метке - пробуем другой способ
+                        -- (по очереди: напрямую к метке вне дорог / отъезд назад и новый маршрут)
+                        local now = os.clock()
+                        if now - (bot.progT or now) > 20 then
+                            bot.tries = (bot.tries or 0) + 1
+                            bot.progT, bot.best, bot.altUntil = now, dist, now + 6
+                            bot.route, bot.wx, bot.commit, bot.turnAt, bot.man, bot.routeFail = nil, nil, nil, nil, nil, nil
+                            bot.nextPlan, bot.manCooldown, bot.stuckSince = 0, 0, nil
+                            if bot.tries % 2 == 1 then
+                                bot.offroadUntil = now + 25
+                            else
+                                bot.offroadUntil, bot.roadEnd = nil, nil
+                                bot.recover = { start = now, till = now + 3, steer = (bot.tries % 4 == 0) and 1 or -1 }
+                            end
+                            log(string.format('[bot] нет продвижения к метке, попытка %d: %s', bot.tries, bot.offroadUntil and 'напрямую' or 'назад и новый маршрут'))
+                        end
+                        if bot.altUntil and now < bot.altUntil then
+                            bot.status = string.format('Ищу другой путь (%d), %d м', bot.tries or 0, math.floor(dist))
+                        elseif bot.offroadUntil and now < bot.offroadUntil then
+                            bot.status = string.format('Еду напрямую: %s, %d м', name, math.floor(dist))
+                        else
+                            bot.status = string.format('Едет: %s, %d м', name, math.floor(dist))
+                        end
                         botControl(car, x, y, z, dist)
                     end
                 end
