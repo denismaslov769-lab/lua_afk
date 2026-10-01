@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Скрипт переписан с нуля: новый автопилот, разворот к метке, объезд углов, защита от вылетов меню и копий.
+-- @changelog: Бот делает в 4 раза меньше проверок препятствий и запросов дорог за кадр (как в стабильных версиях) - против вылетов игры во время езды.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.0.0')
+script_version('2.0.1')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.0.0'
+local SCRIPT_VERSION = '2.0.1'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -457,7 +457,7 @@ local function senseFront(car, len)
     for _, sd in ipairs({ -1, 1 }) do
         local ox, oy = sd * (g.half + 0.15), g.front - 0.3
         local best
-        for _, a in ipairs({ 35, 70 }) do
+        for _, a in ipairs({ 50 }) do
             local r = math.rad(a)
             best = minOf(best, cast(car, ox, oy, ox + sd * math.sin(r) * 2.8, oy + math.cos(r) * 2.8, false))
         end
@@ -478,7 +478,7 @@ local function senseRear(car)
     for _, sd in ipairs({ -1, 1 }) do
         local ox, oy = sd * (g.half + 0.15), -(g.back - 0.3)
         local best
-        for _, a in ipairs({ 35, 70 }) do
+        for _, a in ipairs({ 50 }) do
             local r = math.rad(a)
             best = minOf(best, cast(car, ox, oy, ox + sd * math.sin(r) * 2.8, oy - math.cos(r) * 2.8, false))
         end
@@ -509,11 +509,10 @@ local function corridorClear(car, x, y, z)
 end
 
 -- Маршрут ---------------------------------------------------------------
--- Дорожные узлы игры впереди (прямо и под углами), до которых есть проезд.
--- От узлов прямо по курсу смотрим ещё на шаг вперёд, чтобы заранее увидеть нужный
--- поворот на перекрёстке и сбросить скорость.
+-- Дорожные узлы игры впереди (прямо и под углами), до которых есть прямой проезд.
+-- Лучей немного (как в стабильных версиях): по одной линии на узел и проверка по
+-- ширине машины только для двух лучших узлов.
 local ANGLES = { 0, 20, -20, 45, -45, 75, -75, 90, -90 }
-local AHEAD  = { 0, 45, -45, 70, -70, 90, -90 }
 
 local function nodeNear(sx, sy, z, R)
     local nx, ny, nz = getClosestCarNode(sx, sy, z)
@@ -524,9 +523,14 @@ end
 
 local function planWaypoint(car, tx, ty, tz)
     local cx, cy, cz = getCarCoordinates(car)
+    -- Цель рядом и к ней есть проезд - едем прямо к ней
+    local dist = getDistanceBetweenCoords2d(cx, cy, tx, ty)
+    if dist < 45 and clearLine(cx, cy, cz + 0.6, tx, ty, tz + 0.6) and corridorClear(car, tx, ty, tz) then
+        return tx, ty, true
+    end
     local fx, fy, rx, ry = carBasis(car)
     local R = clamp(10 + getCarSpeed(car) * 0.8, 12, 30)
-    local bestScore, bx, by, turn
+    local list = {}
     for _, a in ipairs(ANGLES) do
         local ar = math.rad(a)
         local dx = fx * math.cos(ar) + rx * math.sin(ar)
@@ -536,46 +540,17 @@ local function planWaypoint(car, tx, ty, tz)
         if nx then
             local _, ly = toLocal(car, nx, ny)
             if ly > 3 and clearLine(cx, cy, cz + 0.6, nx, ny, nz + 0.6) then
-                local score = getDistanceBetweenCoords2d(nx, ny, tx, ty)
-                local t
-                if math.abs(a) <= 20 then
-                    local hx, hy = nx - cx, ny - cy
-                    local hl = math.sqrt(hx * hx + hy * hy)
-                    if hl > 1 then
-                        hx, hy = hx / hl, hy / hl
-                        local straight = score
-                        for _, b in ipairs(AHEAD) do
-                            local br = math.rad(b)
-                            local ex = hx * math.cos(br) + hy * math.sin(br)
-                            local ey = hy * math.cos(br) - hx * math.sin(br)
-                            local mx, my, mz = nodeNear(nx + ex * 18, ny + ey * 18, nz, 18)
-                            if mx and getDistanceBetweenCoords2d(mx, my, nx, ny) > 6
-                                and clearLine(nx, ny, nz + 0.6, mx, my, mz + 0.6) then
-                                local s2 = getDistanceBetweenCoords2d(mx, my, tx, ty) + math.abs(b) * 0.05
-                                if b == 0 then straight = math.min(straight, s2) end
-                                if s2 < score then score = s2; t = (math.abs(b) >= 45) and b or nil end
-                            end
-                        end
-                        if t and straight - score < 8 then t = nil end
-                    end
-                end
-                score = score + math.abs(a) * 0.35
-                if not corridorClear(car, nx, ny, nz) then score = score + 1000 end
-                if not bestScore or score < bestScore then
-                    bestScore, bx, by = score, nx, ny
-                    turn = t and { x = nx, y = ny } or nil
-                end
+                list[#list + 1] = { x = nx, y = ny, z = nz,
+                    score = getDistanceBetweenCoords2d(nx, ny, tx, ty) + math.abs(a) * 0.35 }
             end
         end
     end
-    bot.turnAt = turn
-    -- Цель рядом и к ней есть проезд - едем прямо к ней
-    local dist = getDistanceBetweenCoords2d(cx, cy, tx, ty)
-    if dist < 45 and clearLine(cx, cy, cz + 0.6, tx, ty, tz + 0.6) and corridorClear(car, tx, ty, tz) then
-        bot.turnAt = nil
-        return tx, ty, true
+    if #list == 0 then return nil end
+    table.sort(list, function(p, q) return p.score < q.score end)
+    for k = 1, math.min(2, #list) do
+        if corridorClear(car, list[k].x, list[k].y, list[k].z) then return list[k].x, list[k].y, false end
     end
-    return bx, by, false
+    return list[1].x, list[1].y, false
 end
 
 -- Разворот к метке --------------------------------------------------------
@@ -682,7 +657,7 @@ local function botControl(car, tx, ty, tz, dist)
 
     -- 3. Точка маршрута (5 раз в секунду)
     if now >= bot.nextPlan or not bot.wx then
-        bot.nextPlan = now + 0.2
+        bot.nextPlan = now + 0.25
         local wx, wy, direct = planWaypoint(car, tx, ty, tz)
         if wx and cfg.bot.lane and not direct then
             -- Своя полоса: сдвигаем точку вправо от оси дороги (правостороннее движение)
