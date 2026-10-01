@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Исправлен вылет игры: лучи проверки препятствий больше не идут изнутри машины и у самой земли.
+-- @changelog: Отключение лишних копий скрипта (две копии сами рулили машиной и роняли игру при открытии меню). Защита меню от ошибок.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('1.5.6')
+script_version('1.5.7')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '1.5.6'
+local SCRIPT_VERSION = '1.5.7'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/lua_afk.lua'
 local TAG = '{33AAFF}[lua_afk]{FFFFFF} '
 
@@ -1410,7 +1410,7 @@ imgui.OnFrame(
         imgui.Begin('##lua_afk_menu', menu.window,
             imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoCollapse)
 
-        drawParticles(imgui.GetWindowDrawList(), imgui.GetWindowPos(), imgui.GetWindowSize())
+        pcall(drawParticles, imgui.GetWindowDrawList(), imgui.GetWindowPos(), imgui.GetWindowSize())
 
         -- Боковая панель: вкладки столбиком
         imgui.BeginChild('##sidebar', vec(190, 0), true)
@@ -1428,9 +1428,17 @@ imgui.OnFrame(
 
         -- Содержимое вкладки
         imgui.BeginChild('##content', vec(0, 0), true)
-        local tab = TABS[menu.tab]
+        local tab = TABS[menu.tab] or TABS[1]
         imgui.TextColored(ACCENT, tab.name)
-        tab.draw()
+        -- Ошибка во вкладке не должна ломать окно (иначе игра вылетает): ловим и показываем
+        local ok, err = pcall(tab.draw)
+        if not ok then
+            if menu.lastErr ~= tostring(err) then
+                menu.lastErr = tostring(err)
+                log('[menu] ошибка во вкладке: ' .. menu.lastErr)
+            end
+            imgui.TextColored(V4(1, 0.4, 0.4, 1), 'Ошибка вкладки: ' .. menu.lastErr)
+        end
         imgui.EndChild()
 
         imgui.End()
@@ -1492,9 +1500,38 @@ imgui.OnFrame(
 --==============================================================
 -- Запуск
 --==============================================================
+-- Защита от копий: если в moonloader лежит второй lua_afk (например "lua_afk (1).lua" после
+-- скачивания через браузер), две копии одновременно рулят машиной и ломают меню.
+-- Оставляем самую новую, остальные выгружаем.
+local function killDuplicates()
+    local me = thisScript()
+    local myName = (me.path or ''):match('[^\\/]+$') or ''
+    local found = {}
+    for _, s in ipairs(script.list()) do
+        if s ~= me and s.path ~= me.path and s.name == me.name then
+            local v = tostring(s.version or '0')
+            local otherName = (s.path or ''):match('[^\\/]+$') or ''
+            local otherWins = isNewer(v, SCRIPT_VERSION)
+                or (v == SCRIPT_VERSION and otherName:lower() == 'lua_afk.lua' and myName:lower() ~= 'lua_afk.lua')
+            if otherWins then return false end
+            table.insert(found, { s = s, file = otherName, v = v })
+        end
+    end
+    for _, d in ipairs(found) do
+        log('[lua_afk] выгружена лишняя копия ' .. d.file .. ' (v' .. d.v .. ')')
+        msg('Найдена лишняя копия скрипта: ' .. d.file .. ' (v' .. d.v .. '). Она отключена - удалите этот файл из папки moonloader.')
+        pcall(function() d.s:unload() end)
+    end
+    return true
+end
+
 function main()
     if not isSampLoaded() or not isSampfuncsLoaded() then return end
     while not isSampAvailable() do wait(100) end
+    if not killDuplicates() then
+        log('[lua_afk] запущена более новая копия, эта (' .. tostring(thisScript().path) .. ') отключается')
+        return
+    end
 
     sampRegisterChatCommand('lafk', function() menu.window[0] = not menu.window[0] end)
     sampRegisterChatCommand('lafkupd', function() checkUpdates(true) end)
@@ -1504,6 +1541,7 @@ function main()
         msg(cfg.bot.enabled and 'Бот дальнобойщик включён.' or 'Бот дальнобойщик выключен.')
     end)
     msg('Загружен v' .. SCRIPT_VERSION .. '. Меню: /lafk')
+    log('[lua_afk] файл: ' .. tostring(thisScript().path))
 
     lua_thread.create(autoSpawnThread)
     lua_thread.create(botThread)
