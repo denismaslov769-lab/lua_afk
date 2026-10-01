@@ -4,7 +4,7 @@
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('0.3.0')
+script_version('0.4.0')
 script_description('Скрипт для Arizona RP: меню, авто спавн, автообновление')
 
 local imgui    = require('mimgui')
@@ -17,7 +17,7 @@ encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
 -- ===================== Настройки =====================
-local SCRIPT_VERSION = '0.3.0'
+local SCRIPT_VERSION = '0.4.0'
 local REPO_RAW    = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/'
 local VERSION_URL = REPO_RAW .. 'version.json'
 local SCRIPT_URL  = REPO_RAW .. 'lua_afk.lua'
@@ -37,6 +37,21 @@ local cfg = inicfg.load({
         delay   = 1000,     -- задержка, мс
         item    = 1,        -- номер пункта в диалоге (с 1)
         keyword = 'спавн',  -- слово в заголовке диалога
+    },
+    theme = {
+        accent     = '#3F99FF', -- основной цвет
+        bg         = '#12141C', -- цвет фона окна
+        childAlpha = 0.80,      -- прозрачность панелей
+        rounding   = 12,        -- скругление
+    },
+    particles = {
+        enabled = true,
+        count   = 70,
+        speed   = 60,           -- пикселей в секунду
+        size    = 2.0,
+        alpha   = 0.60,
+        color   = '#FFFFFF',
+        rainbow = false,
     },
 }, INI)
 local function saveCfg() inicfg.save(cfg, INI) end
@@ -148,47 +163,82 @@ local COLOR_GREEN = V4(0.35, 0.85, 0.45, 1.00)
 local COLOR_GRAY  = V4(0.60, 0.63, 0.70, 1.00)
 local COLOR_RED   = V4(1.00, 0.40, 0.40, 1.00)
 local WIDTH = 360
+local ACCENT = V4(0.25, 0.60, 1.00, 1.00)
 
-local function applyStyle()
+local function hexToRGB(hex)
+    local n = tonumber((tostring(hex):gsub('#', '')), 16) or 0xFFFFFF
+    return math.floor(n / 65536) % 256 / 255, math.floor(n / 256) % 256 / 255, n % 256 / 255
+end
+
+local function rgbToHex(r, g, b)
+    local function c(v) return math.max(0, math.min(255, math.floor(v * 255 + 0.5))) end
+    return string.format('#%02X%02X%02X', c(r), c(g), c(b))
+end
+
+local function hsv(h, s, v)
+    local i = math.floor(h * 6)
+    local f = h * 6 - i
+    local p, q, t = v * (1 - s), v * (1 - f * s), v * (1 - (1 - f) * s)
+    i = i % 6
+    if i == 0 then return v, t, p elseif i == 1 then return q, v, p
+    elseif i == 2 then return p, v, t elseif i == 3 then return p, q, v
+    elseif i == 4 then return t, p, v else return v, p, q end
+end
+
+-- Применяет цвета и скругления из настроек (вызывается при каждом изменении)
+local function applyTheme()
     local style = imgui.GetStyle()
     local c, col = style.Colors, imgui.Col
+    local ar, ag, ab = hexToRGB(cfg.theme.accent)
+    local br, bg, bb = hexToRGB(cfg.theme.bg)
+    local function mix(r, g, b, k, a) -- k > 0 светлее, k < 0 темнее
+        if k >= 0 then return V4(r + (1 - r) * k, g + (1 - g) * k, b + (1 - b) * k, a or 1) end
+        return V4(r * (1 + k), g * (1 + k), b * (1 + k), a or 1)
+    end
+    local function lift(k, a) return V4(math.min(1, br + k), math.min(1, bg + k), math.min(1, bb + k), a or 1) end
 
-    style.WindowPadding    = imgui.ImVec2(18, 16)
-    style.FramePadding     = imgui.ImVec2(10, 6)
-    style.ItemSpacing      = imgui.ImVec2(10, 10)
-    style.WindowRounding   = 12
-    style.FrameRounding    = 8
-    style.WindowBorderSize = 1
-    style.WindowTitleAlign = imgui.ImVec2(0.5, 0.5)
+    ACCENT = V4(ar, ag, ab, 1)
+    local rnd = tonumber(cfg.theme.rounding) or 12
 
-    c[col.WindowBg]         = V4(0.07, 0.08, 0.11, 0.97)
-    c[col.Border]           = V4(0.20, 0.55, 1.00, 0.40)
-    c[col.TitleBg]          = V4(0.10, 0.12, 0.17, 1.00)
-    c[col.TitleBgActive]    = V4(0.12, 0.16, 0.25, 1.00)
+    style.WindowPadding     = imgui.ImVec2(18, 16)
+    style.FramePadding      = imgui.ImVec2(10, 6)
+    style.ItemSpacing       = imgui.ImVec2(10, 10)
+    style.WindowRounding    = rnd
+    style.ChildRounding     = rnd * 0.8
+    style.FrameRounding     = rnd * 0.6
+    style.GrabRounding      = rnd * 0.6
+    style.PopupRounding     = rnd * 0.6
+    style.ScrollbarRounding = rnd * 0.6
+    style.GrabMinSize       = 14
+    style.WindowBorderSize  = 1
+    style.ChildBorderSize   = 1
+    style.WindowTitleAlign  = imgui.ImVec2(0.5, 0.5)
+
+    c[col.WindowBg]         = V4(br, bg, bb, 0.97)
+    c[col.ChildBg]          = lift(0.03, tonumber(cfg.theme.childAlpha) or 0.8)
+    c[col.PopupBg]          = lift(0.02, 0.98)
+    c[col.Border]           = V4(ar, ag, ab, 0.40)
+    c[col.Separator]        = V4(ar, ag, ab, 0.25)
+    c[col.TitleBg]          = lift(0.03)
+    c[col.TitleBgActive]    = lift(0.06)
     c[col.Text]             = V4(0.92, 0.94, 0.97, 1.00)
     c[col.TextDisabled]     = COLOR_GRAY
-    c[col.Separator]        = V4(0.20, 0.55, 1.00, 0.25)
-    c[col.FrameBg]          = V4(0.13, 0.15, 0.20, 1.00)
-    c[col.PlotHistogram]    = V4(0.20, 0.60, 1.00, 1.00) -- заливка прогресс-бара
-    c[col.Button]           = V4(0.20, 0.47, 0.95, 1.00)
-    c[col.ButtonHovered]    = V4(0.28, 0.56, 1.00, 1.00)
-    c[col.ButtonActive]     = V4(0.15, 0.38, 0.85, 1.00)
-
-    style.ChildRounding    = 10
-    style.GrabRounding     = 8
-    style.GrabMinSize      = 14
-    style.ChildBorderSize  = 1
-    style.ScrollbarRounding = 8
-    c[col.ChildBg]          = V4(0.10, 0.11, 0.15, 1.00)
-    c[col.PopupBg]          = V4(0.09, 0.10, 0.14, 0.98)
-    c[col.FrameBgHovered]   = V4(0.17, 0.19, 0.26, 1.00)
-    c[col.FrameBgActive]    = V4(0.20, 0.23, 0.32, 1.00)
-    c[col.SliderGrab]       = V4(0.25, 0.60, 1.00, 1.00)
-    c[col.SliderGrabActive] = V4(0.40, 0.70, 1.00, 1.00)
-    c[col.CheckMark]        = V4(0.30, 0.65, 1.00, 1.00)
-    c[col.ScrollbarBg]      = V4(0.08, 0.09, 0.12, 1.00)
-    c[col.ScrollbarGrab]    = V4(0.20, 0.23, 0.30, 1.00)
-    c[col.TextSelectedBg]   = V4(0.20, 0.55, 1.00, 0.35)
+    c[col.FrameBg]          = lift(0.06)
+    c[col.FrameBgHovered]   = lift(0.09)
+    c[col.FrameBgActive]    = lift(0.12)
+    c[col.Button]           = mix(ar, ag, ab, -0.15)
+    c[col.ButtonHovered]    = mix(ar, ag, ab, 0.12)
+    c[col.ButtonActive]     = mix(ar, ag, ab, -0.30)
+    c[col.Header]           = V4(ar, ag, ab, 0.35)
+    c[col.HeaderHovered]    = V4(ar, ag, ab, 0.50)
+    c[col.HeaderActive]     = V4(ar, ag, ab, 0.65)
+    c[col.PlotHistogram]    = ACCENT
+    c[col.SliderGrab]       = ACCENT
+    c[col.SliderGrabActive] = mix(ar, ag, ab, 0.25)
+    c[col.CheckMark]        = ACCENT
+    c[col.ScrollbarBg]      = lift(0.0)
+    c[col.ScrollbarGrab]    = lift(0.12)
+    c[col.TextSelectedBg]   = V4(ar, ag, ab, 0.35)
 end
 
 imgui.OnInitialize(function()
@@ -206,7 +256,7 @@ imgui.OnInitialize(function()
         io.Fonts:AddFontFromFileTTF(font, 16.0, nil, io.Fonts:GetGlyphRangesCyrillic())
     end
 
-    applyStyle()
+    applyTheme()
 end)
 
 local function centerText(text, color)
@@ -287,7 +337,6 @@ imgui.OnFrame(
 
 
 -- ===================== Виджеты (рисуются кодом, без icon-шрифтов => никаких "???") =====================
-local ACCENT = V4(0.25, 0.60, 1.00, 1.00)
 local U32 = imgui.ColorConvertFloat4ToU32
 local function vec(x, y) return imgui.ImVec2(x, y) end
 local function lerp(a, b, t) return a + (b - a) * t end
@@ -348,10 +397,16 @@ local function hint(text)
 end
 
 -- Иконки
-local function iconSpawn(dl, c, col)
-    dl:AddCircleFilled(vec(c.x, c.y - 3), 6.5, col, 24)
-    dl:AddTriangleFilled(vec(c.x - 5.6, c.y), vec(c.x + 5.6, c.y), vec(c.x, c.y + 8), col)
-    dl:AddCircleFilled(vec(c.x, c.y - 3), 2.6, U32(V4(0.10, 0.11, 0.15, 1)), 16)
+local function iconPerson(dl, c, col)
+    dl:AddCircleFilled(vec(c.x, c.y - 4.5), 3.8, col, 20)                       -- голова
+    dl:AddRectFilled(vec(c.x - 6.5, c.y + 1), vec(c.x + 6.5, c.y + 9), col, 4)  -- туловище
+end
+
+local function iconPalette(dl, c, col)
+    dl:AddCircle(c, 8, col, 24, 1.8)
+    dl:AddCircleFilled(vec(c.x - 3.2, c.y - 2.5), 1.7, col, 12)
+    dl:AddCircleFilled(vec(c.x + 3.2, c.y - 2.5), 1.7, col, 12)
+    dl:AddCircleFilled(vec(c.x, c.y + 3.5), 1.7, col, 12)
 end
 
 local function iconInfo(dl, c, col)
@@ -453,8 +508,175 @@ local function drawInfoTab()
     imgui.Text('/lafkupd'); imgui.SameLine(110); imgui.TextDisabled('проверить обновления')
 end
 
+-- ===================== Падающие частицы =====================
+local particles = {}
+
+local function newParticle(w, h, fromTop)
+    return {
+        x     = math.random() * w,
+        y     = fromTop and -math.random() * 20 or math.random() * h,
+        sp    = 0.5 + math.random(),          -- множитель скорости
+        sz    = 0.6 + math.random() * 0.8,    -- множитель размера
+        a     = 0.4 + math.random() * 0.6,    -- множитель прозрачности
+        drift = (math.random() - 0.5) * 20,   -- снос в сторону
+        hue   = math.random(),
+    }
+end
+
+local function drawParticles(dl, pos, size)
+    local P = cfg.particles
+    if not P.enabled then return end
+    local n = math.floor(tonumber(P.count) or 0)
+    while #particles < n do particles[#particles + 1] = newParticle(size.x, size.y, false) end
+    while #particles > n do particles[#particles] = nil end
+
+    local dt, time = imgui.GetIO().DeltaTime, imgui.GetTime()
+    local r, g, b = hexToRGB(P.color)
+    for i = 1, #particles do
+        local p = particles[i]
+        p.y = p.y + P.speed * p.sp * dt
+        p.x = p.x + p.drift * dt
+        if p.y > size.y + 6 or p.x < -6 or p.x > size.x + 6 then
+            p = newParticle(size.x, size.y, true)
+            particles[i] = p
+        end
+        local cr, cg, cb = r, g, b
+        if P.rainbow then cr, cg, cb = hsv((p.hue + time * 0.1) % 1, 0.65, 1) end
+        dl:AddCircleFilled(vec(pos.x + p.x, pos.y + p.y), P.size * p.sz, U32(V4(cr, cg, cb, P.alpha * p.a)), 12)
+    end
+end
+
+-- ===================== Вкладка «Оформление» =====================
+local function f3(hex) local r, g, b = hexToRGB(hex) return imgui.new.float[3](r, g, b) end
+
+local tui = {
+    accent     = f3(cfg.theme.accent),
+    bg         = f3(cfg.theme.bg),
+    childAlpha = imgui.new.float(tonumber(cfg.theme.childAlpha) or 0.8),
+    rounding   = imgui.new.int(tonumber(cfg.theme.rounding) or 12),
+    pOn        = imgui.new.bool(cfg.particles.enabled),
+    pCount     = imgui.new.int(cfg.particles.count),
+    pSpeed     = imgui.new.int(cfg.particles.speed),
+    pSize      = imgui.new.float(cfg.particles.size),
+    pAlpha     = imgui.new.float(cfg.particles.alpha),
+    pColor     = f3(cfg.particles.color),
+    pRainbow   = imgui.new.bool(cfg.particles.rainbow),
+}
+
+local PRESETS = {
+    { name = 'Синий',      accent = '#3F99FF', bg = '#12141C' },
+    { name = 'Фиолетовый', accent = '#9B5CFF', bg = '#15121E' },
+    { name = 'Розовый',    accent = '#FF4FA3', bg = '#1A1218' },
+    { name = 'Красный',    accent = '#FF4D4D', bg = '#1A1214' },
+    { name = 'Оранжевый',  accent = '#FF9A3C', bg = '#1A1612' },
+    { name = 'Зелёный',    accent = '#3CD27A', bg = '#111A15' },
+    { name = 'Бирюзовый',  accent = '#2FD6D0', bg = '#101A1A' },
+}
+
+local function setColor3(arr, hex)
+    local r, g, b = hexToRGB(hex)
+    arr[0], arr[1], arr[2] = r, g, b
+end
+
+-- Ряд круглых образцов цвета (пресеты темы)
+local function presetSwatches()
+    local dl = imgui.GetWindowDrawList()
+    local d = 30
+    for i, pr in ipairs(PRESETS) do
+        if i > 1 then imgui.SameLine() end
+        local p = imgui.GetCursorScreenPos()
+        if imgui.InvisibleButton('##preset' .. i, vec(d, d)) then
+            cfg.theme.accent, cfg.theme.bg = pr.accent, pr.bg
+            setColor3(tui.accent, pr.accent); setColor3(tui.bg, pr.bg)
+            applyTheme(); saveCfg()
+        end
+        local hovered = imgui.IsItemHovered()
+        local r, g, b = hexToRGB(pr.accent)
+        local c = vec(p.x + d / 2, p.y + d / 2)
+        dl:AddCircleFilled(c, d / 2 - (hovered and 2 or 4), U32(V4(r, g, b, 1)), 32)
+        if cfg.theme.accent:upper() == pr.accent:upper() then
+            dl:AddCircle(c, d / 2 - 0.5, U32(V4(1, 1, 1, 0.9)), 32, 2)
+        end
+        if hovered then imgui.SetTooltip(pr.name) end
+    end
+end
+
+local function colorRow(id, label, arr)
+    local changed = imgui.ColorEdit3(id, arr, imgui.ColorEditFlags.NoInputs)
+    imgui.SameLine()
+    imgui.Text(label)
+    return changed
+end
+
+local function drawThemeTab()
+    section('Готовые темы')
+    presetSwatches()
+
+    section('Цвета меню')
+    if colorRow('##accent', 'Основной цвет', tui.accent) then
+        cfg.theme.accent = rgbToHex(tui.accent[0], tui.accent[1], tui.accent[2]); applyTheme(); saveCfg()
+    end
+    if colorRow('##bg', 'Цвет фона', tui.bg) then
+        cfg.theme.bg = rgbToHex(tui.bg[0], tui.bg[1], tui.bg[2]); applyTheme(); saveCfg()
+    end
+    imgui.PushItemWidth(-1)
+    imgui.Text('Прозрачность панелей:')
+    if imgui.SliderFloat('##childAlpha', tui.childAlpha, 0.2, 1.0, '%.2f') then
+        cfg.theme.childAlpha = tui.childAlpha[0]; applyTheme(); saveCfg()
+    end
+    imgui.Text('Скругление:')
+    if imgui.SliderInt('##rounding', tui.rounding, 0, 20, '%d px') then
+        cfg.theme.rounding = tui.rounding[0]; applyTheme(); saveCfg()
+    end
+    imgui.PopItemWidth()
+
+    section('Падающие частицы')
+    if toggle('##p_on', 'Включить частицы', tui.pOn) then
+        cfg.particles.enabled = tui.pOn[0]; saveCfg()
+    end
+    if toggle('##p_rainbow', 'Радужные частицы', tui.pRainbow) then
+        cfg.particles.rainbow = tui.pRainbow[0]; saveCfg()
+    end
+    if not tui.pRainbow[0] then
+        if colorRow('##p_color', 'Цвет частиц', tui.pColor) then
+            cfg.particles.color = rgbToHex(tui.pColor[0], tui.pColor[1], tui.pColor[2]); saveCfg()
+        end
+    end
+    imgui.PushItemWidth(-1)
+    imgui.Text('Количество:')
+    if imgui.SliderInt('##p_count', tui.pCount, 0, 300, '%d шт.') then
+        cfg.particles.count = tui.pCount[0]; saveCfg()
+    end
+    imgui.Text('Скорость:')
+    if imgui.SliderInt('##p_speed', tui.pSpeed, 5, 400, '%d') then
+        cfg.particles.speed = tui.pSpeed[0]; saveCfg()
+    end
+    imgui.Text('Размер:')
+    if imgui.SliderFloat('##p_size', tui.pSize, 0.5, 6.0, '%.1f') then
+        cfg.particles.size = tui.pSize[0]; saveCfg()
+    end
+    imgui.Text('Яркость:')
+    if imgui.SliderFloat('##p_alpha', tui.pAlpha, 0.05, 1.0, '%.2f') then
+        cfg.particles.alpha = tui.pAlpha[0]; saveCfg()
+    end
+    imgui.PopItemWidth()
+
+    imgui.Spacing()
+    if grayButton('Сбросить оформление', vec(-1, 34)) then
+        cfg.theme.accent, cfg.theme.bg, cfg.theme.childAlpha, cfg.theme.rounding = '#3F99FF', '#12141C', 0.80, 12
+        cfg.particles.enabled, cfg.particles.count, cfg.particles.speed = true, 70, 60
+        cfg.particles.size, cfg.particles.alpha, cfg.particles.color, cfg.particles.rainbow = 2.0, 0.60, '#FFFFFF', false
+        setColor3(tui.accent, cfg.theme.accent); setColor3(tui.bg, cfg.theme.bg); setColor3(tui.pColor, cfg.particles.color)
+        tui.childAlpha[0], tui.rounding[0] = cfg.theme.childAlpha, cfg.theme.rounding
+        tui.pOn[0], tui.pCount[0], tui.pSpeed[0] = true, 70, 60
+        tui.pSize[0], tui.pAlpha[0], tui.pRainbow[0] = 2.0, 0.60, false
+        applyTheme(); saveCfg()
+    end
+end
+
 local TABS = {
-    { name = 'Авто спавн', icon = iconSpawn, draw = drawSpawnTab },
+    { name = 'Авто спавн', icon = iconPerson, draw = drawSpawnTab },
+    { name = 'Оформление', icon = iconPalette, draw = drawThemeTab },
     { name = 'Информация', icon = iconInfo,  draw = drawInfoTab  },
 }
 
@@ -463,11 +685,14 @@ imgui.OnFrame(
     function(player)
         local sw, sh = getScreenResolution()
         imgui.SetNextWindowPos(vec(sw / 2, sh / 2), imgui.Cond.FirstUseEver, vec(0.5, 0.5))
-        imgui.SetNextWindowSize(vec(660, 430), imgui.Cond.Always)
+        imgui.SetNextWindowSize(vec(700, 480), imgui.Cond.Always)
         imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, vec(10, 10))
         imgui.Begin('##lua_afk_menu', menu.window,
             imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoCollapse)
         imgui.PopStyleVar()
+
+        -- Частицы рисуются на фоне окна, панели поверх них полупрозрачные
+        drawParticles(imgui.GetWindowDrawList(), imgui.GetWindowPos(), imgui.GetWindowSize())
 
         -- Боковая панель: вкладки столбиком
         imgui.BeginChild('##sidebar', vec(190, 0), true)
