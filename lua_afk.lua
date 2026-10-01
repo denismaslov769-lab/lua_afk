@@ -1,11 +1,11 @@
 -- lua_afk.lua
--- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
+-- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Сцепка: новый подъезд - бот плавно выходит на линию прицепа и встаёт перед ним ровно, без разворотов на месте (раньше издалека/сбоку дёргался вперёд-назад). Исправлен газ вперёд при переходе на задний ход на скорости.
+-- @changelog: Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.3.8')
+script_version('2.4.0')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.3.8'
+local SCRIPT_VERSION = '2.4.0'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -29,13 +29,6 @@ local TAG = '{33AAFF}[lua_afk]{FFFFFF} '
 --==============================================================
 local INI = 'lua_afk.ini'
 local cfg = inicfg.load({
-    spawn = {
-        enabled = false,
-        mode    = 0,        -- 0 = кнопка Spawn, 1 = пункт в диалоге
-        delay   = 1000,     -- мс
-        item    = 1,        -- номер пункта (с 1)
-        keyword = 'спавн',  -- слово в заголовке диалога
-    },
     bot = {
         enabled  = false,
         source   = 0,       -- 0 = авто, 1 = чекпоинт, 2 = метка на карте
@@ -62,11 +55,26 @@ local cfg = inicfg.load({
         alpha   = 0.60,
         color   = '#FFFFFF',
         rainbow = false,
+        mode    = 0,        -- 0 = точки, 1 = свои картинки
+        images  = '',       -- выбранные картинки через |
+        spin    = true,
+        tint    = false,
+    },
+    bgimg = {
+        enabled = false,
+        file    = '',       -- файл или папка в config/lua_afk/backgrounds
+        fit     = 0,        -- 0 = заполнить, 1 = вписать, 2 = растянуть
+        dim     = 0.45,     -- затемнение в цвет темы
+        speed   = 1.0,      -- скорость анимации
+        fps     = 20,       -- кадров в секунду для видео
+        quality = 1,        -- 0..2
+        flip    = false,
     },
     update = {
         auto = true,
     },
 }, INI)
+cfg.spawn = nil -- авто спавн удалён: старая секция больше не сохраняется
 local function saveCfg() inicfg.save(cfg, INI) end
 local function num(v, d) return tonumber(v) or d end
 
@@ -286,46 +294,6 @@ local function updateScheduler()
         if os.time() - last >= 300 then
             last = os.time()
             checkUpdates(false, true)
-        end
-    end
-end
-
---==============================================================
--- Авто спавн
---==============================================================
-local function autoSpawnThread()
-    local lastSpawn, lastDialogId, lastDialogTime = 0, -1, 0
-    while true do
-        wait(200)
-        if cfg.spawn.enabled then
-            if num(cfg.spawn.mode, 0) == 0 then
-                local connected = sampGetPlayerIdByCharHandle(PLAYER_PED)
-                if connected and not sampIsLocalPlayerSpawned() and not sampIsDialogActive()
-                   and os.clock() - lastSpawn > 3 then
-                    wait(num(cfg.spawn.delay, 1000))
-                    if not sampIsLocalPlayerSpawned() and not sampIsDialogActive() then
-                        sampSendRequestSpawn()
-                        sampSpawnPlayer()
-                        lastSpawn = os.clock()
-                        msg('Авто спавн: персонаж заспавнен.')
-                    end
-                end
-            elseif sampIsDialogActive() then
-                local id = sampGetCurrentDialogId()
-                if id ~= lastDialogId or os.clock() - lastDialogTime > 3 then
-                    local caption = u8(sampGetDialogCaption() or ''):gsub('{%x+}', '')
-                    local kw = ruLower(cfg.spawn.keyword)
-                    if kw ~= '' and ruLower(caption):find(kw, 1, true) then
-                        lastDialogId, lastDialogTime = id, os.clock()
-                        wait(num(cfg.spawn.delay, 1000))
-                        if sampIsDialogActive() and sampGetCurrentDialogId() == id then
-                            sampSetCurrentDialogListItem(num(cfg.spawn.item, 1) - 1)
-                            sampCloseCurrentDialogWithButton(1)
-                            msg('Авто спавн: выбран пункт ' .. cfg.spawn.item .. '.')
-                        end
-                    end
-                end
-            end
         end
     end
 end
@@ -1420,23 +1388,605 @@ end
 local V4  = imgui.ImVec4
 local function vec(x, y) return imgui.ImVec2(x, y) end
 local function U32(c) return imgui.ColorConvertFloat4ToU32(c) end
-local WHITE = V4(1, 1, 1, 1)
-local GRAY  = V4(0.55, 0.58, 0.65, 1)
-local GREEN = V4(0.35, 0.85, 0.45, 1)
-local ACCENT = V4(0.25, 0.6, 1, 1)
+local function lerp(a, b, t) return a + (b - a) * t end
+local function lerpV4(a, b, t) return V4(lerp(a.x, b.x, t), lerp(a.y, b.y, t), lerp(a.z, b.z, t), lerp(a.w, b.w, t)) end
+local function mixV(a, b, t, alpha) return V4(lerp(a.x, b.x, t), lerp(a.y, b.y, t), lerp(a.z, b.z, t), alpha or 1) end
+
+-- Палитра. Пересчитывается в applyTheme под яркость фона: на светлой теме текст и
+-- элементы тёмные, на тёмной - светлые. Все виджеты берут цвета только отсюда.
+local GREEN   = V4(0.35, 0.85, 0.45, 1)
+local YELLOW  = V4(1.0, 0.8, 0.35, 1)
+local RED     = V4(1.0, 0.42, 0.42, 1)
+local BGV     = V4(0.07, 0.08, 0.11, 1)   -- цвет фона окна
+local TEXT    = V4(0.93, 0.94, 0.97, 1)   -- основной текст
+local DIM     = V4(0.58, 0.61, 0.68, 1)   -- второстепенный текст
+local ACCENT  = V4(0.25, 0.6, 1, 1)       -- акцент (заливки)
+local ACCENT_TEXT = ACCENT                -- акцент для текста (читаемый на фоне)
+local SURF, SURF_H, SURF_A = V4(0.2, 0.22, 0.28, 1), V4(0.26, 0.28, 0.35, 1), V4(0.16, 0.18, 0.22, 1)
+local TRACK   = V4(0.22, 0.24, 0.30, 1)   -- дорожка выключенного переключателя
+local KNOB    = V4(1, 1, 1, 1)
+local KNOB_EDGE = V4(0, 0, 0, 0)
+local CHILD   = V4(0.1, 0.11, 0.14, 1)
+local LIGHT   = false
+
+local function relLum(r, g, b)
+    local function ch(c) return c <= 0.03928 and c / 12.92 or ((c + 0.055) / 1.055) ^ 2.4 end
+    return 0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b)
+end
+local function contrast(a, b)
+    local l1, l2 = relLum(a.x, a.y, a.z), relLum(b.x, b.y, b.z)
+    if l1 < l2 then l1, l2 = l2, l1 end
+    return (l1 + 0.05) / (l2 + 0.05)
+end
+-- Сдвигает цвет к toward, пока контраст с фоном не станет не меньше ratio
+local function ensureContrast(fg, bg, ratio, toward)
+    for i = 0, 20 do
+        local c = mixV(fg, toward, i / 20, fg.w)
+        if contrast(c, bg) >= ratio then return c end
+    end
+    return toward
+end
+-- Цвет статуса/подсветки, который читается на текущем фоне
+local function readable(c) return ensureContrast(c, BGV, 3.0, TEXT) end
+
+--==============================================================
+-- Свои картинки, GIF и видео для меню.
+-- Картинки и анимации декодирует Windows (WIC): png, jpg, bmp, gif, tiff, ico,
+-- а также webp/heic/avif, если в системе стоят их кодеки. Видео (mp4, avi, wmv,
+-- mov, mkv...) - через Media Foundation. Всё переводится в текстуры D3D9 через mimgui.
+--==============================================================
+local media = { ok = false, err = nil, loaders = {} }
+do -- внутренности загрузчика спрятаны в блок: у Lua лимит 200 локальных переменных
+local IMG_EXT = { png = 1, jpg = 1, jpeg = 1, jfif = 1, bmp = 1, gif = 1, webp = 1, tif = 1, tiff = 1,
+                  ico = 1, jxr = 1, wdp = 1, heic = 1, heif = 1, avif = 1, dds = 1, tga = 1 }
+local VIDEO_EXT = { mp4 = 1, m4v = 1, avi = 1, wmv = 1, mov = 1, mkv = 1, webm = 1, mpg = 1, mpeg = 1, ['3gp'] = 1, flv = 1 }
+
+do
+    local defs = {
+        'typedef struct { uint32_t d1; uint16_t d2, d3; uint8_t d4[8]; } lafk_GUID;',
+        'typedef struct { uint16_t vt, r1, r2, r3; union { uint8_t b; uint16_t ui; uint32_t ul; uint64_t u64; void *p; } v; } lafk_PV;',
+        'long __stdcall lafk_CoInitializeEx(void *, unsigned long) __asm__("CoInitializeEx");',
+        'long __stdcall lafk_CoCreateInstance(const lafk_GUID *, void *, unsigned long, const lafk_GUID *, void **) __asm__("CoCreateInstance");',
+        'long __stdcall lafk_PropVariantClear(lafk_PV *) __asm__("PropVariantClear");',
+        'int __stdcall lafk_MB2WC(unsigned int, unsigned long, const char *, int, uint16_t *, int) __asm__("MultiByteToWideChar");',
+        'long __stdcall lafk_WICConvert(const lafk_GUID *, void *, void **) __asm__("WICConvertBitmapSource");',
+        'long __stdcall lafk_MFStartup(unsigned long, unsigned long) __asm__("MFStartup");',
+        'long __stdcall lafk_MFCreateAttributes(void **, uint32_t) __asm__("MFCreateAttributes");',
+        'long __stdcall lafk_MFCreateMediaType(void **) __asm__("MFCreateMediaType");',
+        'long __stdcall lafk_MFCreateSourceReaderFromURL(const uint16_t *, void *, void **) __asm__("MFCreateSourceReaderFromURL");',
+        'void * __stdcall lafk_ShellExecuteA(void *, const char *, const char *, const char *, const char *, int) __asm__("ShellExecuteA");',
+    }
+    local okAll = true
+    for _, d in ipairs(defs) do
+        local ok, e = pcall(ffi.cdef, d)
+        if not ok then okAll = false; log('[media] cdef: ' .. tostring(e)) end
+    end
+    local function lib(name) local ok, l = pcall(ffi.load, name) if ok then return l end end
+    media.ole32, media.wic, media.mfplat, media.mfrw, media.shell = lib('ole32'), lib('windowscodecs'), lib('mfplat'), lib('mfreadwrite'), lib('shell32')
+    media.ok = okAll and media.ole32 ~= nil and media.wic ~= nil
+        and imgui.CreateTextureFromFileInMemory ~= nil
+    if not media.ok then media.err = 'Загрузка своих картинок недоступна в этой системе.' end
+end
+
+local function guid(s)
+    local g = ffi.new('lafk_GUID')
+    local a, b, c, d, e = s:match('(%x+)-(%x+)-(%x+)-(%x+)-(%x+)')
+    g.d1, g.d2, g.d3 = tonumber(a, 16), tonumber(b, 16), tonumber(c, 16)
+    local rest = d .. e
+    for i = 0, 7 do g.d4[i] = tonumber(rest:sub(i * 2 + 1, i * 2 + 2), 16) end
+    return g
+end
+local G = {}
+if media.ok then
+    G.CLSID_WIC  = guid('cacaf262-9370-4615-a13b-9f5539da4c0a')
+    G.IID_WICF   = guid('ec5ec8a9-c395-4314-9c77-54d7a935ff70')
+    G.PF_BGRA    = guid('6fddc324-4e03-4bfe-b185-3d77768dc90f')
+    G.MF_VPROC   = guid('fb394f3d-ccf1-42ee-bbb3-f9b845d5681d') -- MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING
+    G.MT_MAJOR   = guid('48eba18e-f8c9-4687-bf11-0a74c9f96a8f')
+    G.MT_SUBTYPE = guid('f7e34c9a-42e8-4714-b74b-cb29d72c35e5')
+    G.MT_SIZE    = guid('1652c33d-d6b2-4012-b834-72030849a37d')
+    G.MT_STRIDE  = guid('644b4e48-1e02-4516-b0eb-c01ca9d49ac6')
+    G.MT_VIDEO   = guid('73646976-0000-0010-8000-00aa00389b71')
+    G.RGB32      = guid('00000016-0000-0010-8000-00aa00389b71')
+end
+
+-- Вызов метода COM-объекта по номеру в таблице виртуальных функций
+local fnTypes = {}
+local function vc(obj, idx, sig, ...)
+    local t = fnTypes[sig]
+    if not t then
+        t = ffi.typeof('long (__stdcall *)(void *' .. (sig ~= '' and (', ' .. sig) or '') .. ')')
+        fnTypes[sig] = t
+    end
+    local vt = ffi.cast('void ***', obj)[0]
+    return ffi.cast(t, vt[idx])(obj, ...)
+end
+local function release(obj) if obj ~= nil then vc(obj, 2, '') end end
+local function hex(hr) return string.format('%08X', hr % 4294967296) end
+
+local function wide(s)
+    local n = ffi.C.lafk_MB2WC(0, 0, s, -1, nil, 0)
+    local buf = ffi.new('uint16_t[?]', n + 1)
+    ffi.C.lafk_MB2WC(0, 0, s, -1, buf, n)
+    return buf
+end
+
+local factory
+local function wicFactory()
+    if factory then return factory end
+    media.ole32.lafk_CoInitializeEx(nil, 2)
+    local pp = ffi.new('void *[1]')
+    local hr = media.ole32.lafk_CoCreateInstance(G.CLSID_WIC, nil, 1, G.IID_WICF, pp)
+    if hr < 0 then error('WIC недоступен (' .. hex(hr) .. ')', 0) end
+    factory = pp[0]
+    return factory
+end
+
+local function metaNum(reader, name)
+    if reader == nil then return nil end
+    local pv = ffi.new('lafk_PV')
+    if vc(reader, 5, 'const uint16_t *, lafk_PV *', wide(name), pv) < 0 then return nil end
+    local vt, v = pv.vt, nil
+    if vt == 17 then v = pv.v.b elseif vt == 18 then v = pv.v.ui elseif vt == 19 then v = pv.v.ul
+    elseif vt == 11 then v = (pv.v.ui ~= 0) and 1 or 0 end
+    media.ole32.lafk_PropVariantClear(pv)
+    return v and tonumber(v)
+end
+
+local function srcSize(src)
+    local w, h = ffi.new('uint32_t[1]'), ffi.new('uint32_t[1]')
+    if vc(src, 3, 'uint32_t *, uint32_t *', w, h) < 0 then return nil end
+    return tonumber(w[0]), tonumber(h[0])
+end
+
+-- Источник WIC -> пиксели BGRA (top-down), с масштабом до dw x dh (если задан)
+local function readPixels(src, dw, dh)
+    local fac = wicFactory()
+    local cp = ffi.new('void *[1]')
+    if media.wic.lafk_WICConvert(G.PF_BGRA, src, cp) < 0 then return nil end
+    local s = cp[0]
+    local sw, sh = srcSize(s)
+    if not sw then release(s) return nil end
+    local out, scaler = s, nil
+    if dw and dh and (dw ~= sw or dh ~= sh) then
+        local pp = ffi.new('void *[1]')
+        if vc(fac, 11, 'void **', pp) >= 0 then
+            scaler = pp[0]
+            if vc(scaler, 8, 'void *, uint32_t, uint32_t, int', s, dw, dh, 3) >= 0 then
+                out, sw, sh = scaler, dw, dh
+            else
+                release(scaler); scaler = nil
+            end
+        end
+    end
+    local size = sw * sh * 4
+    local buf = ffi.new('uint8_t[?]', size)
+    local hr = vc(out, 7, 'void *, uint32_t, uint32_t, uint8_t *', nil, sw * 4, size, buf)
+    if scaler then release(scaler) end
+    release(s)
+    if hr < 0 then return nil end
+    return buf, sw, sh
+end
+
+local function downscale(src, w, h, dw, dh)
+    if dw == w and dh == h then return src end
+    local dst = ffi.new('uint8_t[?]', dw * dh * 4)
+    local s32, d32 = ffi.cast('uint32_t *', src), ffi.cast('uint32_t *', dst)
+    for y = 0, dh - 1 do
+        local sy, row = math.floor(y * h / dh) * w, y * dw
+        for x = 0, dw - 1 do d32[row + x] = s32[sy + math.floor(x * w / dw)] end
+    end
+    return dst
+end
+
+-- Пиксели BGRA -> текстура (через TGA в памяти: D3DX понимает его вместе с прозрачностью)
+local function makeTexture(buf, w, h)
+    local size = 18 + w * h * 4
+    local t = ffi.new('uint8_t[?]', size)
+    t[2] = 2
+    t[12], t[13], t[14], t[15] = w % 256, math.floor(w / 256), h % 256, math.floor(h / 256)
+    t[16], t[17] = 32, 0x28
+    ffi.copy(t + 18, buf, w * h * 4)
+    local tex = imgui.CreateTextureFromFileInMemory(t, size)
+    if tex == nil then return nil end
+    return tex
+end
+
+local function planSize(w, h, maxSide, maxPx)
+    local s = math.min(1, maxSide / math.max(w, h), math.sqrt(maxPx / (w * h)))
+    return math.max(1, math.floor(w * s)), math.max(1, math.floor(h * s))
+end
+
+-- Средний и самый яркий цвет картинки - для подбора темы под фон
+local function analyze(m, buf, w, h)
+    if m.avg then return end
+    local sr, sg, sb, n, best, bs = 0, 0, 0, 0, nil, -1
+    for gy = 0, 23 do
+        for gx = 0, 23 do
+            local i = (math.floor((gy + 0.5) * h / 24) * w + math.floor((gx + 0.5) * w / 24)) * 4
+            local b, g, r = buf[i] / 255, buf[i + 1] / 255, buf[i + 2] / 255
+            sr, sg, sb, n = sr + r, sg + g, sb + b, n + 1
+            local mx, mn = math.max(r, g, b), math.min(r, g, b)
+            local score = (mx - mn) * mx
+            if score > bs then bs, best = score, { r, g, b } end
+        end
+    end
+    m.avg = { sr / n, sg / n, sb / n }
+    m.vivid = best
+end
+
+local function budget(m)
+    if m.cancel then error('cancel', 0) end
+    if os.clock() > m.deadline then coroutine.yield() end
+    if m.cancel then error('cancel', 0) end
+end
+
+local function addFrame(m, buf, w, h, delay)
+    analyze(m, buf, w, h)
+    local tex = makeTexture(buf, w, h)
+    if tex == nil then error('не удалось создать текстуру', 0) end
+    m.frames[#m.frames + 1], m.delays[#m.delays + 1] = tex, delay
+    m.w, m.h = w, h
+end
+
+local function openDecoder(path)
+    local pp = ffi.new('void *[1]')
+    local hr = vc(wicFactory(), 3, 'const uint16_t *, void *, uint32_t, int, void **', wide(path), nil, 0x80000000, 0, pp)
+    if hr < 0 then return nil, hr end
+    return pp[0]
+end
+
+-- Картинка или анимация (gif / анимированный webp) через WIC
+local function loadImage(m, path, opt)
+    local dec, hr = openDecoder(path)
+    if not dec then error('формат не поддерживается системой (' .. hex(hr) .. ')', 0) end
+    local ok, err = pcall(function()
+        local cnt = ffi.new('uint32_t[1]')
+        vc(dec, 12, 'uint32_t *', cnt)
+        local n = math.max(1, tonumber(cnt[0]))
+        local isGif = path:lower():match('%.gif$') ~= nil
+        local picks = math.min(n, opt.maxFrames)
+        local step = n / picks
+        local nextPick, cw, ch, canvas, saved = 0, nil, nil, nil, nil
+        if isGif and n > 1 then
+            local rp = ffi.new('void *[1]')
+            if vc(dec, 8, 'void **', rp) >= 0 then
+                cw, ch = metaNum(rp[0], '/logscrdesc/Width'), metaNum(rp[0], '/logscrdesc/Height')
+                release(rp[0])
+            end
+        end
+        local dw, dh
+        for i = 0, n - 1 do
+            budget(m)
+            local fp = ffi.new('void *[1]')
+            if vc(dec, 13, 'uint32_t, void **', i, fp) < 0 then break end
+            local fr = fp[0]
+            local left, top, delay, disp = 0, 0, 10, 0
+            if n > 1 then
+                local rp = ffi.new('void *[1]')
+                if vc(fr, 8, 'void **', rp) >= 0 then
+                    left = metaNum(rp[0], '/imgdesc/Left') or 0
+                    top = metaNum(rp[0], '/imgdesc/Top') or 0
+                    delay = metaNum(rp[0], '/grctlext/Delay') or 10
+                    disp = metaNum(rp[0], '/grctlext/Disposal') or 0
+                    release(rp[0])
+                end
+            end
+            local d = ((delay or 0) <= 1 and 10 or delay) / 100
+            if canvas or (isGif and n > 1) then
+                -- GIF: кадры бывают частичными - собираем полный кадр на холсте
+                local px, fw, fh = readPixels(fr)
+                release(fr)
+                if px then
+                    if not canvas then
+                        cw, ch = cw or fw, ch or fh
+                        canvas = ffi.new('uint8_t[?]', cw * ch * 4)
+                        dw, dh = planSize(cw, ch, opt.maxSide, opt.budget / picks)
+                    end
+                    if disp == 3 then saved = ffi.new('uint8_t[?]', cw * ch * 4); ffi.copy(saved, canvas, cw * ch * 4) end
+                    local s32, c32 = ffi.cast('uint32_t *', px), ffi.cast('uint32_t *', canvas)
+                    for y = 0, fh - 1 do
+                        local cy = top + y
+                        if cy >= 0 and cy < ch then
+                            local srow, crow = y * fw, cy * cw + left
+                            for x = 0, math.min(fw, cw - left) - 1 do
+                                if px[(srow + x) * 4 + 3] >= 128 then c32[crow + x] = s32[srow + x] end
+                            end
+                        end
+                    end
+                    if i >= nextPick then
+                        nextPick = nextPick + step
+                        addFrame(m, downscale(canvas, cw, ch, dw, dh), dw, dh, 0)
+                    end
+                    m.delays[#m.delays] = (m.delays[#m.delays] or 0) + d
+                    if disp == 2 then
+                        for y = math.max(0, top), math.min(ch, top + fh) - 1 do
+                            ffi.fill(canvas + (y * cw + math.max(0, left)) * 4, math.max(0, math.min(cw, left + fw) - math.max(0, left)) * 4, 0)
+                        end
+                    elseif disp == 3 and saved then
+                        ffi.copy(canvas, saved, cw * ch * 4)
+                    end
+                end
+            else
+                if i >= nextPick then
+                    nextPick = nextPick + step
+                    local fw, fh = srcSize(fr)
+                    if fw then
+                        dw, dh = planSize(fw, fh, opt.maxSide, opt.budget / picks)
+                        local px = readPixels(fr, dw, dh)
+                        if px then addFrame(m, px, dw, dh, 0) end
+                    end
+                end
+                release(fr)
+                if #m.delays > 0 then m.delays[#m.delays] = m.delays[#m.delays] + d end
+            end
+        end
+    end)
+    release(dec)
+    if not ok then error(err, 0) end
+end
+
+-- Папка с кадрами (001.png, 002.png, ...) - как анимация
+local function loadSequence(m, dir, files, opt)
+    local picks = math.min(#files, opt.maxFrames)
+    local step = #files / picks
+    local i = 1
+    while i <= #files and #m.frames < picks do
+        budget(m)
+        local dec = openDecoder(dir .. '\\' .. files[math.floor(i)])
+        if dec then
+            local fp = ffi.new('void *[1]')
+            if vc(dec, 13, 'uint32_t, void **', 0, fp) >= 0 then
+                local fw, fh = srcSize(fp[0])
+                if fw then
+                    local dw, dh = planSize(fw, fh, opt.maxSide, opt.budget / picks)
+                    local px = readPixels(fp[0], dw, dh)
+                    if px then addFrame(m, px, dw, dh, step / opt.fps) end
+                end
+                release(fp[0])
+            end
+            release(dec)
+        end
+        i = i + step
+    end
+end
+
+-- Видео через Media Foundation: берём кадры с нужной частотой, до лимита кадров
+local mfStarted = false
+local function loadVideo(m, path, opt)
+    local mf, mfrw = media.mfplat, media.mfrw
+    if not mf or not mfrw then error('в системе нет Media Foundation', 0) end
+    media.ole32.lafk_CoInitializeEx(nil, 2)
+    if not mfStarted then
+        local hr = mf.lafk_MFStartup(0x20070, 0)
+        if hr < 0 then error('Media Foundation не запустился (' .. hex(hr) .. ')', 0) end
+        mfStarted = true
+    end
+    local ap = ffi.new('void *[1]')
+    if mf.lafk_MFCreateAttributes(ap, 1) < 0 then error('MFCreateAttributes', 0) end
+    vc(ap[0], 21, 'const lafk_GUID *, uint32_t', G.MF_VPROC, 1)
+    local rp = ffi.new('void *[1]')
+    local hr = mfrw.lafk_MFCreateSourceReaderFromURL(wide(path), ap[0], rp)
+    release(ap[0])
+    if hr < 0 then error('видео не открылось - нет кодека или файл повреждён (' .. hex(hr) .. ')', 0) end
+    local rd = rp[0]
+    local VS = 0xFFFFFFFC
+    local ok, err = pcall(function()
+        vc(rd, 4, 'uint32_t, int', 0xFFFFFFFE, 0)
+        vc(rd, 4, 'uint32_t, int', VS, 1)
+        local tp = ffi.new('void *[1]')
+        if mf.lafk_MFCreateMediaType(tp) < 0 then error('MFCreateMediaType', 0) end
+        vc(tp[0], 24, 'const lafk_GUID *, const lafk_GUID *', G.MT_MAJOR, G.MT_VIDEO)
+        vc(tp[0], 24, 'const lafk_GUID *, const lafk_GUID *', G.MT_SUBTYPE, G.RGB32)
+        hr = vc(rd, 7, 'uint32_t, uint32_t *, void *', VS, nil, tp[0])
+        release(tp[0])
+        if hr < 0 then error('видео не переводится в RGB (' .. hex(hr) .. ')', 0) end
+        local cp = ffi.new('void *[1]')
+        if vc(rd, 6, 'uint32_t, void **', VS, cp) < 0 then error('нет формата кадра', 0) end
+        local fs = ffi.new('uint32_t[2]')
+        vc(cp[0], 8, 'const lafk_GUID *, uint32_t *', G.MT_SIZE, fs)
+        local st = ffi.new('uint32_t[1]')
+        local hasStride = vc(cp[0], 7, 'const lafk_GUID *, uint32_t *', G.MT_STRIDE, st) >= 0
+        release(cp[0])
+        local vw, vh = tonumber(fs[1]), tonumber(fs[0])
+        if vw < 1 or vh < 1 then error('неизвестный размер кадра', 0) end
+        local stride = hasStride and tonumber(ffi.cast('int32_t', st[0])) or vw * 4
+        local flipV = (stride < 0) ~= (opt.flip == true)
+        stride = math.abs(stride)
+        local dw, dh = planSize(vw, vh, opt.maxSide, opt.budget / opt.maxFrames)
+        local interval, nextT = 1 / opt.fps, 0
+        local idx, flags, ts, sp = ffi.new('uint32_t[1]'), ffi.new('uint32_t[1]'), ffi.new('int64_t[1]'), ffi.new('void *[1]')
+        local data, maxl, cur = ffi.new('uint8_t *[1]'), ffi.new('uint32_t[1]'), ffi.new('uint32_t[1]')
+        local empty = 0
+        while #m.frames < opt.maxFrames do
+            budget(m)
+            sp[0] = nil
+            hr = vc(rd, 9, 'uint32_t, uint32_t, uint32_t *, uint32_t *, int64_t *, void **', VS, 0, idx, flags, ts, sp)
+            local smp = sp[0]
+            if hr < 0 or bit.band(flags[0], 2) ~= 0 then release(smp) break end
+            if smp == nil then
+                empty = empty + 1
+                if empty > 300 then break end
+            else
+                empty = 0
+                local t = tonumber(ts[0]) / 1e7
+                if t + 0.001 >= nextT then
+                    nextT = math.max(nextT + interval, t)
+                    local bp = ffi.new('void *[1]')
+                    if vc(smp, 41, 'void **', bp) >= 0 then
+                        local b = bp[0]
+                        if vc(b, 3, 'uint8_t **, uint32_t *, uint32_t *', data, maxl, cur) >= 0 then
+                            local sstride = stride
+                            if tonumber(cur[0]) < sstride * vh then sstride = math.floor(tonumber(cur[0]) / vh) end
+                            local src = data[0]
+                            local px = ffi.new('uint8_t[?]', dw * dh * 4)
+                            local d32 = ffi.cast('uint32_t *', px)
+                            for y = 0, dh - 1 do
+                                local sy = math.floor(y * vh / dh)
+                                if flipV then sy = vh - 1 - sy end
+                                local row = ffi.cast('uint32_t *', src + sy * sstride)
+                                local base = y * dw
+                                for x = 0, dw - 1 do d32[base + x] = bit.bor(row[math.floor(x * vw / dw)], 0xFF000000) end
+                            end
+                            vc(b, 4, '')
+                            addFrame(m, px, dw, dh, interval)
+                        end
+                        release(b)
+                    end
+                end
+                release(smp)
+            end
+        end
+    end)
+    release(rd)
+    if not ok then error(err, 0) end
+end
+
+-- Запасной путь для dds/tga и т.п.: D3DX сам грузит файл (без анимации)
+local function loadD3DX(m, path)
+    local tex = imgui.CreateTextureFromFile(path)
+    if tex == nil then error('файл не открылся', 0) end
+    local w, h = 256, 256
+    pcall(function()
+        local desc = ffi.new('uint32_t[8]')
+        if vc(ffi.cast('void *', tex), 17, 'uint32_t, uint32_t *', 0, desc) >= 0 then w, h = tonumber(desc[6]), tonumber(desc[7]) end
+    end)
+    m.frames[1], m.delays[1], m.w, m.h = tex, 1, w, h
+end
+
+local function extOf(name) return (tostring(name):match('%.([^%.\\/]+)$') or ''):lower() end
+
+-- Список файлов папки: { name, disp, dir, video, ext }
+function media.scanDir(dir)
+    local list = {}
+    local ok = pcall(function()
+        local h, name = findFirstFile(dir .. '\\*')
+        if not h then return end
+        while name do
+            if name ~= '.' and name ~= '..' then
+                local full = dir .. '\\' .. name
+                local ext = extOf(name)
+                local isDir = doesDirectoryExist(full)
+                if isDir or IMG_EXT[ext] or VIDEO_EXT[ext] then
+                    list[#list + 1] = { name = name, disp = u8(name), dir = isDir, video = VIDEO_EXT[ext] ~= nil, ext = ext }
+                end
+            end
+            name = findNextFile(h)
+        end
+        findClose(h)
+    end)
+    table.sort(list, function(a, b)
+        if a.dir ~= b.dir then return a.dir end
+        return a.name:lower() < b.name:lower()
+    end)
+    return list
+end
+
+local function imagesIn(dir)
+    local out = {}
+    for _, f in ipairs(media.scanDir(dir)) do
+        if not f.dir and not f.video then out[#out + 1] = f.name end
+    end
+    return out
+end
+
+-- Создать объект медиа и поставить загрузку в очередь (идёт по кусочкам в кадрах меню)
+function media.load(path, opt)
+    local m = { frames = {}, delays = {}, w = 1, h = 1, done = false, path = path, deadline = 0 }
+    if not media.ok then m.done, m.err = true, media.err return m end
+    local ext = extOf(path)
+    m.co = coroutine.create(function()
+        if doesDirectoryExist(path) then
+            local files = imagesIn(path)
+            if #files == 0 then error('в папке нет картинок', 0) end
+            loadSequence(m, path, files, opt)
+        elseif VIDEO_EXT[ext] then
+            loadVideo(m, path, opt)
+        else
+            local ok, e = pcall(loadImage, m, path, opt)
+            if not ok then
+                if e == 'cancel' then error(e, 0) end
+                if #m.frames == 0 and (ext == 'dds' or ext == 'tga' or ext == 'png' or ext == 'jpg' or ext == 'jpeg' or ext == 'bmp') then
+                    loadD3DX(m, path)
+                else
+                    error(e, 0)
+                end
+            end
+        end
+    end)
+    media.loaders[#media.loaders + 1] = m
+    return m
+end
+
+function media.free(m)
+    if not m then return end
+    m.cancel = true
+    for _, t in ipairs(m.frames) do pcall(imgui.ReleaseTexture, t) end
+    m.frames, m.delays = {}, {}
+end
+
+local function finish(m)
+    m.done, m.co = true, nil
+    local cum, total = {}, 0
+    for i, d in ipairs(m.delays) do total = total + math.max(0.01, d); cum[i] = total end
+    m.cum, m.total = cum, total
+    if #m.frames == 0 and not m.err then m.err = 'не удалось загрузить' end
+end
+
+-- Продолжить загрузки (вызывается каждый кадр меню, ~budgetSec времени на всё)
+function media.pump(budgetSec)
+    local i = 1
+    while i <= #media.loaders do
+        local m = media.loaders[i]
+        m.deadline = os.clock() + budgetSec
+        local ok, err = coroutine.resume(m.co)
+        if not ok then
+            if err ~= 'cancel' then m.err = tostring(err); log('[media] ' .. tostring(m.path) .. ': ' .. tostring(err)) end
+        end
+        if m.cancel then
+            -- отменили во время загрузки - освобождаем то, что успело загрузиться
+            if coroutine.status(m.co) ~= 'dead' then
+                m.deadline = 0
+                coroutine.resume(m.co)
+            end
+            media.free(m)
+            table.remove(media.loaders, i)
+        elseif coroutine.status(m.co) == 'dead' then
+            finish(m)
+            table.remove(media.loaders, i)
+        else
+            i = i + 1
+        end
+        if os.clock() > m.deadline then break end
+    end
+end
+
+-- Текущий кадр анимации
+function media.frame(m, t)
+    local n = #m.frames
+    if n == 0 then return nil end
+    if n == 1 or not m.done or not m.total or m.total <= 0 then return m.frames[1] end
+    local x = t % m.total
+    local cum = m.cum
+    local lo, hi = 1, n
+    while lo < hi do
+        local mid = math.floor((lo + hi) / 2)
+        if cum[mid] < x then lo = mid + 1 else hi = mid end
+    end
+    return m.frames[lo]
+end
+
+function media.openFolder(dir)
+    if media.shell then pcall(media.shell.lafk_ShellExecuteA, nil, 'open', dir, nil, nil, 1) end
+end
+end -- загрузчик
+
+local menu = { window = imgui.new.bool(false), tab = 1, frames = 0, err = nil }
 
 local function f3(hex) local r, g, b = hexToRGB(hex) return imgui.new.float[3](r, g, b) end
 local function setF3(arr, hex) local r, g, b = hexToRGB(hex) arr[0], arr[1], arr[2] = r, g, b end
 
-local menu = { window = imgui.new.bool(false), tab = 1, frames = 0, err = nil }
-
 local ui = {
-    spawnOn    = imgui.new.bool(cfg.spawn.enabled == true),
-    spawnMode  = imgui.new.int(num(cfg.spawn.mode, 0)),
-    spawnDelay = imgui.new.int(num(cfg.spawn.delay, 1000)),
-    spawnItem  = imgui.new.int(num(cfg.spawn.item, 1)),
-    spawnKw    = imgui.new.char[64](tostring(cfg.spawn.keyword or '')),
-
     botOn      = imgui.new.bool(cfg.bot.enabled == true),
     botSource  = imgui.new.int(num(cfg.bot.source, 0)),
     botSpeed   = imgui.new.int(num(cfg.bot.speed, 25)),
@@ -1448,12 +1998,25 @@ local ui = {
     botLane    = imgui.new.bool(cfg.bot.lane == true),
     botLaneOff = imgui.new.float(num(cfg.bot.laneOff, 2.5)),
 
+    setTab     = imgui.new.int(0),
     accent     = f3(cfg.theme.accent),
     bg         = f3(cfg.theme.bg),
     childAlpha = imgui.new.float(num(cfg.theme.childAlpha, 0.8)),
     rounding   = imgui.new.int(num(cfg.theme.rounding, 12)),
+
+    bgOn       = imgui.new.bool(cfg.bgimg.enabled == true),
+    bgFit      = imgui.new.int(num(cfg.bgimg.fit, 0)),
+    bgDim      = imgui.new.float(num(cfg.bgimg.dim, 0.45)),
+    bgSpeed    = imgui.new.float(num(cfg.bgimg.speed, 1.0)),
+    bgFps      = imgui.new.int(num(cfg.bgimg.fps, 20)),
+    bgQuality  = imgui.new.int(num(cfg.bgimg.quality, 1)),
+    bgFlip     = imgui.new.bool(cfg.bgimg.flip == true),
+
     pOn        = imgui.new.bool(cfg.particles.enabled ~= false),
+    pMode      = imgui.new.int(num(cfg.particles.mode, 0)),
     pRainbow   = imgui.new.bool(cfg.particles.rainbow == true),
+    pTint      = imgui.new.bool(cfg.particles.tint == true),
+    pSpin      = imgui.new.bool(cfg.particles.spin ~= false),
     pColor     = f3(cfg.particles.color),
     pCount     = imgui.new.int(num(cfg.particles.count, 70)),
     pSpeed     = imgui.new.int(num(cfg.particles.speed, 60)),
@@ -1463,19 +2026,44 @@ local ui = {
     autoUpd    = imgui.new.bool(cfg.update.auto ~= false),
 }
 
+-- Папки для своих файлов: moonloader/config/lua_afk/backgrounds и /particles
+local DIRS = {}
+do
+    local base = getWorkingDirectory() .. '\\config\\lua_afk'
+    DIRS.base, DIRS.bg, DIRS.pt = base, base .. '\\backgrounds', base .. '\\particles'
+    for _, d in ipairs({ getWorkingDirectory() .. '\\config', DIRS.base, DIRS.bg, DIRS.pt }) do
+        if not doesDirectoryExist(d) then pcall(createDirectory, d) end
+    end
+end
+
 -- Тема ------------------------------------------------------------------
 local function applyTheme()
     local style = imgui.GetStyle()
     local c, col = style.Colors, imgui.Col
     local ar, ag, ab = hexToRGB(cfg.theme.accent)
-    local br, bg, bb = hexToRGB(cfg.theme.bg)
-    local function mix(k, a)
-        if k >= 0 then return V4(ar + (1 - ar) * k, ag + (1 - ag) * k, ab + (1 - ab) * k, a or 1) end
-        return V4(ar * (1 + k), ag * (1 + k), ab * (1 + k), a or 1)
-    end
-    local function lift(k, a) return V4(math.min(1, br + k), math.min(1, bg + k), math.min(1, bb + k), a or 1) end
+    local br, bgc, bb = hexToRGB(cfg.theme.bg)
+    BGV = V4(br, bgc, bb, 1)
+    LIGHT = relLum(br, bgc, bb) > 0.28
+    -- INK - цвет "в сторону контраста": на светлом фоне тёмный, на тёмном - белый
+    local INK = LIGHT and V4(0.05, 0.06, 0.08, 1) or V4(1, 1, 1, 1)
+    local function shade(k, a) return mixV(BGV, INK, k, a) end
     local rnd = num(cfg.theme.rounding, 12)
+
+    TEXT = LIGHT and V4(0.09, 0.10, 0.13, 1) or V4(0.94, 0.95, 0.98, 1)
+    DIM = ensureContrast(LIGHT and V4(0.40, 0.42, 0.48, 1) or V4(0.60, 0.63, 0.70, 1), BGV, 4.5, TEXT)
     ACCENT = V4(ar, ag, ab, 1)
+    ACCENT_TEXT = ensureContrast(ACCENT, BGV, 3.5, TEXT)
+    SURF, SURF_H, SURF_A = shade(0.09), shade(0.14), shade(0.19)
+    TRACK = shade(LIGHT and 0.22 or 0.20)
+    KNOB = V4(1, 1, 1, 1)
+    KNOB_EDGE = LIGHT and V4(0, 0, 0, 0.25) or V4(0, 0, 0, 0)
+    CHILD = shade(0.04)
+    -- кнопки: акцент, смешанный с фоном ровно настолько, чтобы текст на них читался
+    local btn = mixV(BGV, ACCENT, 0.2)
+    for i = 0, 12 do
+        local cand = mixV(BGV, ACCENT, 0.8 - i * 0.05)
+        if contrast(cand, TEXT) >= 4.5 then btn = cand break end
+    end
 
     style.WindowPadding     = vec(14, 14)
     style.FramePadding      = vec(10, 6)
@@ -1485,32 +2073,37 @@ local function applyTheme()
     style.FrameRounding     = rnd * 0.6
     style.GrabRounding      = rnd * 0.6
     style.ScrollbarRounding = rnd * 0.6
+    style.PopupRounding     = rnd * 0.6
     style.GrabMinSize       = 14
     style.WindowBorderSize  = 1
     style.ChildBorderSize   = 1
 
-    c[col.WindowBg]         = V4(br, bg, bb, 0.97)
-    c[col.ChildBg]          = lift(0.03, num(cfg.theme.childAlpha, 0.8))
-    c[col.PopupBg]          = lift(0.02, 0.98)
-    c[col.Border]           = V4(ar, ag, ab, 0.40)
-    c[col.Separator]        = V4(ar, ag, ab, 0.25)
-    c[col.Text]             = V4(0.92, 0.94, 0.97, 1.00)
-    c[col.TextDisabled]     = GRAY
-    c[col.FrameBg]          = lift(0.06)
-    c[col.FrameBgHovered]   = lift(0.09)
-    c[col.FrameBgActive]    = lift(0.12)
-    c[col.Button]           = mix(-0.15)
-    c[col.ButtonHovered]    = mix(0.12)
-    c[col.ButtonActive]     = mix(-0.30)
-    c[col.Header]           = V4(ar, ag, ab, 0.35)
-    c[col.HeaderHovered]    = V4(ar, ag, ab, 0.50)
-    c[col.HeaderActive]     = V4(ar, ag, ab, 0.65)
-    c[col.PlotHistogram]    = ACCENT
-    c[col.SliderGrab]       = ACCENT
-    c[col.SliderGrabActive] = mix(0.25)
-    c[col.CheckMark]        = ACCENT
-    c[col.ScrollbarBg]      = lift(0.0)
-    c[col.ScrollbarGrab]    = lift(0.12)
+    c[col.WindowBg]             = V4(br, bgc, bb, 0.97)
+    c[col.ChildBg]              = shade(0.04, num(cfg.theme.childAlpha, 0.8))
+    c[col.PopupBg]              = shade(0.03, 0.98)
+    c[col.Border]               = V4(ar, ag, ab, LIGHT and 0.55 or 0.40)
+    c[col.BorderShadow]         = V4(0, 0, 0, 0)
+    c[col.Separator]            = mixV(BGV, ACCENT, 0.45)
+    c[col.Text]                 = TEXT
+    c[col.TextDisabled]         = DIM
+    c[col.TextSelectedBg]       = V4(ar, ag, ab, 0.35)
+    c[col.FrameBg]              = SURF
+    c[col.FrameBgHovered]       = SURF_H
+    c[col.FrameBgActive]        = SURF_A
+    c[col.Button]               = btn
+    c[col.ButtonHovered]        = mixV(btn, INK, 0.10)
+    c[col.ButtonActive]         = mixV(btn, INK, 0.20)
+    c[col.Header]               = mixV(BGV, ACCENT, 0.28)
+    c[col.HeaderHovered]        = mixV(BGV, ACCENT, 0.38)
+    c[col.HeaderActive]         = mixV(BGV, ACCENT, 0.48)
+    c[col.PlotHistogram]        = ACCENT
+    c[col.SliderGrab]           = ACCENT
+    c[col.SliderGrabActive]     = mixV(ACCENT, INK, 0.25)
+    c[col.CheckMark]            = ACCENT_TEXT
+    c[col.ScrollbarBg]          = shade(0.02, 0.6)
+    c[col.ScrollbarGrab]        = shade(0.22)
+    c[col.ScrollbarGrabHovered] = shade(0.30)
+    c[col.ScrollbarGrabActive]  = shade(0.38)
 end
 
 -- Шрифт с кириллицей. Таблица диапазонов хранится глобально, чтобы её не собрал сборщик мусора.
@@ -1544,12 +2137,10 @@ local function approach(id, target, speed)
     anim[id] = v
     return v
 end
-local function lerp(a, b, t) return a + (b - a) * t end
-local function lerpV4(a, b, t) return V4(lerp(a.x, b.x, t), lerp(a.y, b.y, t), lerp(a.z, b.z, t), lerp(a.w, b.w, t)) end
 
 local function section(title)
     imgui.Spacing()
-    imgui.TextColored(ACCENT, title)
+    imgui.TextColored(ACCENT_TEXT, title)
     imgui.Separator()
 end
 
@@ -1562,7 +2153,7 @@ end
 local function centerText(text, color)
     local w = imgui.CalcTextSize(text).x
     imgui.SetCursorPosX((imgui.GetWindowWidth() - w) / 2)
-    imgui.TextColored(color or WHITE, text)
+    imgui.TextColored(color or TEXT, text)
 end
 
 local function toggle(id, label, ptr)
@@ -1573,10 +2164,12 @@ local function toggle(id, label, ptr)
     local clicked = imgui.InvisibleButton(id, vec(w, h))
     if clicked then ptr[0] = not ptr[0] end
     local t = approach(id, ptr[0] and 1 or 0)
-    local bg = lerpV4(V4(0.22, 0.24, 0.30, 1), ACCENT, t)
-    if imgui.IsItemHovered() then bg = lerpV4(bg, WHITE, 0.08) end
+    local bg = lerpV4(TRACK, ACCENT, t)
+    if imgui.IsItemHovered() then bg = lerpV4(bg, TEXT, 0.08) end
     dl:AddRectFilled(p, vec(p.x + w, p.y + h), U32(bg), h / 2)
-    dl:AddCircleFilled(vec(p.x + h / 2 + t * (w - h), p.y + h / 2), h / 2 - 3, U32(WHITE), 24)
+    local kc = vec(p.x + h / 2 + t * (w - h), p.y + h / 2)
+    dl:AddCircleFilled(kc, h / 2 - 3, U32(KNOB), 24)
+    if KNOB_EDGE.w > 0 then dl:AddCircle(kc, h / 2 - 3, U32(KNOB_EDGE), 24, 1) end
     imgui.SameLine()
     imgui.AlignTextToFramePadding()
     imgui.Text(label)
@@ -1591,14 +2184,15 @@ local function segmented(id, ptr, items)
         if i > 1 then imgui.SameLine() end
         local active = ptr[0] == i - 1
         if not active then
-            imgui.PushStyleColor(imgui.Col.Button, V4(0.22, 0.24, 0.30, 1))
-            imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.30, 0.32, 0.40, 1))
+            imgui.PushStyleColor(imgui.Col.Button, SURF)
+            imgui.PushStyleColor(imgui.Col.ButtonHovered, SURF_H)
+            imgui.PushStyleColor(imgui.Col.ButtonActive, SURF_A)
         end
         if imgui.Button(name .. '##' .. id .. i, vec(w, 30)) and not active then
             ptr[0] = i - 1
             changed = true
         end
-        if not active then imgui.PopStyleColor(2) end
+        if not active then imgui.PopStyleColor(3) end
     end
     return changed
 end
@@ -1627,20 +2221,15 @@ local function colorRow(id, label, arr)
 end
 
 local function grayButton(label, size)
-    imgui.PushStyleColor(imgui.Col.Button,        V4(0.22, 0.24, 0.30, 1))
-    imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.30, 0.32, 0.40, 1))
-    imgui.PushStyleColor(imgui.Col.ButtonActive,  V4(0.18, 0.20, 0.25, 1))
+    imgui.PushStyleColor(imgui.Col.Button,        SURF)
+    imgui.PushStyleColor(imgui.Col.ButtonHovered, SURF_H)
+    imgui.PushStyleColor(imgui.Col.ButtonActive,  SURF_A)
     local pressed = imgui.Button(label, size)
     imgui.PopStyleColor(3)
     return pressed
 end
 
 -- Иконки (рисуются линиями) ------------------------------------------------
-local function iconPerson(dl, c, col)
-    dl:AddCircleFilled(vec(c.x, c.y - 4), 3.5, col, 16)
-    dl:AddRectFilled(vec(c.x - 6, c.y + 1), vec(c.x + 6, c.y + 8), col, 4)
-end
-
 local function drawTruck(dl, x, y, s, body, cab)
     local function R(a, b, c2, d, col, r) dl:AddRectFilled(vec(x + a * s, y + b * s), vec(x + c2 * s, y + d * s), col, r or 0) end
     R(0, 4, 38, 26, body, 3 * s)          -- кузов
@@ -1653,14 +2242,6 @@ local function drawTruck(dl, x, y, s, body, cab)
 end
 local function iconTruck(dl, c, col) drawTruck(dl, c.x - 9.3, c.y - 6, 0.32, col, col) end
 
-local function iconPalette(dl, c, col)
-    dl:AddCircle(c, 7.5, col, 20, 2)
-    for i = 0, 2 do
-        local a = i * 2.1 - 1.2
-        dl:AddCircleFilled(vec(c.x + math.cos(a) * 3.8, c.y + math.sin(a) * 3.8), 1.8, col, 8)
-    end
-end
-
 local function iconInfo(dl, c, col)
     dl:AddCircle(c, 7.5, col, 20, 2)
     dl:AddRectFilled(vec(c.x - 1, c.y - 1), vec(c.x + 1, c.y + 4.5), col)
@@ -1672,6 +2253,18 @@ local function iconClose(dl, c, col)
     dl:AddLine(vec(c.x + 5, c.y - 5), vec(c.x - 5, c.y + 5), col, 2)
 end
 
+-- Шестерня: при наведении/на открытой вкладке медленно крутится
+local function iconGear(dl, c, col, t)
+    local rot = imgui.GetTime() * 1.6 * (t or 0)
+    for i = 0, 7 do
+        local a = rot + i * math.pi / 4
+        local ca, sa = math.cos(a), math.sin(a)
+        dl:AddLine(vec(c.x + ca * 5.2, c.y + sa * 5.2), vec(c.x + ca * 8.6, c.y + sa * 8.6), col, 3.2)
+    end
+    dl:AddCircle(c, 5.6, col, 24, 2.6)
+    dl:AddCircleFilled(c, 1.8, col, 12)
+end
+
 local function sidebarButton(id, name, icon, active)
     local dl = imgui.GetWindowDrawList()
     local p  = imgui.GetCursorScreenPos()
@@ -1680,21 +2273,117 @@ local function sidebarButton(id, name, icon, active)
     local clicked = imgui.InvisibleButton(id, vec(w, h))
     local t = approach(id, active and 1 or (imgui.IsItemHovered() and 0.45 or 0), 14)
     if t > 0.01 then
-        dl:AddRectFilled(p, vec(p.x + w, p.y + h), U32(V4(ACCENT.x, ACCENT.y, ACCENT.z, 0.18 * t)), 8)
+        dl:AddRectFilled(p, vec(p.x + w, p.y + h), U32(V4(ACCENT.x, ACCENT.y, ACCENT.z, (LIGHT and 0.22 or 0.18) * t)), 8)
     end
     if active then dl:AddRectFilled(vec(p.x, p.y + 8), vec(p.x + 4, p.y + h - 8), U32(ACCENT), 2) end
-    local col = U32(lerpV4(GRAY, WHITE, t))
-    icon(dl, vec(p.x + 22, p.y + h / 2), col)
+    local col = U32(lerpV4(DIM, active and ACCENT_TEXT or TEXT, t))
+    icon(dl, vec(p.x + 22, p.y + h / 2), col, t)
     dl:AddText(vec(p.x + 42, p.y + (h - imgui.GetTextLineHeight()) / 2), col, name)
     return clicked
 end
 
+-- Свой фон меню ------------------------------------------------------------
+local bgState = { media = nil, file = nil }
+
+local QUALITY = {
+    { budget = 8e6,  frames = 90,  side = 1280 },
+    { budget = 16e6, frames = 150, side = 1600 },
+    { budget = 32e6, frames = 240, side = 1920 },
+}
+
+local function bgOptions()
+    local q = QUALITY[clamp(num(cfg.bgimg.quality, 1), 0, 2) + 1]
+    return { maxSide = q.side, budget = q.budget, maxFrames = q.frames,
+             fps = clamp(num(cfg.bgimg.fps, 20), 5, 60), flip = cfg.bgimg.flip == true }
+end
+
+local function bgReload()
+    if bgState.media then media.free(bgState.media) end
+    bgState.media, bgState.file = nil, nil
+    local f = tostring(cfg.bgimg.file or '')
+    if cfg.bgimg.enabled and f ~= '' then
+        bgState.file = f
+        bgState.media = media.load(DIRS.bg .. '\\' .. f, bgOptions())
+    end
+end
+
+local function drawImage(dl, tex, p0, p1, uv0, uv1, col, rounding)
+    if rounding and rounding > 0 and not media.noRounded then
+        local ok = pcall(function() dl:AddImageRounded(tex, p0, p1, uv0, uv1, col, rounding) end)
+        if ok then return end
+        media.noRounded = true -- старая версия mimgui: рисуем без скругления
+    end
+    dl:AddImage(tex, p0, p1, uv0, uv1, col)
+end
+
+-- Рисует фон-картинку с подгонкой под окно и затемнением в цвет темы. true - если нарисован.
+local function drawBackground(dl, pos, size)
+    local m = bgState.media
+    if not (cfg.bgimg.enabled and m and #m.frames > 0) then return false end
+    local tex = media.frame(m, imgui.GetTime() * num(cfg.bgimg.speed, 1))
+    if not tex then return false end
+    local rnd = num(cfg.theme.rounding, 12)
+    local p0, p1 = pos, vec(pos.x + size.x, pos.y + size.y)
+    local iw, ih = math.max(1, m.w), math.max(1, m.h)
+    local fit = num(cfg.bgimg.fit, 0)
+    local white = U32(V4(1, 1, 1, 1))
+    if fit == 0 then
+        -- заполнить: сохраняем пропорции, лишнее обрезаем по центру
+        local ra, rw = iw / ih, size.x / size.y
+        local u0, v0, u1, v1 = 0, 0, 1, 1
+        if ra > rw then local k = rw / ra; u0 = (1 - k) / 2; u1 = 1 - u0
+        else local k = ra / rw; v0 = (1 - k) / 2; v1 = 1 - v0 end
+        drawImage(dl, tex, p0, p1, vec(u0, v0), vec(u1, v1), white, rnd)
+    elseif fit == 1 then
+        -- вписать: картинка целиком, поля - та же картинка, растянутая и приглушённая
+        drawImage(dl, tex, p0, p1, vec(0.25, 0.25), vec(0.75, 0.75), U32(V4(1, 1, 1, 0.35)), rnd)
+        local s = math.min(size.x / iw, size.y / ih)
+        local w, h = iw * s, ih * s
+        local a = vec(pos.x + (size.x - w) / 2, pos.y + (size.y - h) / 2)
+        dl:AddImage(tex, a, vec(a.x + w, a.y + h), vec(0, 0), vec(1, 1), white)
+    else
+        drawImage(dl, tex, p0, p1, vec(0, 0), vec(1, 1), white, rnd)
+    end
+    -- затемнение в цвет фона темы: текст остаётся читаемым на любой картинке
+    dl:AddRectFilled(p0, p1, U32(V4(BGV.x, BGV.y, BGV.z, clamp(num(cfg.bgimg.dim, 0.45), 0, 0.95))), rnd)
+    dl:AddRect(p0, p1, U32(V4(ACCENT.x, ACCENT.y, ACCENT.z, LIGHT and 0.55 or 0.40)), rnd)
+    return true
+end
+
 -- Падающие частицы ---------------------------------------------------------
 local particles = {}
+local ptState = { list = {}, key = nil }   -- загруженные картинки частиц
+
+local function ptSelected()
+    local set, order = {}, {}
+    for name in tostring(cfg.particles.images or ''):gmatch('[^|]+') do
+        if not set[name] then set[name] = true; order[#order + 1] = name end
+    end
+    return set, order
+end
+
+local function ptReload()
+    local _, order = ptSelected()
+    local key = table.concat(order, '|')
+    if key == ptState.key then return end
+    local old = {}
+    for _, e in ipairs(ptState.list) do old[e.name] = e end
+    local list = {}
+    for _, name in ipairs(order) do
+        local e = old[name]
+        if e then old[name] = nil
+        else e = { name = name, media = media.load(DIRS.pt .. '\\' .. name, { maxSide = 128, budget = 128 * 128 * 60, maxFrames = 60, fps = 20 }) } end
+        list[#list + 1] = e
+    end
+    for _, e in pairs(old) do media.free(e.media) end
+    ptState.list, ptState.key = list, key
+end
+
 local function newParticle(w, h, fromTop)
-    return { x = math.random() * w, y = fromTop and -math.random() * 20 or math.random() * h,
+    return { x = math.random() * w, y = fromTop and -math.random() * 30 or math.random() * h,
              sp = 0.5 + math.random(), drift = (math.random() - 0.5) * 12,
-             sz = 0.6 + math.random() * 0.8, a = 0.4 + math.random() * 0.6, hue = math.random() }
+             sz = 0.6 + math.random() * 0.8, a = 0.4 + math.random() * 0.6, hue = math.random(),
+             rot = math.random() * 6.283, rs = (math.random() - 0.5) * 2.4, img = math.random(1000), ph = math.random() * 10 }
 end
 
 local function drawParticles(dl, pos, size)
@@ -1705,62 +2394,61 @@ local function drawParticles(dl, pos, size)
     while #particles > n do particles[#particles] = nil end
     local dt, time = imgui.GetIO().DeltaTime, imgui.GetTime()
     local r, g, b = hexToRGB(P.color)
+    -- картинки, которые уже загрузились
+    local imgs = {}
+    if num(P.mode, 0) == 1 then
+        for _, e in ipairs(ptState.list) do if #e.media.frames > 0 then imgs[#imgs + 1] = e.media end end
+    end
+    local spin = P.spin ~= false
     for i = 1, #particles do
         local p = particles[i]
         p.y = p.y + num(P.speed, 60) * p.sp * dt
         p.x = p.x + p.drift * dt
-        if p.y > size.y + 6 or p.x < -6 or p.x > size.x + 6 then
+        p.rot = p.rot + p.rs * dt
+        if p.y > size.y + 30 or p.x < -30 or p.x > size.x + 30 then
             p = newParticle(size.x, size.y, true)
             particles[i] = p
         end
         local cr, cg, cb = r, g, b
         if P.rainbow then cr, cg, cb = hsv((p.hue + time * 0.1) % 1, 0.65, 1) end
-        dl:AddCircleFilled(vec(pos.x + p.x, pos.y + p.y), num(P.size, 2) * p.sz,
-                           U32(V4(cr, cg, cb, num(P.alpha, 0.6) * p.a)), 12)
+        local alpha = num(P.alpha, 0.6) * p.a
+        if #imgs > 0 then
+            local m = imgs[(p.img % #imgs) + 1]
+            local tex = media.frame(m, time + p.ph)
+            if tex then
+                local tint = (P.tint or P.rainbow) and V4(cr, cg, cb, alpha) or V4(1, 1, 1, alpha)
+                local s = num(P.size, 2) * 7 * p.sz
+                local hw, hh = s, s * m.h / math.max(1, m.w)
+                if hh > s then hw, hh = s * m.w / math.max(1, m.h), s end
+                local cx, cy = pos.x + p.x, pos.y + p.y
+                if spin then
+                    local ca, sa = math.cos(p.rot), math.sin(p.rot)
+                    local function pt(x, y) return vec(cx + x * ca - y * sa, cy + x * sa + y * ca) end
+                    dl:AddImageQuad(tex, pt(-hw, -hh), pt(hw, -hh), pt(hw, hh), pt(-hw, hh),
+                        vec(0, 0), vec(1, 0), vec(1, 1), vec(0, 1), U32(tint))
+                else
+                    dl:AddImage(tex, vec(cx - hw, cy - hh), vec(cx + hw, cy + hh), vec(0, 0), vec(1, 1), U32(tint))
+                end
+            end
+        else
+            dl:AddCircleFilled(vec(pos.x + p.x, pos.y + p.y), num(P.size, 2) * p.sz,
+                               U32(V4(cr, cg, cb, alpha)), 12)
+        end
     end
 end
 
 -- Вкладки ----------------------------------------------------------------
-local function drawSpawnTab()
-    section('Основное')
-    if toggle('##spawn_on', 'Включить авто спавн', ui.spawnOn) then
-        cfg.spawn.enabled = ui.spawnOn[0]; saveCfg()
-    end
-    section('Режим')
-    if segmented('spawn_mode', ui.spawnMode, { 'Кнопка Spawn', 'Пункт в диалоге' }) then
-        cfg.spawn.mode = ui.spawnMode[0]; saveCfg()
-    end
-    if ui.spawnMode[0] == 0 then
-        hint('Скрипт сам нажмёт Spawn, когда персонаж ещё не появился и нет открытых диалогов.')
-    else
-        hint('Когда откроется диалог с ключевым словом в заголовке, скрипт выберет нужный пункт.')
-        imgui.Text('Ключевое слово:')
-        imgui.PushItemWidth(-1)
-        if imgui.InputText('##spawn_kw', ui.spawnKw, ffi.sizeof(ui.spawnKw)) then
-            cfg.spawn.keyword = ffi.string(ui.spawnKw); saveCfg()
-        end
-        imgui.PopItemWidth()
-        if sliderInt('Номер пункта:', '##spawn_item', ui.spawnItem, 1, 10, 'Пункт %d') then
-            cfg.spawn.item = ui.spawnItem[0]; saveCfg()
-        end
-    end
-    section('Задержка')
-    if sliderInt('Перед спавном:', '##spawn_delay', ui.spawnDelay, 0, 5000, '%d мс') then
-        cfg.spawn.delay = ui.spawnDelay[0]; saveCfg()
-    end
-end
-
 local function drawFarmTab()
     section('Бот дальнобойщик')
     local dl = imgui.GetWindowDrawList()
     local p  = imgui.GetCursorScreenPos()
     local w  = imgui.GetContentRegionAvail().x
     local h  = 92
-    dl:AddRectFilled(p, vec(p.x + w, p.y + h), U32(V4(ACCENT.x, ACCENT.y, ACCENT.z, 0.10)), 10)
+    dl:AddRectFilled(p, vec(p.x + w, p.y + h), U32(V4(ACCENT.x, ACCENT.y, ACCENT.z, LIGHT and 0.16 or 0.10)), 10)
     local sway = bot.active and math.sin(imgui.GetTime() * 12) * 0.6 or 0
     drawTruck(dl, p.x + 14, p.y + 14 + sway, 2.3, U32(V4(0.85, 0.87, 0.92, 1)), U32(ACCENT))
-    dl:AddText(vec(p.x + 170, p.y + 22), U32(WHITE), 'Статус:')
-    local scol = bot.active and GREEN or (cfg.bot.enabled == true and V4(1.0, 0.8, 0.35, 1) or GRAY)
+    dl:AddText(vec(p.x + 170, p.y + 22), U32(TEXT), 'Статус:')
+    local scol = bot.active and readable(GREEN) or (cfg.bot.enabled == true and readable(YELLOW) or DIM)
     dl:AddText(vec(p.x + 170, p.y + 44), U32(scol), tostring(bot.status or ''))
     imgui.Dummy(vec(w, h))
 
@@ -1823,28 +2511,41 @@ local function drawFarmTab()
     hint('Свой автопилот: едет по дорожным узлам игры, светофоров не видит, тормозит перед препятствиями, не срезает углы, разворачивается к метке. Скорость до упора вправо - No Limit. Не работает на Arizona RP.')
 end
 
+-- Настройки (шестерня) ---------------------------------------------------
 local PRESETS = {
     { accent = '#3F99FF', bg = '#12141C' }, { accent = '#9B5CFF', bg = '#15121C' },
     { accent = '#FF4D6A', bg = '#1A1214' }, { accent = '#2ED47A', bg = '#111A15' },
     { accent = '#FFB020', bg = '#1A1610' }, { accent = '#21C7D9', bg = '#10181A' },
 }
+local PRESETS_LIGHT = {
+    { accent = '#2F6BFF', bg = '#F4F6FA' }, { accent = '#7C4DFF', bg = '#F6F3FF' },
+    { accent = '#E0405E', bg = '#FFF4F6' }, { accent = '#1E9E5A', bg = '#F1FAF4' },
+    { accent = '#E08A00', bg = '#FFF8EC' }, { accent = '#0F9BB0', bg = '#EFF9FB' },
+}
 
-local function presetSwatches()
+local function setTheme(accent, bg)
+    cfg.theme.accent, cfg.theme.bg = accent, bg
+    setF3(ui.accent, accent); setF3(ui.bg, bg)
+    applyTheme(); saveCfg()
+end
+
+local function presetSwatches(id, list)
     local dl = imgui.GetWindowDrawList()
     local d = 30
-    for i, pr in ipairs(PRESETS) do
+    for i, pr in ipairs(list) do
         if i > 1 then imgui.SameLine() end
         local p = imgui.GetCursorScreenPos()
-        if imgui.InvisibleButton('##preset' .. i, vec(d, d)) then
-            cfg.theme.accent, cfg.theme.bg = pr.accent, pr.bg
-            setF3(ui.accent, pr.accent); setF3(ui.bg, pr.bg)
-            applyTheme(); saveCfg()
-        end
-        local r, g, b = hexToRGB(pr.accent)
+        if imgui.InvisibleButton('##preset' .. id .. i, vec(d, d)) then setTheme(pr.accent, pr.bg) end
+        local hov = imgui.IsItemHovered()
+        local ar, ag, ab = hexToRGB(pr.accent)
+        local br, bgc, bb = hexToRGB(pr.bg)
         local c = vec(p.x + d / 2, p.y + d / 2)
-        dl:AddCircleFilled(c, d / 2 - (imgui.IsItemHovered() and 2 or 4), U32(V4(r, g, b, 1)), 32)
-        if tostring(cfg.theme.accent):upper() == pr.accent then
-            dl:AddCircle(c, d / 2 - 0.5, U32(V4(1, 1, 1, 0.9)), 32, 2)
+        local rr = d / 2 - (hov and 1 or 3)
+        dl:AddCircleFilled(c, rr, U32(V4(br, bgc, bb, 1)), 32)
+        dl:AddCircle(c, rr, U32(V4(TEXT.x, TEXT.y, TEXT.z, 0.25)), 32, 1)
+        dl:AddCircleFilled(c, rr * 0.55, U32(V4(ar, ag, ab, 1)), 24)
+        if tostring(cfg.theme.accent):upper() == pr.accent and tostring(cfg.theme.bg):upper() == pr.bg then
+            dl:AddCircle(c, d / 2 + 1, U32(ACCENT_TEXT), 32, 2)
         end
     end
 end
@@ -1853,31 +2554,161 @@ local function resetTheme()
     cfg.theme.accent, cfg.theme.bg, cfg.theme.childAlpha, cfg.theme.rounding = '#3F99FF', '#12141C', 0.80, 12
     local P = cfg.particles
     P.enabled, P.count, P.speed, P.size, P.alpha, P.color, P.rainbow = true, 70, 60, 2.0, 0.60, '#FFFFFF', false
+    P.mode, P.tint, P.spin = 0, false, true
+    cfg.bgimg.fit, cfg.bgimg.dim, cfg.bgimg.speed = 0, 0.45, 1.0
     setF3(ui.accent, cfg.theme.accent); setF3(ui.bg, cfg.theme.bg); setF3(ui.pColor, P.color)
     ui.childAlpha[0], ui.rounding[0] = 0.80, 12
     ui.pOn[0], ui.pRainbow[0], ui.pCount[0], ui.pSpeed[0], ui.pSize[0], ui.pAlpha[0] = true, false, 70, 60, 2.0, 0.60
+    ui.pMode[0], ui.pTint[0], ui.pSpin[0] = 0, false, true
+    ui.bgFit[0], ui.bgDim[0], ui.bgSpeed[0] = 0, 0.45, 1.0
     applyTheme(); saveCfg()
 end
 
-local function drawThemeTab()
+-- Подобрать цвета темы под картинку фона
+local function themeFromImage(m, light)
+    if not (m and m.avg) then return end
+    local v = m.vivid or m.avg
+    local ar, ag, ab = v[1], v[2], v[3]
+    local mx = math.max(ar, ag, ab, 0.01)
+    ar, ag, ab = ar / mx, ag / mx, ab / mx              -- максимальная яркость акцента
+    local a = m.avg
+    local br, bgc, bb
+    if light then br, bgc, bb = 0.94 + a[1] * 0.05, 0.94 + a[2] * 0.05, 0.94 + a[3] * 0.05
+    else br, bgc, bb = 0.05 + a[1] * 0.08, 0.05 + a[2] * 0.08, 0.06 + a[3] * 0.08 end
+    setTheme(rgbToHex(ar, ag, ab), rgbToHex(br, bgc, bb))
+end
+
+local scan = { bg = {}, pt = {}, t = -10 }
+local function rescan(force)
+    if force or os.clock() - scan.t > 2 then
+        scan.t = os.clock()
+        scan.bg, scan.pt = media.scanDir(DIRS.bg), media.scanDir(DIRS.pt)
+    end
+end
+
+local function mediaStatus(m)
+    if not m then return end
+    if m.err then imgui.TextColored(readable(RED), 'Ошибка: ' .. tostring(m.err))
+    elseif not m.done then imgui.TextColored(readable(YELLOW), string.format('Загрузка... кадров: %d', #m.frames))
+    elseif #m.frames > 1 then imgui.TextColored(readable(GREEN), string.format('Анимация: %d кадров, %.1f с, %dx%d', #m.frames, m.total or 0, m.w, m.h))
+    else imgui.TextColored(readable(GREEN), string.format('Картинка %dx%d', m.w, m.h)) end
+end
+
+local function folderButtons(id, dir)
+    local bw = (imgui.GetContentRegionAvail().x - imgui.GetStyle().ItemSpacing.x) / 2
+    if imgui.Button('Открыть папку##' .. id, vec(bw, 30)) then media.openFolder(dir) end
+    imgui.SameLine()
+    if grayButton('Обновить список##' .. id, vec(bw, 30)) then rescan(true) end
+end
+
+local function drawThemeSettings()
     section('Готовые темы')
-    presetSwatches()
-    section('Цвета меню')
+    imgui.TextDisabled('Тёмные'); presetSwatches('d', PRESETS)
+    imgui.TextDisabled('Светлые'); presetSwatches('l', PRESETS_LIGHT)
+    section('Цвета')
     if colorRow('##accent', 'Основной цвет', ui.accent) then
         cfg.theme.accent = rgbToHex(ui.accent[0], ui.accent[1], ui.accent[2]); applyTheme(); saveCfg()
     end
     if colorRow('##bg', 'Цвет фона', ui.bg) then
         cfg.theme.bg = rgbToHex(ui.bg[0], ui.bg[1], ui.bg[2]); applyTheme(); saveCfg()
     end
+    hint('Можно ставить любые цвета: текст и элементы сами становятся тёмными на светлом фоне и светлыми на тёмном, а слишком бледный основной цвет затемняется для надписей.')
     if sliderFloat('Прозрачность панелей:', '##childAlpha', ui.childAlpha, 0.2, 1.0, '%.2f') then
         cfg.theme.childAlpha = ui.childAlpha[0]; applyTheme(); saveCfg()
     end
     if sliderInt('Скругление:', '##rounding', ui.rounding, 0, 20, '%d px') then
         cfg.theme.rounding = ui.rounding[0]; applyTheme(); saveCfg()
     end
-    section('Падающие частицы')
+    imgui.Spacing()
+    if grayButton('Сбросить оформление', vec(-1, 34)) then resetTheme() end
+end
+
+local function drawBgSettings()
+    rescan()
+    section('Фон меню')
+    if toggle('##bg_on', 'Своя картинка / анимация / видео на фоне', ui.bgOn) then
+        cfg.bgimg.enabled = ui.bgOn[0]; saveCfg(); bgReload()
+    end
+    if not media.ok then hint(media.err or '') end
+    imgui.TextDisabled('Файлы из папки moonloader\\config\\lua_afk\\backgrounds:')
+    imgui.BeginChild('##bg_files', vec(0, 130), true)
+    if #scan.bg == 0 then hint('Папка пуста. Нажмите "Открыть папку" и положите туда картинку, GIF, видео или папку с кадрами.') end
+    for i, f in ipairs(scan.bg) do
+        local tag = f.dir and '[кадры] ' or (f.video and '[видео] ' or (f.ext == 'gif' and '[gif] ' or ''))
+        if imgui.Selectable(tag .. f.disp .. '##bgf' .. i, tostring(cfg.bgimg.file) == f.name) then
+            cfg.bgimg.file, cfg.bgimg.enabled, ui.bgOn[0] = f.name, true, true
+            saveCfg(); bgReload()
+        end
+    end
+    imgui.EndChild()
+    folderButtons('bg', DIRS.bg)
+    mediaStatus(bgState.media)
+
+    section('Подгонка')
+    if segmented('bg_fit', ui.bgFit, { 'Заполнить', 'Вписать', 'Растянуть' }) then
+        cfg.bgimg.fit = ui.bgFit[0]; saveCfg()
+    end
+    if sliderFloat('Затемнение фона:', '##bg_dim', ui.bgDim, 0, 0.95, '%.2f') then
+        cfg.bgimg.dim = ui.bgDim[0]; saveCfg()
+    end
+    hint('Картинка всегда сохраняет пропорции и затемняется в цвет темы, поэтому текст читается на любом фоне. На светлой теме фон осветляется.')
+    local m = bgState.media
+    if m and m.avg then
+        local bw = (imgui.GetContentRegionAvail().x - imgui.GetStyle().ItemSpacing.x) / 2
+        if imgui.Button('Цвета под фон (тёмная)', vec(bw, 30)) then themeFromImage(m, false) end
+        imgui.SameLine()
+        if imgui.Button('Цвета под фон (светлая)', vec(bw, 30)) then themeFromImage(m, true) end
+    end
+
+    section('Анимация и видео')
+    if sliderFloat('Скорость анимации:', '##bg_speed', ui.bgSpeed, 0.1, 3.0, '%.2fx') then
+        cfg.bgimg.speed = ui.bgSpeed[0]; saveCfg()
+    end
+    if sliderInt('Кадров в секунду (видео и папка с кадрами):', '##bg_fps', ui.bgFps, 5, 60, '%d') then
+        cfg.bgimg.fps = ui.bgFps[0]; saveCfg()
+    end
+    if imgui.IsItemDeactivatedAfterEdit() then bgReload() end
+    imgui.Text('Качество анимации:')
+    if segmented('bg_q', ui.bgQuality, { 'Низкое', 'Среднее', 'Высокое' }) then
+        cfg.bgimg.quality = ui.bgQuality[0]; saveCfg(); bgReload()
+    end
+    if toggle('##bg_flip', 'Перевернуть видео (если оно вверх ногами)', ui.bgFlip) then
+        cfg.bgimg.flip = ui.bgFlip[0]; saveCfg(); bgReload()
+    end
+    hint('Форматы: png, jpg, bmp, gif (анимация), tiff, ico, а также webp/heic/avif, если в Windows стоят их кодеки. Видео: mp4, avi, wmv, mov, mkv и др. - берутся первые несколько секунд (зависит от качества и FPS) и крутятся по кругу. Папка с кадрами 001.png, 002.png... тоже играет как анимация. Высокое качество ест больше памяти игры.')
+end
+
+local function drawParticleSettings()
+    rescan()
     local P = cfg.particles
+    section('Падающие частицы')
     if toggle('##p_on', 'Включить частицы', ui.pOn) then P.enabled = ui.pOn[0]; saveCfg() end
+    if segmented('p_mode', ui.pMode, { 'Точки', 'Свои картинки' }) then P.mode = ui.pMode[0]; saveCfg(); ptReload() end
+    if ui.pMode[0] == 1 then
+        imgui.TextDisabled('Отметьте картинки из moonloader\\config\\lua_afk\\particles:')
+        imgui.BeginChild('##pt_files', vec(0, 120), true)
+        local set = ptSelected()
+        local any = false
+        for i, f in ipairs(scan.pt) do
+            if not f.dir and not f.video then
+                any = true
+                if imgui.Selectable((set[f.name] and '[x] ' or '[  ] ') .. f.disp .. '##ptf' .. i, set[f.name] == true) then
+                    set[f.name] = not set[f.name] or nil
+                    local out = {}
+                    for _, g in ipairs(scan.pt) do if set[g.name] then out[#out + 1] = g.name end end
+                    P.images = table.concat(out, '|'); saveCfg(); ptReload()
+                end
+            end
+        end
+        if not any then hint('Папка пуста. Положите туда png/webp/gif (снежинки, сердечки, листья...).') end
+        imgui.EndChild()
+        folderButtons('pt', DIRS.pt)
+        for _, e in ipairs(ptState.list) do
+            if e.media.err then imgui.TextColored(readable(RED), u8(e.name) .. ': ' .. tostring(e.media.err)) end
+        end
+        if toggle('##p_spin', 'Вращение', ui.pSpin) then P.spin = ui.pSpin[0]; saveCfg() end
+        if toggle('##p_tint', 'Красить картинки в цвет частиц', ui.pTint) then P.tint = ui.pTint[0]; saveCfg() end
+    end
     if toggle('##p_rainbow', 'Радужные частицы', ui.pRainbow) then P.rainbow = ui.pRainbow[0]; saveCfg() end
     if not ui.pRainbow[0] and colorRow('##p_color', 'Цвет частиц', ui.pColor) then
         P.color = rgbToHex(ui.pColor[0], ui.pColor[1], ui.pColor[2]); saveCfg()
@@ -1886,33 +2717,46 @@ local function drawThemeTab()
     if sliderInt('Скорость:', '##p_speed', ui.pSpeed, 5, 400, '%d') then P.speed = ui.pSpeed[0]; saveCfg() end
     if sliderFloat('Размер:', '##p_size', ui.pSize, 0.5, 6.0, '%.1f') then P.size = ui.pSize[0]; saveCfg() end
     if sliderFloat('Яркость:', '##p_alpha', ui.pAlpha, 0.05, 1.0, '%.2f') then P.alpha = ui.pAlpha[0]; saveCfg() end
-    imgui.Spacing()
-    if grayButton('Сбросить оформление', vec(-1, 34)) then resetTheme() end
 end
 
-local function drawInfoTab()
-    section('Скрипт')
-    imgui.Text('Версия:'); imgui.SameLine(110); imgui.TextColored(GREEN, SCRIPT_VERSION)
-    imgui.Text('Автор:');  imgui.SameLine(110); imgui.TextColored(GRAY, 'denismaslov769-lab')
+local function drawOtherSettings()
     section('Обновления')
     if toggle('##auto_upd', 'Автоматически проверять обновления', ui.autoUpd) then
         cfg.update.auto = ui.autoUpd[0]; saveCfg()
     end
     if imgui.Button('Проверить обновления', vec(-1, 34)) then checkUpdates(true) end
+    section('Файлы')
+    hint('Свои картинки, видео и частицы лежат в moonloader\\config\\lua_afk.')
+    if grayButton('Открыть папку lua_afk', vec(-1, 30)) then media.openFolder(DIRS.base) end
+end
+
+local function drawSettingsTab()
+    segmented('set_tabs', ui.setTab, { 'Тема', 'Фон', 'Частицы', 'Прочее' })
+    local t = ui.setTab[0]
+    if t == 0 then drawThemeSettings()
+    elseif t == 1 then drawBgSettings()
+    elseif t == 2 then drawParticleSettings()
+    else drawOtherSettings() end
+end
+
+local function drawInfoTab()
+    section('Скрипт')
+    imgui.Text('Версия:'); imgui.SameLine(110); imgui.TextColored(readable(GREEN), SCRIPT_VERSION)
+    imgui.Text('Автор:');  imgui.SameLine(110); imgui.TextDisabled('denismaslov769-lab')
     section('Команды')
     imgui.Text('/lafk');    imgui.SameLine(110); imgui.TextDisabled('открыть / закрыть меню')
     imgui.Text('/lafkupd'); imgui.SameLine(110); imgui.TextDisabled('проверить обновления')
     imgui.Text('/ltruck');  imgui.SameLine(110); imgui.TextDisabled('вкл / выкл бота дальнобойщика')
     imgui.Text('/pricep');  imgui.SameLine(110); imgui.TextDisabled('заспавнить прицеп (del - удалить)')
     imgui.Text('/lhitch');  imgui.SameLine(110); imgui.TextDisabled('бот цепляет прицеп / отмена')
+    hint('Оформление, свой фон, частицы и обновления - в настройках (шестерня слева внизу).')
 end
 
 local TABS = {
-    { name = 'Авто спавн', icon = iconPerson,  draw = drawSpawnTab },
-    { name = 'Авто фарм',  icon = iconTruck,   draw = drawFarmTab  },
-    { name = 'Оформление', icon = iconPalette, draw = drawThemeTab },
-    { name = 'Информация', icon = iconInfo,    draw = drawInfoTab  },
+    { name = 'Авто фарм',  icon = iconTruck, draw = drawFarmTab  },
+    { name = 'Информация', icon = iconInfo,  draw = drawInfoTab  },
 }
+local SETTINGS_TAB = { name = 'Настройки', icon = iconGear, draw = drawSettingsTab }
 
 -- Ошибка внутри вкладки ловится и показывается текстом: Begin/End всегда парные,
 -- поэтому окно не ломается и игра не вылетает.
@@ -1921,7 +2765,7 @@ local function safe(where, fn)
     if not ok then
         err = tostring(err)
         if menu.err ~= err then menu.err = err; log('[menu] ошибка (' .. where .. '): ' .. err) end
-        imgui.TextColored(V4(1, 0.4, 0.4, 1), 'Ошибка: ' .. err)
+        imgui.TextColored(readable(RED), 'Ошибка: ' .. err)
     end
 end
 
@@ -1933,27 +2777,48 @@ imgui.OnFrame(
         local trace = menu.frames <= 3 or menu.frames % 30 == 0
         local function step(t) if trace then log('[menu] кадр ' .. menu.frames .. ': ' .. t) end end
         step('начало')
+        if not menu.mediaInit then
+            -- свои файлы грузим при первом открытии меню
+            menu.mediaInit = true
+            pcall(bgReload); pcall(ptReload)
+        end
+        local okPump, ePump = pcall(media.pump, 0.008)
+        if not okPump then log('[media] ' .. tostring(ePump)) end
+
         local sw, sh = getScreenResolution()
         imgui.SetNextWindowPos(vec(sw / 2, sh / 2), imgui.Cond.FirstUseEver, vec(0.5, 0.5))
-        imgui.SetNextWindowSize(vec(700, 480), imgui.Cond.Always)
+        imgui.SetNextWindowSize(vec(720, 500), imgui.Cond.Always)
         imgui.Begin('##lua_afk_menu', menu.window,
             imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoCollapse)
 
         step('окно')
+        local hasBg = false
+        safe('фон', function()
+            hasBg = drawBackground(imgui.GetWindowDrawList(), imgui.GetWindowPos(), imgui.GetWindowSize())
+        end)
         safe('частицы', function()
             drawParticles(imgui.GetWindowDrawList(), imgui.GetWindowPos(), imgui.GetWindowSize())
         end)
+        -- на картинке панели становятся плотнее, чтобы текст не терялся
+        local pushed = 0
+        if hasBg then
+            imgui.PushStyleColor(imgui.Col.ChildBg, V4(CHILD.x, CHILD.y, CHILD.z, math.max(0.62, num(cfg.theme.childAlpha, 0.8))))
+            pushed = 1
+        end
 
         step('панель')
         imgui.BeginChild('##sidebar', vec(190, 0), true)
         safe('меню слева', function()
-            centerText('lua_afk', ACCENT)
-            centerText('v' .. SCRIPT_VERSION, GRAY)
+            centerText('lua_afk', ACCENT_TEXT)
+            centerText('v' .. SCRIPT_VERSION, DIM)
             imgui.Spacing(); imgui.Separator(); imgui.Spacing()
             for i, tab in ipairs(TABS) do
                 if sidebarButton('##tab' .. i, tab.name, tab.icon, menu.tab == i) then menu.tab = i end
             end
-            imgui.SetCursorPosY(imgui.GetWindowHeight() - 40 - imgui.GetStyle().WindowPadding.y)
+            local pad = imgui.GetStyle().WindowPadding.y
+            imgui.SetCursorPosY(imgui.GetWindowHeight() - 40 * 2 - 4 - pad)
+            if sidebarButton('##settings', 'Настройки', iconGear, menu.tab == 'settings') then menu.tab = 'settings' end
+            imgui.SetCursorPosY(imgui.GetWindowHeight() - 40 - pad)
             if sidebarButton('##close', 'Закрыть', iconClose, false) then menu.window[0] = false end
         end)
         imgui.EndChild()
@@ -1961,13 +2826,14 @@ imgui.OnFrame(
         imgui.SameLine()
 
         imgui.BeginChild('##content', vec(0, 0), true)
-        local tab = TABS[menu.tab] or TABS[1]
-        step('вкладка ' .. menu.tab)
+        local tab = (menu.tab == 'settings') and SETTINGS_TAB or (TABS[menu.tab] or TABS[1])
+        step('вкладка ' .. tostring(menu.tab))
         safe(tab.name, function()
-            imgui.TextColored(ACCENT, tab.name)
+            imgui.TextColored(ACCENT_TEXT, tab.name)
             tab.draw()
         end)
         imgui.EndChild()
+        if pushed > 0 then imgui.PopStyleColor(pushed) end
 
         imgui.End()
         step('конец')
@@ -1989,7 +2855,7 @@ imgui.OnFrame(
             upd.shown = upd.shown + (upd.progress - upd.shown) * math.min(1, imgui.GetIO().DeltaTime * 6)
             if upd.state == 'prompt' then
                 imgui.Text('Доступна новая версия: ')
-                imgui.SameLine(); imgui.TextColored(GREEN, tostring(upd.latest))
+                imgui.SameLine(); imgui.TextColored(readable(GREEN), tostring(upd.latest))
                 imgui.TextDisabled('Установлена: ' .. SCRIPT_VERSION)
                 if upd.changelog then imgui.Spacing(); hint(upd.changelog) end
                 imgui.Spacing()
@@ -2003,7 +2869,7 @@ imgui.OnFrame(
                 imgui.Text(upd.state == 'downloading' and 'Загрузка обновления...' or 'Установка...')
                 imgui.ProgressBar(upd.shown, vec(-1, 22))
             elseif upd.state == 'error' then
-                imgui.TextColored(V4(1, 0.45, 0.45, 1), tostring(upd.error))
+                imgui.TextColored(readable(RED), tostring(upd.error))
                 local bw = (imgui.GetContentRegionAvail().x - imgui.GetStyle().ItemSpacing.x) / 2
                 if imgui.Button('Повторить', vec(bw, 32)) then startDownload() end
                 imgui.SameLine()
@@ -2072,7 +2938,6 @@ function main()
     log('[lua_afk] v' .. SCRIPT_VERSION .. ', файл: ' .. tostring(thisScript().path))
 
     lua_thread.create(netThread)
-    lua_thread.create(autoSpawnThread)
     lua_thread.create(botThread)
     lua_thread.create(updateScheduler)
 
