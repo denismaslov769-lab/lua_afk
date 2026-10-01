@@ -4,18 +4,20 @@
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('0.2.0')
-script_description('Скрипт для Arizona RP с автообновлением')
+script_version('0.3.0')
+script_description('Скрипт для Arizona RP: меню, авто спавн, автообновление')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
 local dlstatus = require('moonloader').download_status
+local inicfg   = require('inicfg')
+local ffi      = require('ffi')
 
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
 -- ===================== Настройки =====================
-local SCRIPT_VERSION = '0.2.0'
+local SCRIPT_VERSION = '0.3.0'
 local REPO_RAW    = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/'
 local VERSION_URL = REPO_RAW .. 'version.json'
 local SCRIPT_URL  = REPO_RAW .. 'lua_afk.lua'
@@ -25,7 +27,19 @@ local TMP_VERSION = TMP_DIR .. '\\lua_afk_version.json'
 local TMP_SCRIPT  = TMP_DIR .. '\\lua_afk_update.lua'
 
 local TAG = '{33AAFF}[lua_afk]{FFFFFF} '
-local enabled = false
+
+-- ===================== Конфиг (moonloader/config/lua_afk.ini) =====================
+local INI = 'lua_afk.ini'
+local cfg = inicfg.load({
+    spawn = {
+        enabled = false,
+        mode    = 0,        -- 0 = обычный спавн, 1 = выбор пункта в диалоге
+        delay   = 1000,     -- задержка, мс
+        item    = 1,        -- номер пункта в диалоге (с 1)
+        keyword = 'спавн',  -- слово в заголовке диалога
+    },
+}, INI)
+local function saveCfg() inicfg.save(cfg, INI) end
 
 -- ===================== Утилиты =====================
 -- Текст в файле хранится в UTF-8, чат игры использует CP1251
@@ -159,6 +173,22 @@ local function applyStyle()
     c[col.Button]           = V4(0.20, 0.47, 0.95, 1.00)
     c[col.ButtonHovered]    = V4(0.28, 0.56, 1.00, 1.00)
     c[col.ButtonActive]     = V4(0.15, 0.38, 0.85, 1.00)
+
+    style.ChildRounding    = 10
+    style.GrabRounding     = 8
+    style.GrabMinSize      = 14
+    style.ChildBorderSize  = 1
+    style.ScrollbarRounding = 8
+    c[col.ChildBg]          = V4(0.10, 0.11, 0.15, 1.00)
+    c[col.PopupBg]          = V4(0.09, 0.10, 0.14, 0.98)
+    c[col.FrameBgHovered]   = V4(0.17, 0.19, 0.26, 1.00)
+    c[col.FrameBgActive]    = V4(0.20, 0.23, 0.32, 1.00)
+    c[col.SliderGrab]       = V4(0.25, 0.60, 1.00, 1.00)
+    c[col.SliderGrabActive] = V4(0.40, 0.70, 1.00, 1.00)
+    c[col.CheckMark]        = V4(0.30, 0.65, 1.00, 1.00)
+    c[col.ScrollbarBg]      = V4(0.08, 0.09, 0.12, 1.00)
+    c[col.ScrollbarGrab]    = V4(0.20, 0.23, 0.30, 1.00)
+    c[col.TextSelectedBg]   = V4(0.20, 0.55, 1.00, 0.35)
 end
 
 imgui.OnInitialize(function()
@@ -167,10 +197,14 @@ imgui.OnInitialize(function()
 
     -- Шрифт с поддержкой кириллицы
     local fontsDir = getFolderPath(0x14)
-    local font = fontsDir .. '\\trebucbd.ttf'
-    if not doesFileExist(font) then font = fontsDir .. '\\arial.ttf' end
-    io.Fonts:Clear()
-    io.Fonts:AddFontFromFileTTF(font, 16.0, nil, io.Fonts:GetGlyphRangesCyrillic())
+    local font
+    for _, name in ipairs({ 'trebucbd.ttf', 'segoeui.ttf', 'arial.ttf', 'tahoma.ttf' }) do
+        if doesFileExist(fontsDir .. '\\' .. name) then font = fontsDir .. '\\' .. name break end
+    end
+    if font then
+        io.Fonts:Clear()
+        io.Fonts:AddFontFromFileTTF(font, 16.0, nil, io.Fonts:GetGlyphRangesCyrillic())
+    end
 
     applyStyle()
 end)
@@ -251,11 +285,280 @@ imgui.OnFrame(
     end
 )
 
+
+-- ===================== Виджеты (рисуются кодом, без icon-шрифтов => никаких "???") =====================
+local ACCENT = V4(0.25, 0.60, 1.00, 1.00)
+local U32 = imgui.ColorConvertFloat4ToU32
+local function vec(x, y) return imgui.ImVec2(x, y) end
+local function lerp(a, b, t) return a + (b - a) * t end
+local function lerpV4(a, b, t) return V4(lerp(a.x, b.x, t), lerp(a.y, b.y, t), lerp(a.z, b.z, t), lerp(a.w, b.w, t)) end
+local anim = {}
+
+-- Переключатель (toggle switch) с анимацией
+local function toggle(id, label, ptr)
+    local dl = imgui.GetWindowDrawList()
+    local p  = imgui.GetCursorScreenPos()
+    local h  = imgui.GetFrameHeight()
+    local w  = h * 1.9
+    local clicked = imgui.InvisibleButton(id, vec(w, h))
+    if clicked then ptr[0] = not ptr[0] end
+    local target = ptr[0] and 1 or 0
+    local t = anim[id] or target
+    t = t + (target - t) * math.min(1, imgui.GetIO().DeltaTime * 12)
+    anim[id] = t
+    local bg = lerpV4(V4(0.22, 0.24, 0.30, 1), ACCENT, t)
+    if imgui.IsItemHovered() then bg = lerpV4(bg, V4(1, 1, 1, 1), 0.08) end
+    dl:AddRectFilled(p, vec(p.x + w, p.y + h), U32(bg), h / 2)
+    dl:AddCircleFilled(vec(p.x + h / 2 + t * (w - h), p.y + h / 2), h / 2 - 3, U32(V4(1, 1, 1, 1)), 24)
+    imgui.SameLine()
+    imgui.AlignTextToFramePadding()
+    imgui.Text(label)
+    return clicked
+end
+
+-- Сегментированный выбор (вместо выпадающего списка)
+local function segmented(id, ptr, items)
+    local sp = imgui.GetStyle().ItemSpacing.x
+    local w  = (imgui.GetContentRegionAvail().x - sp * (#items - 1)) / #items
+    local changed = false
+    for i, name in ipairs(items) do
+        if i > 1 then imgui.SameLine() end
+        local active = ptr[0] == i - 1
+        if not active then
+            imgui.PushStyleColor(imgui.Col.Button,        V4(0.16, 0.18, 0.24, 1.00))
+            imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.22, 0.25, 0.33, 1.00))
+            imgui.PushStyleColor(imgui.Col.ButtonActive,  V4(0.18, 0.20, 0.27, 1.00))
+        end
+        if imgui.Button(name .. '##' .. id .. i, vec(w, 32)) then ptr[0] = i - 1; changed = true end
+        if not active then imgui.PopStyleColor(3) end
+    end
+    return changed
+end
+
+local function section(title)
+    imgui.Spacing()
+    imgui.TextColored(ACCENT, title)
+    imgui.Separator()
+end
+
+local function hint(text)
+    imgui.PushTextWrapPos(0)
+    imgui.TextDisabled(text)
+    imgui.PopTextWrapPos()
+end
+
+-- Иконки
+local function iconSpawn(dl, c, col)
+    dl:AddCircleFilled(vec(c.x, c.y - 3), 6.5, col, 24)
+    dl:AddTriangleFilled(vec(c.x - 5.6, c.y), vec(c.x + 5.6, c.y), vec(c.x, c.y + 8), col)
+    dl:AddCircleFilled(vec(c.x, c.y - 3), 2.6, U32(V4(0.10, 0.11, 0.15, 1)), 16)
+end
+
+local function iconInfo(dl, c, col)
+    dl:AddCircle(c, 8, col, 24, 1.8)
+    dl:AddCircleFilled(vec(c.x, c.y - 3.8), 1.4, col, 12)
+    dl:AddRectFilled(vec(c.x - 1, c.y - 1), vec(c.x + 1, c.y + 4.5), col)
+end
+
+local function iconClose(dl, c, col)
+    dl:AddLine(vec(c.x - 5, c.y - 5), vec(c.x + 5, c.y + 5), col, 2)
+    dl:AddLine(vec(c.x + 5, c.y - 5), vec(c.x - 5, c.y + 5), col, 2)
+end
+
+-- Кнопка-вкладка в боковой панели
+local function sidebarButton(id, name, icon, active)
+    local dl = imgui.GetWindowDrawList()
+    local p  = imgui.GetCursorScreenPos()
+    local w  = imgui.GetContentRegionAvail().x
+    local h  = 40
+    local clicked = imgui.InvisibleButton(id, vec(w, h))
+    local hovered = imgui.IsItemHovered()
+
+    local t = anim[id] or 0
+    local target = active and 1 or (hovered and 0.45 or 0)
+    t = t + (target - t) * math.min(1, imgui.GetIO().DeltaTime * 14)
+    anim[id] = t
+
+    if t > 0.01 then
+        dl:AddRectFilled(p, vec(p.x + w, p.y + h), U32(V4(ACCENT.x, ACCENT.y, ACCENT.z, 0.18 * t)), 8)
+    end
+    if active then
+        dl:AddRectFilled(vec(p.x, p.y + 8), vec(p.x + 4, p.y + h - 8), U32(ACCENT), 2)
+    end
+    local col = U32(lerpV4(COLOR_GRAY, V4(1, 1, 1, 1), t))
+    icon(dl, vec(p.x + 22, p.y + h / 2), col)
+    dl:AddText(vec(p.x + 42, p.y + (h - imgui.GetTextLineHeight()) / 2), col, name)
+    return clicked
+end
+
+-- ===================== Меню =====================
+local menu = {
+    window = imgui.new.bool(false),
+    tab    = 1,
+}
+
+local ui = {
+    spawnEnabled = imgui.new.bool(cfg.spawn.enabled),
+    spawnMode    = imgui.new.int(cfg.spawn.mode),
+    spawnDelay   = imgui.new.int(cfg.spawn.delay),
+    spawnItem    = imgui.new.int(cfg.spawn.item),
+    spawnKeyword = imgui.new.char[64](tostring(cfg.spawn.keyword)),
+}
+
+local function drawSpawnTab()
+    section('Основное')
+    if toggle('##spawn_on', 'Включить авто спавн', ui.spawnEnabled) then
+        cfg.spawn.enabled = ui.spawnEnabled[0]; saveCfg()
+        msg(cfg.spawn.enabled and 'Авто спавн включён.' or 'Авто спавн выключен.')
+    end
+
+    section('Режим')
+    if segmented('spawn_mode', ui.spawnMode, { 'Кнопка Spawn', 'Пункт в диалоге' }) then
+        cfg.spawn.mode = ui.spawnMode[0]; saveCfg()
+    end
+    if ui.spawnMode[0] == 0 then
+        hint('Скрипт сам нажмёт Spawn, когда персонаж ещё не появился на сервере и нет открытых диалогов.')
+    else
+        hint('Когда откроется диалог, в заголовке которого есть ключевое слово, скрипт выберет нужный пункт.')
+        imgui.Text('Ключевое слово:')
+        imgui.PushItemWidth(-1)
+        if imgui.InputText('##spawn_kw', ui.spawnKeyword, ffi.sizeof(ui.spawnKeyword)) then
+            cfg.spawn.keyword = ffi.string(ui.spawnKeyword); saveCfg()
+        end
+        imgui.Text('Номер пункта:')
+        if imgui.SliderInt('##spawn_item', ui.spawnItem, 1, 10, 'Пункт %d') then
+            cfg.spawn.item = ui.spawnItem[0]; saveCfg()
+        end
+        imgui.PopItemWidth()
+    end
+
+    section('Задержка')
+    imgui.PushItemWidth(-1)
+    if imgui.SliderInt('##spawn_delay', ui.spawnDelay, 0, 5000, '%d мс') then
+        cfg.spawn.delay = ui.spawnDelay[0]; saveCfg()
+    end
+    imgui.PopItemWidth()
+end
+
+local function drawInfoTab()
+    section('Скрипт')
+    imgui.Text('Версия:');  imgui.SameLine(110); imgui.TextColored(COLOR_GREEN, SCRIPT_VERSION)
+    imgui.Text('Автор:');   imgui.SameLine(110); imgui.TextColored(COLOR_GRAY, 'denismaslov769-lab')
+
+    section('Обновления')
+    if imgui.Button('Проверить обновления', vec(-1, 34)) then checkUpdates(true) end
+
+    section('Команды')
+    imgui.Text('/lafk');    imgui.SameLine(110); imgui.TextDisabled('открыть / закрыть меню')
+    imgui.Text('/lafkupd'); imgui.SameLine(110); imgui.TextDisabled('проверить обновления')
+end
+
+local TABS = {
+    { name = 'Авто спавн', icon = iconSpawn, draw = drawSpawnTab },
+    { name = 'Информация', icon = iconInfo,  draw = drawInfoTab  },
+}
+
+imgui.OnFrame(
+    function() return menu.window[0] end,
+    function(player)
+        local sw, sh = getScreenResolution()
+        imgui.SetNextWindowPos(vec(sw / 2, sh / 2), imgui.Cond.FirstUseEver, vec(0.5, 0.5))
+        imgui.SetNextWindowSize(vec(660, 430), imgui.Cond.Always)
+        imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, vec(10, 10))
+        imgui.Begin('##lua_afk_menu', menu.window,
+            imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoCollapse)
+        imgui.PopStyleVar()
+
+        -- Боковая панель: вкладки столбиком
+        imgui.BeginChild('##sidebar', vec(190, 0), true)
+        imgui.SetWindowFontScale(1.35)
+        centerText('lua_afk', ACCENT)
+        imgui.SetWindowFontScale(1.0)
+        centerText('v' .. SCRIPT_VERSION, COLOR_GRAY)
+        imgui.Spacing(); imgui.Separator(); imgui.Spacing()
+
+        for i, tab in ipairs(TABS) do
+            if sidebarButton('##tab' .. i, tab.name, tab.icon, menu.tab == i) then menu.tab = i end
+        end
+
+        -- Кнопка закрытия внизу панели
+        imgui.SetCursorPosY(imgui.GetWindowHeight() - 40 - imgui.GetStyle().WindowPadding.y)
+        if sidebarButton('##close', 'Закрыть', iconClose, false) then menu.window[0] = false end
+        imgui.EndChild()
+
+        imgui.SameLine()
+
+        -- Содержимое вкладки
+        imgui.BeginChild('##content', vec(0, 0), true)
+        local tab = TABS[menu.tab]
+        imgui.SetWindowFontScale(1.25)
+        imgui.Text(tab.name)
+        imgui.SetWindowFontScale(1.0)
+        tab.draw()
+        imgui.EndChild()
+
+        imgui.End()
+    end
+)
+
+-- ===================== Авто спавн =====================
+local RU_UP = 'АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ'
+local RU_LO = 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя'
+local RU_MAP = {}
+do
+    local up, lo = {}, {}
+    for ch in RU_UP:gmatch('[\208\209][\128-\191]') do up[#up + 1] = ch end
+    for ch in RU_LO:gmatch('[\208\209][\128-\191]') do lo[#lo + 1] = ch end
+    for i = 1, #up do RU_MAP[up[i]] = lo[i] end
+end
+local function ruLower(s)
+    local r = s:lower():gsub('[\208\209][\128-\191]', RU_MAP)
+    return r
+end
+
+local function autoSpawnThread()
+    local lastSpawn, lastDialogId, lastDialogTime = 0, -1, 0
+    while true do
+        wait(200)
+        if cfg.spawn.enabled then
+            if cfg.spawn.mode == 0 then
+                -- Обычный спавн: персонаж подключён, но ещё не появился, диалогов нет
+                local connected = sampGetPlayerIdByCharHandle(PLAYER_PED)
+                if connected and not sampIsLocalPlayerSpawned() and not sampIsDialogActive()
+                   and os.clock() - lastSpawn > 3 then
+                    wait(cfg.spawn.delay)
+                    if not sampIsLocalPlayerSpawned() and not sampIsDialogActive() then
+                        sampSendRequestSpawn()
+                        sampSpawnPlayer()
+                        lastSpawn = os.clock()
+                        msg('Авто спавн: персонаж заспавнен.')
+                    end
+                end
+            elseif sampIsDialogActive() then
+                -- Выбор пункта в диалоге спавна
+                local id = sampGetCurrentDialogId()
+                if id ~= lastDialogId or os.clock() - lastDialogTime > 3 then
+                    local caption = u8(sampGetDialogCaption() or ''):gsub('{%x+}', '')
+                    local kw = ruLower(tostring(cfg.spawn.keyword))
+                    if kw ~= '' and ruLower(caption):find(kw, 1, true) then
+                        lastDialogId, lastDialogTime = id, os.clock()
+                        wait(cfg.spawn.delay)
+                        if sampIsDialogActive() and sampGetCurrentDialogId() == id then
+                            sampSetCurrentDialogListItem(cfg.spawn.item - 1)
+                            sampCloseCurrentDialogWithButton(1)
+                            msg('Авто спавн: выбран пункт ' .. cfg.spawn.item .. '.')
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
 -- ===================== Команды =====================
--- /lafk - включить/выключить скрипт
-local function cmdToggle()
-    enabled = not enabled
-    msg(enabled and 'Скрипт включён.' or 'Скрипт выключен.')
+-- /lafk - открыть/закрыть меню
+local function cmdMenu()
+    menu.window[0] = not menu.window[0]
 end
 
 -- ===================== Главный цикл =====================
@@ -263,9 +566,11 @@ function main()
     if not isSampLoaded() or not isSampfuncsLoaded() then return end
     while not isSampAvailable() do wait(100) end
 
-    sampRegisterChatCommand('lafk', cmdToggle)
+    sampRegisterChatCommand('lafk', cmdMenu)
     sampRegisterChatCommand('lafkupd', function() checkUpdates(true) end)
-    msg('Загружен v' .. SCRIPT_VERSION .. '. Команды: /lafk, /lafkupd')
+    msg('Загружен v' .. SCRIPT_VERSION .. '. Меню: /lafk')
+
+    lua_thread.create(autoSpawnThread)
 
     -- Проверяем обновления после входа на сервер (когда персонаж заспавнился)
     lua_thread.create(function()
@@ -280,10 +585,6 @@ function main()
         if upd.state == 'installing' and upd.shown >= 0.999 then
             wait(500)
             if installUpdate() then return end
-        end
-
-        if enabled then
-            -- TODO: основная логика скрипта
         end
     end
 end
