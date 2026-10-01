@@ -1,5 +1,5 @@
 {
-  "version": "1.5.5",
+  "version": "1.5.6",
   "url": "https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/lua_afk.lua",
-  "changelog": "Исправлен вылет скрипта (cannot resume non-suspended coroutine в processLineOfSight). Плюс всё из 1.5.4: бот не срезает углы и отъезжает от препятствий."
+  "changelog": "Исправлен вылет игры: лучи проверки препятствий больше не идут изнутри машины и у самой земли."
 }

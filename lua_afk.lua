@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Исправлен вылет скрипта (cannot resume non-suspended coroutine в processLineOfSight). Плюс всё из 1.5.4: бот не срезает углы и отъезжает от препятствий.
+-- @changelog: Исправлен вылет игры: лучи проверки препятствий больше не идут изнутри машины и у самой земли.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('1.5.5')
+script_version('1.5.6')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '1.5.5'
+local SCRIPT_VERSION = '1.5.6'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/lua_afk.lua'
 local TAG = '{33AAFF}[lua_afk]{FFFFFF} '
 
@@ -687,13 +687,8 @@ local function los(x1, y1, z1, x2, y2, z2, ...)
     local dx, dy, dz = x2 - x1, y2 - y1, z2 - z1
     local l2 = dx * dx + dy * dy + dz * dz
     if l2 < 0.01 or l2 > 200 * 200 then return false end
-    local ok, hit, cp = pcall(processLineOfSight, x1, y1, z1, x2, y2, z2, ...)
-    if not ok then
-        bot.losErrors = (bot.losErrors or 0) + 1
-        if bot.losErrors == 1 then log('[bot] ошибка луча (пропущено): ' .. tostring(hit)) end
-        return false
-    end
-    return hit, cp
+    -- Без pcall: если игра всё же сломается внутри луча, пусть лучше остановится скрипт, чем вылетит игра
+    return processLineOfSight(x1, y1, z1, x2, y2, z2, ...)
 end
 
 -- Прямая видимость между точками (здания и объекты), без учёта машин
@@ -743,9 +738,10 @@ local function dirRay(car, deg, len)
     local hy = (cs >= 0) and (maxY or 3) or math.abs(minY or -3)
     local hx = (sn >= 0) and (maxX or 1.2) or math.abs(minX or -1.2)
     local body = math.min(math.abs(cs) > 0.01 and hy / math.abs(cs) or 99, math.abs(sn) > 0.01 and hx / math.abs(sn) or 99)
-    local st = math.max(0, math.min(body - 0.3, len - 0.5))
+    local st = body + 0.3                               -- старт снаружи кузова, как у проверенного луча от бампера
+    if st >= len - 0.3 then return nil end
     local best
-    for _, h in ipairs({ -0.1, 0.45 }) do              -- низкие (бордюры, заборы) и высокие препятствия
+    for _, h in ipairs({ 0.3 }) do                      -- та же высота, что у луча от бампера (работал без проблем)
         local x1, y1, z1 = getOffsetFromCarInWorldCoords(car, sn * st, cs * st, h)
         local x2, y2, z2 = getOffsetFromCarInWorldCoords(car, sn * len, cs * len, h)
         local hit, cp = los(x1, y1, z1, x2, y2, z2, true, false, false, true, false, false, false, false)
@@ -865,7 +861,7 @@ local function corridorClear(car, x, y, z)
     local lift = (found and gz and gz ~= 0 and cz - gz > 0 and cz - gz < 3) and (cz - gz) or 0.8
     local ez = (z or (cz - lift))
     for _, sd in ipairs({ -1, 1 }) do
-        for _, h in ipairs({ -0.3, 0.5 }) do
+        for _, h in ipairs({ 0.2, 0.6 }) do
             if not clearLine(cx + px * sd, cy + py * sd, cz + h, x + px * sd, y + py * sd, ez + lift + h) then
                 return false
             end
