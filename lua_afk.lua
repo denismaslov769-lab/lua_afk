@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
+-- @changelog: Исправлен вылет игры при повторном выборе фона. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.4.0')
+script_version('2.4.1')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.4.0'
+local SCRIPT_VERSION = '2.4.1'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1918,11 +1918,27 @@ function media.load(path, opt)
     return m
 end
 
+-- Текстуры освобождаем не сразу, а через пару кадров: в текущем кадре картинка уже
+-- могла попасть в список отрисовки, и удаление прямо сейчас роняет игру.
+media.trash, media.tick = {}, 0
 function media.free(m)
     if not m then return end
     m.cancel = true
-    for _, t in ipairs(m.frames) do pcall(imgui.ReleaseTexture, t) end
+    for _, t in ipairs(m.frames) do media.trash[#media.trash + 1] = { tex = t, tick = media.tick } end
     m.frames, m.delays = {}, {}
+end
+
+local function emptyTrash()
+    local i = 1
+    while i <= #media.trash do
+        local e = media.trash[i]
+        if media.tick - e.tick >= 2 then
+            pcall(imgui.ReleaseTexture, e.tex)
+            table.remove(media.trash, i)
+        else
+            i = i + 1
+        end
+    end
 end
 
 local function finish(m)
@@ -1935,6 +1951,8 @@ end
 
 -- Продолжить загрузки (вызывается каждый кадр меню, ~budgetSec времени на всё)
 function media.pump(budgetSec)
+    media.tick = media.tick + 1
+    emptyTrash()
     local i = 1
     while i <= #media.loaders do
         local m = media.loaders[i]
@@ -2636,8 +2654,11 @@ local function drawBgSettings()
     for i, f in ipairs(scan.bg) do
         local tag = f.dir and '[кадры] ' or (f.video and '[видео] ' or (f.ext == 'gif' and '[gif] ' or ''))
         if imgui.Selectable(tag .. f.disp .. '##bgf' .. i, tostring(cfg.bgimg.file) == f.name) then
+            local m = bgState.media
+            local same = bgState.file == f.name and m and not m.err and cfg.bgimg.enabled
             cfg.bgimg.file, cfg.bgimg.enabled, ui.bgOn[0] = f.name, true, true
-            saveCfg(); bgReload()
+            saveCfg()
+            if not same then bgReload() end -- тот же файл ещё раз - не перезагружаем
         end
     end
     imgui.EndChild()
