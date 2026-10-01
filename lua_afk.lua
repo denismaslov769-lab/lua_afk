@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Правая полоса по самой дороге: бот находит правый край асфальта (бордюр, разделительная, газон) и держится своей полосы. Правая полоса: сдвиг как у машин трафика игры (крайняя правая полоса, с учётом разделительной), в поворотах не срезает угол через встречку. Повороты проходит быстрее (точнее считает радиус поворота). Своя карта дорог всего штата (из файлов игры) и свой поиск пути: бот видит маршрут до далёкой метки сразу, учитывает односторонние дороги и трассы, не мечется вперёд-назад. Бот ездит только по дорогам: убрана езда напрямую. Нет продвижения - отъезжает и ищет другой маршрут по дорогам (с разворотом и без), без слепой езды. Метка в стороне от дороги - останавливается у ближайшей точки дороги. Гифки по ссылке или коду встраивания Tenor/Giphy прямо в меню (фон и частицы). Бот больше не сдаётся: если не может приблизиться к метке, пробует другие пути (напрямую вне дорог, отъезд и новый маршрут). Метка вдали от дороги - доезжает до неё по бездорожью. Развязки и развилки: бот едет по самой линии маршрута (не срезает через отбойник), не путает эстакады, быстрее замечает, что ушёл не в ту ветку, и заранее сбрасывает скорость перед изгибами. Сцепка: мало места перед прицепом - бот подъезжает ближе и сдаёт с короткого расстояния, не крутится бесконечно (останавливается с подсказкой). Новый виджет бота во вкладке Авто фарм (дорога, скорость, расстояние, прицеп, прогресс, кнопка запуска). Частицы Arizona и Hearts. ПКМ - Убрать фон у своих частиц. Сцепка: прицеп далеко или за забором - бот едет к нему в объезд и быстрее, без качелей вперёд-назад. Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
+-- @changelog: Команда /lafkdbg - показывает линию маршрута и полосу бота на экране. Правая полоса по самой дороге: бот находит правый край асфальта (бордюр, разделительная, газон) и держится своей полосы. Правая полоса: сдвиг как у машин трафика игры (крайняя правая полоса, с учётом разделительной), в поворотах не срезает угол через встречку. Повороты проходит быстрее (точнее считает радиус поворота). Своя карта дорог всего штата (из файлов игры) и свой поиск пути: бот видит маршрут до далёкой метки сразу, учитывает односторонние дороги и трассы, не мечется вперёд-назад. Бот ездит только по дорогам: убрана езда напрямую. Нет продвижения - отъезжает и ищет другой маршрут по дорогам (с разворотом и без), без слепой езды. Метка в стороне от дороги - останавливается у ближайшей точки дороги. Гифки по ссылке или коду встраивания Tenor/Giphy прямо в меню (фон и частицы). Бот больше не сдаётся: если не может приблизиться к метке, пробует другие пути (напрямую вне дорог, отъезд и новый маршрут). Метка вдали от дороги - доезжает до неё по бездорожью. Развязки и развилки: бот едет по самой линии маршрута (не срезает через отбойник), не путает эстакады, быстрее замечает, что ушёл не в ту ветку, и заранее сбрасывает скорость перед изгибами. Сцепка: мало места перед прицепом - бот подъезжает ближе и сдаёт с короткого расстояния, не крутится бесконечно (останавливается с подсказкой). Новый виджет бота во вкладке Авто фарм (дорога, скорость, расстояние, прицеп, прогресс, кнопка запуска). Частицы Arizona и Hearts. ПКМ - Убрать фон у своих частиц. Сцепка: прицеп далеко или за забором - бот едет к нему в объезд и быстрее, без качелей вперёд-назад. Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.4')
+script_version('2.5.5')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.4'
+local SCRIPT_VERSION = '2.5.5'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1073,7 +1073,42 @@ bot.edgeOff = function(a, b, half, dataOff, cz)
         bot.edgeLogged = true
         log(string.format('[roads] край дороги: справа %.1f м от линии, сдвиг %.1f (по данным %.1f)', R, off, dataOff))
     end
-    return off
+    return off, R
+end
+
+bot.drawDbg = function()
+    local r = bot.route
+    if not bot.dbgFont then bot.dbgFont = renderCreateFont('Arial', 10, 5) end
+    local function scr(x, y, z)
+        if not isPointOnScreen(x, y, z, 1.0) then return nil end
+        return convert3DCoordsToScreen(x, y, z)
+    end
+    if r and r.pts then
+        local pts = r.pts
+        for i = math.max(1, (r.idx or 1) - 2), math.min(#pts - 1, (r.idx or 1) + 30) do
+            local a, b = pts[i], pts[i + 1]
+            local az, bz = (a.z or 0) + 0.3, (b.z or 0) + 0.3
+            local x1, y1 = scr(a.x, a.y, az)
+            local x2, y2 = scr(b.x, b.y, bz)
+            if x1 and x2 then renderDrawLine(x1, y1, x2, y2, 2, 0xFFFFDD00) end
+            local sl = getDistanceBetweenCoords2d(a.x, a.y, b.x, b.y)
+            local off = r.eoS or a.off or 0
+            if sl > 0.01 then
+                local ux, uy = (b.x - a.x) / sl, (b.y - a.y) / sl
+                local u1, v1 = scr(a.x + uy * off, a.y - ux * off, az)
+                local u2, v2 = scr(b.x + uy * off, b.y - ux * off, bz)
+                if u1 and u2 then renderDrawLine(u1, v1, u2, v2, 2, 0xFF33FF55) end
+            end
+        end
+    end
+    local d = bot.dbg
+    if d and d.px then
+        local x, y = scr(d.px, d.py, (d.pz or 0) + 0.5)
+        if x then renderDrawBox(x - 5, y - 5, 10, 10, 0xFFFF2020) end
+        local e = bot.dbgEdge or {}
+        renderFontDrawText(bot.dbgFont, string.format('lat %.1f  used %.1f  data %.1f  edgeR %s  edgeOff %s',
+            d.lat or 0, d.used or 0, e.data or 0, tostring(e.R), tostring(e.eo)), 20, 300, 0xFFFFFFFF)
+    end
 end
 
 -- Точка маршрута для руления + безопасная скорость по изгибам дороги впереди.
@@ -1107,7 +1142,8 @@ local function routeWaypoint(car, speed, tx, ty)
     if not r.eoT or now > r.eoT then
         r.eoT = now + 0.2
         local j = math.min(n - 1, bi + 3)
-        local eo = bot.edgeOff(pts[j], pts[j + 1], geo(car).half, pts[j].off or 0, cz)
+        local eo, eR = bot.edgeOff(pts[j], pts[j + 1], geo(car).half, pts[j].off or 0, cz)
+        bot.dbgEdge = { eo = eo, R = eR, data = pts[j].off or 0 }
         if eo then r.eoS = r.eoS and r.eoS + clamp(eo - r.eoS, -0.5, 0.5) or eo end
     end
     -- точка на линии маршрута впереди на расстоянии L (по самой дороге)
@@ -1161,6 +1197,20 @@ local function routeWaypoint(car, speed, tx, ty)
         if clearLine(cx, cy, cz + 0.6, qx, qy, qz + 1.2) and corridorClear(car, qx, qy, qz + 0.4) then px, py, pz = qx, qy, qz break end
         L = L - 4
         px, py, pz, last = at(L)
+    end
+    -- отладка полосы (/lafkdbg): где машина относительно линии маршрута
+    do
+        local a, b = pts[bi], pts[math.min(n, bi + 1)]
+        local sl = getDistanceBetweenCoords2d(a.x, a.y, b.x, b.y)
+        local lat = 0
+        if sl > 0.01 then lat = ((cx - a.x) * (b.y - a.y) - (cy - a.y) * (b.x - a.x)) / sl end
+        bot.dbg = { px = px, py = py, pz = pz, lat = lat, used = r.noLane and 0 or (r.eoS or a.off or 0) }
+        if bot.dbgOn and (not bot.dbgT or now > bot.dbgT) then
+            bot.dbgT = now + 2
+            local e = bot.dbgEdge or {}
+            log(string.format('[lane] машина от линии %.1f м (+ справа), нужный сдвиг %.1f, по данным %.1f, край справа %s, сдвиг по краю %s',
+                lat, bot.dbg.used, a.off or 0, tostring(e.R), tostring(e.eo)))
+        end
     end
     -- конец маршрута рядом с меткой - дальше едем прямо к метке
     if last and getDistanceBetweenCoords2d(cx, cy, px, py) < 12 then
@@ -4023,6 +4073,10 @@ function main()
 
     sampRegisterChatCommand('lafk', function() menu.window[0] = not menu.window[0] end)
     sampRegisterChatCommand('lafkupd', function() checkUpdates(true) end)
+    sampRegisterChatCommand('lafkdbg', function()
+        bot.dbgOn = not bot.dbgOn
+        msg(bot.dbgOn and 'Отладка полосы включена: жёлтая - линия дороги, зелёная - полоса бота, красный - куда рулит.' or 'Отладка полосы выключена.')
+    end)
     sampRegisterChatCommand('pricep', function(arg)
         if tostring(arg):lower():find('del', 1, true) then
             if hitch.active then hitchStop() end
@@ -4051,6 +4105,7 @@ function main()
             beat = os.clock()
             log('[main] жив, меню открыто, кадров: ' .. menu.frames)
         end
+        if bot.dbgOn then pcall(bot.drawDbg) end
         if upd.state == 'installing' and (upd.shown >= 0.999 or not upd.window[0]) then
             -- Сначала закрываем окна и отпускаем клавиши, ждём пока mimgui перестанет рисовать,
             -- и только потом пишем файл. AutoReboot.lua сам перезапускает скрипт при изменении
