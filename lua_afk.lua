@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Бот подъезжает к надписи груза ближе 1 метра (при перелёте сдаёт назад). Исправлена сцепка: ищутся все модели рабочих прицепов, выданный прицеп не теряется после неудачной попытки, допуск сцепки увеличен.
+-- @changelog: Исправлено наматывание кругов при езде по метке: бот замечает, что крутится на месте, сдаёт назад и строит маршрут заново; разворот к близкой точке делается в несколько приёмов, а не по кругу.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.14')
+script_version('2.5.15')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.14'
+local SCRIPT_VERSION = '2.5.15'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1321,10 +1321,27 @@ local function maneuver(car, tx, ty, dist, s, now, speed, routed)
     local stalled = t > 1.0 and now - (m.moved or m.since) > 0.8
     local dir = m.dir
 
+    -- сколько уже повернулись за этот разворот: больше 300 градусов - это круг, бросаем
+    do
+        local h = getCarHeading(car)
+        if m.h then m.turned = (m.turned or 0) + math.abs(((h - m.h + 540) % 360) - 180) end
+        m.h = h
+        if (m.turned or 0) > 300 then
+            log('[bot] разворот пошёл по кругу - отменяю')
+            bot.man, bot.manCooldown = nil, now + 10
+            bot.wx, bot.nextPlan, bot.route = nil, 0, nil
+            return false
+        end
+    end
+
     if m.phase == 'fwd' then
         local frontGap = minOf(s.fl, s.fc, s.fr)
         local cornerGap = (dir > 0) and s.cr or s.cl
-        if t > 0.4 and ((frontGap and frontGap < 1.0) or (cornerGap and cornerGap < 0.6) or stalled) then
+        -- точка близко сбоку - вперёд на полном руле её не достать (внутри круга
+        -- поворота), поэтому сдаём назад: разворот в несколько приёмов
+        local gd = math.sqrt(lx * lx + ly * ly)
+        local inside = gd < 14 and a > 70
+        if t > 0.4 and ((frontGap and frontGap < 1.0) or (cornerGap and cornerGap < 0.6) or stalled or (inside and t > 1.5)) then
             m.phase, m.since, m.n, m.moved = 'back', now, m.n + 1, nil
             keys(0, 0, 1)
             return true
@@ -1358,6 +1375,41 @@ local function botControl(car, tx, ty, tz, dist)
     local decel = careful and 5 or 7      -- комфортное замедление
     local aLat  = careful and 6 or 8      -- боковое ускорение в повороте
     local stopGap = careful and 5 or 3.5  -- сколько оставлять до препятствия
+
+    -- 0. Защита от кругов: считаем, на сколько градусов повернулась машина.
+    -- Если за 30 с набрали больше 1.25 оборота и к метке не приблизились - это
+    -- кружение вокруг недостижимой точки маршрута: сдаём назад и строим путь заново.
+    do
+        local h = getCarHeading(car)
+        local C = bot.circ
+        if not C or not C.tx or getDistanceBetweenCoords2d(C.tx, C.ty, tx, ty) > 10 then
+            C = { tx = tx, ty = ty, h = h, acc = 0, t = now, d = dist }
+            bot.circ = C
+        end
+        local dh = ((h - C.h + 540) % 360) - 180
+        C.h = h
+        if speed > 0.5 then C.acc = C.acc + dh end
+        if now - C.t > 30 or dist < C.d - 30 then C.acc, C.t, C.d = 0, now, dist end
+        if math.abs(C.acc) > 450 then
+            C.n = (C.n or 0) + 1
+            log(string.format('[bot] кружусь на месте (%.0f град за %.0f с), до метки %.0f м - перестраиваю маршрут, раз %d',
+                C.acc, now - C.t, dist, C.n))
+            C.acc, C.t, C.d = 0, now, dist
+            bot.man, bot.manCooldown = nil, now + 12
+            bot.route, bot.wx, bot.commit, bot.turnAt, bot.routeFail, bot.vt = nil, nil, nil, nil, nil, nil
+            bot.nextPlan, bot.stuckSince = 0, nil
+            bot.allowBehind = (C.n % 2 == 1) and (now + 40) or nil
+            local r = senseRear(car)
+            local rg = minOf(r.bl, r.bc, r.br)
+            if not rg or rg > 2 then
+                bot.recover = { start = now, till = now + 2.0, steer = 0 }
+            else
+                keys(0, 0, 1)
+            end
+            bot.status = 'Кружился - строю маршрут заново'
+            return
+        end
+    end
 
     -- 1. Отъезд назад после упора
     if bot.recover then
