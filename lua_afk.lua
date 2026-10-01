@@ -4,7 +4,7 @@
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('0.5.1')
+script_version('0.5.2')
 script_description('Скрипт для Arizona RP: меню, авто спавн, автообновление')
 
 local imgui    = require('mimgui')
@@ -17,7 +17,7 @@ encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
 -- ===================== Настройки =====================
-local SCRIPT_VERSION = '0.5.1'
+local SCRIPT_VERSION = '0.5.2'
 local REPO_RAW    = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/'
 local VERSION_URL = REPO_RAW .. 'version.json'
 local SCRIPT_URL  = REPO_RAW .. 'lua_afk.lua'
@@ -607,13 +607,22 @@ local function botStop()
     end
 end
 
+-- Стили вождения GTA SA: 2 = объезжать машины, 4 = тормозить перед машинами.
+-- Оба НЕ останавливаются на светофорах (стили 0/1/5/6 - останавливаются).
+local function botStyle() return (tonumber(cfg.bot.style) or 0) == 1 and 4 or 2 end
+
+-- Задача водителя сбрасывает стиль на свой, поэтому стиль и скорость
+-- принудительно выставляются заново каждые 100 мс, пока бот едет
+local function botEnforce(car)
+    setCarDrivingStyle(car, botStyle())
+    setCarCruiseSpeed(car, tonumber(cfg.bot.speed) or 25)
+end
+
 local function botDrive(car, x, y, z)
     -- Встроенный ИИ водителя GTA: едет по дорогам (path nodes), объезжает транспорт.
-    -- Стиль 2 = объезжать машины, 4 = тормозить перед машинами; оба игнорируют светофоры.
-    local style = (tonumber(cfg.bot.style) or 0) == 1 and 4 or 2
     local speed = tonumber(cfg.bot.speed) or 25
-    setCarCruiseSpeed(car, speed)
-    taskCarDriveToCoord(PLAYER_PED, car, x, y, z, speed, 0, 0, style)
+    taskCarDriveToCoord(PLAYER_PED, car, x, y, z, speed, 0, 0, botStyle())
+    botEnforce(car)
     bot.driving, bot.lastTask, bot.tx, bot.ty = true, os.clock(), x, y
 end
 
@@ -660,6 +669,8 @@ local function botThread()
                         if not bot.driving or moved or stuck then
                             botDrive(car, x, y, z)
                             bot.stuckSince = nil
+                        else
+                            botEnforce(car)
                         end
                         bot.status = string.format('Едет: %s, %d м', name, math.floor(dist))
                     end

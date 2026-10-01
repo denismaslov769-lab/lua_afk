@@ -1,5 +1,5 @@
 {
-  "version": "0.5.1",
+  "version": "0.5.2",
   "url": "https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/lua_afk.lua",
-  "changelog": "Исправлено автообновление (больше не берёт устаревший файл из кэша GitHub). Вкладка переименована в Авто фарм."
+  "changelog": "Бот дальнобойщик больше не останавливается на светофорах."
 }
