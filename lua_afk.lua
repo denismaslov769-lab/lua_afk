@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Скрипт полностью переписан: стабильное автообновление без крашей, обновлённое меню.
+-- @changelog: Бот: светофоры для ИИ всегда зелёные, нет кружения у метки, точнее маршрут.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('1.0.0')
+script_version('1.1.0')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '1.0.0'
+local SCRIPT_VERSION = '1.1.0'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/lua_afk.lua'
 local TAG = '{33AAFF}[lua_afk]{FFFFFF} '
 
@@ -582,7 +582,53 @@ end
 -- Бот дальнобойщик (для личного сервера, на Arizona RP отключён)
 --==============================================================
 local bot = { status = 'Выключен', driving = false, cp = nil, tx = nil, ty = nil,
-              lastTask = 0, stuckSince = nil, pauseUntil = 0, arrived = false }
+              lastTask = 0, stuckSince = nil, pauseUntil = 0, arrived = false,
+              best = nil, bestTime = 0, gaveUp = false }
+
+--------------------------------------------------------------
+-- Светофоры. ИИ водителя GTA спрашивает у игры цвет светофора через
+-- CTrafficLights::LightForCars1 / LightForCars2. Пока бот включён, эти функции
+-- подменяются на "всегда зелёный" (mov eax, 0; ret), при выключении - восстанавливаются.
+-- Перед патчем адреса проверяются (GTA SA 1.0 US), чтобы не сломать игру на другой версии.
+--------------------------------------------------------------
+local LIGHT_FUNCS = { 0x49D610, 0x49D670 }
+local TIMER_MS    = 0x00B7CB84 -- CTimer::m_snTimeInMilliseconds
+local lights = { patched = false, orig = {}, ok = nil }
+
+local function looksLikeLightFunc(a)
+    local pad = readMemory(a - 1, 1, true)
+    if pad ~= 0x90 and pad ~= 0xCC then return false end
+    for i = 0, 48 do
+        if readMemory(a + i, 4, true) == TIMER_MS then return true end
+    end
+    return false
+end
+
+local function lightsPatch(on)
+    if on == lights.patched then return end
+    if on then
+        if lights.ok == nil then
+            lights.ok = true
+            for _, a in ipairs(LIGHT_FUNCS) do
+                if not looksLikeLightFunc(a) then lights.ok = false end
+            end
+            log(lights.ok and '[bot] светофоры: патч доступен' or '[bot] светофоры: функции не найдены, патч пропущен')
+        end
+        if not lights.ok then return end
+        for _, a in ipairs(LIGHT_FUNCS) do
+            lights.orig[a] = { readMemory(a, 4, true), readMemory(a + 4, 2, true) }
+            writeMemory(a, 4, 0x000000B8, true)  -- B8 00 00 00
+            writeMemory(a + 4, 2, 0xC300, true)  -- 00 C3  => mov eax, 0 ; ret
+        end
+    else
+        for a, o in pairs(lights.orig) do
+            writeMemory(a, 4, o[1], true)
+            writeMemory(a + 4, 2, o[2], true)
+        end
+        lights.orig = {}
+    end
+    lights.patched = on
+end
 
 if hasSampev then
     function sampev.onSetCheckpoint(pos)             bot.cp = { pos.x, pos.y, pos.z } end
@@ -605,6 +651,7 @@ local function botTarget()
         local ok, x, y, z = getTargetBlipCoordinates()
         if ok then
             if not z or z == 0 then z = getGroundZFor3dCoord(x, y, 1000.0) end
+            if not z or z == 0 then local _, _, pz = getCharCoordinates(PLAYER_PED) z = pz end
             return x, y, z, 'метка на карте'
         end
     end
@@ -632,28 +679,10 @@ local function botDrive(car, x, y, z)
     bot.driving, bot.lastTask, bot.tx, bot.ty = true, os.clock(), x, y
 end
 
--- Свободна ли дорога перед бампером
-local function roadAheadClear(car, len)
-    local _, _, _, _, maxY = getModelDimensions(getCarModel(car))
-    maxY = maxY or 3
-    local x1, y1, z1 = getOffsetFromCarInWorldCoords(car, 0, maxY + 0.6, 0.4)
-    local x2, y2, z2 = getOffsetFromCarInWorldCoords(car, 0, maxY + 0.6 + len, 0.4)
-    local hit = processLineOfSight(x1, y1, z1, x2, y2, z2, true, true, true, true, false, false, false, false)
-    return not hit
-end
-
--- Светофоры: если машина почти встала, а впереди пусто - толкаем её вперёд
-local function lightBreaker(car)
-    if getCarSpeed(car) < 4.0 and roadAheadClear(car, 12) then
-        setCarForwardSpeed(car, math.min(tonumber(cfg.bot.speed) or 25, 12))
-        return true
-    end
-    return false
-end
-
 local function botThread()
     while true do
         wait(100)
+        lightsPatch(cfg.bot.enabled and not isArizona())
         if not cfg.bot.enabled then
             botStop(); bot.status = 'Выключен'
         elseif isArizona() then
@@ -674,30 +703,41 @@ local function botThread()
                     local typing = sampIsChatInputActive() or sampIsDialogActive() or isSampfuncsConsoleActive()
                     local manual = cfg.bot.takeover and not typing and (isKeyDown(0x57) or isKeyDown(0x53))
 
+                    -- новая цель - сбрасываем прогресс
+                    if not bot.tx or getDistanceBetweenCoords2d(bot.tx, bot.ty, x, y) > 10 then
+                        bot.best, bot.bestTime, bot.gaveUp = dist, os.clock(), false
+                    end
+                    if not bot.best or dist < bot.best - 5 then bot.best, bot.bestTime = dist, os.clock() end
+
                     if dist <= (tonumber(cfg.bot.radius) or 12) then
                         botStop()
                         if not bot.arrived then msg('Бот: прибыли (' .. name .. ').') end
                         bot.arrived, bot.status = true, 'Прибыл'
+                    elseif bot.gaveUp then
+                        bot.status = 'Ближе по дороге не подъехать'
+                    elseif os.clock() - bot.bestTime > 35 then
+                        -- 35 секунд не приближаемся к метке: ИИ кружит, останавливаемся
+                        botStop(); bot.gaveUp = true
+                        msg('Бот: ближе по дороге не подъехать, остановился. Переставьте метку ближе к дороге.')
                     elseif manual then
                         botStop(); bot.pauseUntil = os.clock() + 3
                         bot.status = 'Управление у вас'
                     elseif os.clock() >= bot.pauseUntil then
                         bot.arrived = false
-                        local moved = not bot.tx or getDistanceBetweenCoords2d(bot.tx, bot.ty, x, y) > 3
-                        if getCarSpeed(car) < 1.0 then
+                        local moved = not bot.tx or getDistanceBetweenCoords2d(bot.tx, bot.ty, x, y) > 10
+                        -- Застревание: стоим 6+ секунд. Манёвры разворота ИИ не трогаем.
+                        if getCarSpeed(car) < 0.5 then
                             bot.stuckSince = bot.stuckSince or os.clock()
                         else
                             bot.stuckSince = nil
                         end
-                        local stuck = bot.stuckSince and os.clock() - bot.stuckSince > 3
+                        local stuck = bot.stuckSince and os.clock() - bot.stuckSince > 6
+                                      and os.clock() - bot.lastTask > 6
                         if not bot.driving or moved or stuck then
                             botDrive(car, x, y, z)
                             bot.stuckSince = nil
                         else
                             botEnforce(car)
-                            if os.clock() - bot.lastTask > 1.0 and lightBreaker(car) then
-                                bot.stuckSince = nil
-                            end
                         end
                         bot.status = string.format('Едет: %s, %d м', name, math.floor(dist))
                     end
@@ -842,7 +882,10 @@ local function drawFarmTab()
     if toggle('##bot_take', 'W / S забирают управление', ui.botTake) then
         cfg.bot.takeover = ui.botTake[0]; saveCfg()
     end
-    hint('Бот едет по дорогам и не останавливается на светофорах. Не работает на серверах Arizona RP.')
+    if lights.ok == false then
+        imgui.TextColored(RED, 'Светофоры отключить не удалось: нужна GTA SA 1.0 US.')
+    end
+    hint('Пока бот включён, светофоры для ИИ всегда зелёные. Если 35 секунд не удаётся приблизиться к метке, бот останавливается вместо кружения. Не работает на серверах Arizona RP.')
 end
 
 ------------------------- Оформление ---------------------------
@@ -1064,5 +1107,7 @@ function main()
 end
 
 function onScriptTerminate(s, quit)
-    if s == thisScript() and not quit and bot.driving then clearCharTasks(PLAYER_PED) end
+    if s ~= thisScript() then return end
+    pcall(lightsPatch, false)
+    if not quit and bot.driving then clearCharTasks(PLAYER_PED) end
 end

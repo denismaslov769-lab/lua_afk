@@ -1,5 +1,5 @@
 {
-  "version": "1.0.0",
+  "version": "1.1.0",
   "url": "https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/lua_afk.lua",
-  "changelog": "Скрипт полностью переписан: стабильное автообновление без крашей, обновлённое меню."
+  "changelog": "Бот: светофоры для ИИ всегда зелёные, нет кружения у метки, точнее маршрут."
 }
