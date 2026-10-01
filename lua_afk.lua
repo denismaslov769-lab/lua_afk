@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Красные чекпоинты рейса: близкие (до 60 м) бот проезжает напрямую, даже если они не на дороге. Если ворота закрылись перед фурой - бот снова сигналит, пока не откроются.
+-- @changelog: Бот больше не сбрасывает скорость перед чекпоинтом рейса: проезжает его на ходу, без торможения.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.23')
+script_version('2.5.24')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.23'
+local SCRIPT_VERSION = '2.5.24'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1532,7 +1532,11 @@ local function botControl(car, tx, ty, tz, dist)
     end
 
     -- Подъезд к метке и к нужному повороту
-    v = math.min(v, math.sqrt(2 * decel * math.max(0, dist - num(cfg.bot.radius, 12))) + 2)
+    -- Чекпоинт рейса проезжаем на ходу - перед ним не тормозим
+    local passCp = bot.job and bot.job.phase == 'cp'
+    if not passCp then
+        v = math.min(v, math.sqrt(2 * decel * math.max(0, dist - num(cfg.bot.radius, 12))) + 2)
+    end
     if bot.turnAt then
         local cx, cy = getCarCoordinates(car)
         local jd = getDistanceBetweenCoords2d(cx, cy, bot.turnAt.x, bot.turnAt.y)
@@ -1866,12 +1870,20 @@ bot.jobApproach = function(car)
             return
         end
         local steer = clamp(math.atan2(lx, ly) / 0.6, -1, 1)
-        local vt = clamp(d * 0.3, isCp and 3.5 or 2.5, 7)
-        if math.abs(steer) > 0.7 then vt = math.min(vt, 3) end
+        local vt
+        if isCp then
+            -- чекпоинт - на ходу: скорость не зависит от расстояния до него
+            local vmax = num(cfg.bot.speed, 25)
+            vt = (vmax >= SPEED_NO_LIMIT) and 14 or math.min(vmax, 14)
+            if math.abs(steer) > 0.7 then vt = math.min(vt, 6) end
+        else
+            vt = clamp(d * 0.3, 2.5, 7)
+            if math.abs(steer) > 0.7 then vt = math.min(vt, 3) end
+        end
         local fs = senseFront(car, 10)
         if fs.fc then vt = math.min(vt, math.max(0, (fs.fc - 3) * 0.6)) end
         local gas, brake = 0, 0
-        if speed < vt then gas = 0.5 elseif speed > vt + 1 then brake = 0.6 end
+        if speed < vt then gas = isCp and 0.85 or 0.5 elseif speed > vt + 1 then brake = 0.6 end
         keys(steer, gas, brake)
         bot.status = string.format(isCp and 'Работа: еду к чекпоинту напрямую, %d м' or 'Работа: еду к воротам напрямую, %d м', math.floor(d))
         return
@@ -2687,7 +2699,8 @@ local function botThread()
                     end
                     if manual or os.clock() < bot.pauseUntil then bot.progT = os.clock() end
 
-                    if dist <= ((bot.job and bot.job.r) or num(cfg.bot.radius, 12)) or bot.atRoadEnd then
+                    local passCp = bot.job and bot.job.phase == 'cp'
+                    if not passCp and (dist <= ((bot.job and bot.job.r) or num(cfg.bot.radius, 12)) or bot.atRoadEnd) then
                         if getCarSpeed(car) > 1 then keys(0, 0, 1) else botRelease() end
                         if not bot.arrived and not bot.job then
                             msg(bot.atRoadEnd and ('Бот: приехал к ближайшей к метке точке дороги (' .. name .. ', ещё ' .. math.floor(dist) .. ' м без дороги).')
