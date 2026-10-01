@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Сцепка: издалека бот сразу сдаёт задом, если стоит примерно перед прицепом (раньше ехал вперёд и наматывал круги). Подъезд больше не кружит вокруг точки, задний ход не сбрасывается из-за небольшого смещения вдали.
+-- @changelog: Сцепка: бот больше не уезжает вперёд у самого прицепа из-за небольшого смещения или угла - цепляет с запасом, поправка вперёд только при явном промахе.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.3.4')
+script_version('2.3.5')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.3.4'
+local SCRIPT_VERSION = '2.3.5'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1172,7 +1172,8 @@ local function hitchControl(car)
     -- Рядом и ровно - цепляем
     -- Рядом и ровно - цепляем (с запасом: точки седла и шкворня у моделей примерные)
     local stuck = hitch.phase == 'reverse' and speed < 0.3 and now - (hitch.st.moved or now) > 0.7
-    if ((dHK < 2.6 and math.abs(e) < 1.3) or (dHK < 4 and stuck)) and headErr < 22 then
+    -- attachTrailerToCab цепляет принудительно, так что точность до сантиметра не нужна
+    if ((dHK < 3.2 and math.abs(e) < 1.8) or (dHK < 4.5 and stuck)) and headErr < 25 then
         keys(0, 0, (speed > 0.5) and 0.4 or 0)
         if speed < 0.6 then
             attachTrailerToCab(tr, car)
@@ -1267,14 +1268,16 @@ local function hitchControl(car)
     hitch.status = string.format('Сцепка: сдаю назад, %.1f м', dHK)
     if speed > 0.4 then hitch.st.moved = now end
     hitch.st.moved = hitch.st.moved or now
-    if along < -1.5 or (along > 6 and (math.abs(e) > eTol + 1 or headErr > 45)) then
+    if along < -3 or (along > 6 and (math.abs(e) > eTol + 1 or headErr > 45)) then
         hitch.tries = hitch.tries + 1
         if hitch.tries > 5 then return hitchStop('Бот: не получилось ровно подъехать к прицепу.') end
         hitch.phase, hitch.st = 'approach', {}
         return
     end
-    -- Близко, но сбоку - короткая поправка вперёд вместо полного захода
-    if along < 6 and (math.abs(e) > 0.9 or headErr > 12) then
+    -- Совсем близко и явно мимо - короткая поправка вперёд вместо полного захода.
+    -- (Раньше срабатывало уже при 0.9 м / 12 градусах, а регулятор сам держит угол
+    -- до 13+ градусов на подходе - и бот дёргался вперёд прямо у прицепа.)
+    if along < 4 and (math.abs(e) > 1.8 or headErr > 25) then
         hitch.tries = hitch.tries + 1
         if hitch.tries > 8 then return hitchStop('Бот: не получилось ровно подъехать к прицепу.') end
         hitch.phase, hitch.st = 'pull', {}
@@ -1286,7 +1289,9 @@ local function hitchControl(car)
     -- влево (e > 0), нос должен смотреть вправо: нужный угол psiD = atan(e / дистанция).
     -- Задним ходом руль вправо поворачивает нос влево, поэтому руль = (psi - psiD).
     local psi = math.deg(math.atan2(fx * tfy - fy * tfx, fx * tfx + fy * tfy))
-    local psiD = clamp(math.deg(math.atan2(e, math.max(3, along * 0.7))), -30, 30)
+    -- у самого прицепа нужный угол сужается, чтобы подъехать почти ровно
+    local psiMax = math.min(30, 6 + math.max(0, along) * 2.5)
+    local psiD = clamp(math.deg(math.atan2(e, math.max(3, along * 0.7))), -psiMax, psiMax)
     local steer = clamp((psi - psiD) / 12, -1, 1)
     -- далеко - быстрее, у самого прицепа - аккуратно
     local v = (dHK > 10) and 4.0 or (dHK > 5) and 2.6 or (dHK > 2.5) and 1.6 or 1.0
