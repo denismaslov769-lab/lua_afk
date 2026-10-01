@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Бот: разворот к метке. Если метка сзади или сбоку, бот сдаёт назад с поворотом и едет прямо к ней, упёрся в препятствие - аккуратно отъезжает назад.
+-- @changelog: Бот: разворот сначала вперёд, если есть место, назад - только когда тесно; видит стену вплотную и не упирается в неё; заранее замечает нужный поворот на перекрёстке и сбрасывает скорость.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('1.5.0')
+script_version('1.5.1')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '1.5.0'
+local SCRIPT_VERSION = '1.5.1'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/lua_afk.lua'
 local TAG = '{33AAFF}[lua_afk]{FFFFFF} '
 
@@ -646,7 +646,7 @@ local function botStop()
         keys(0, false, false, false)
         bot.driving, bot.wx, bot.wy, bot.vt = false, nil, nil, nil
     end
-    bot.man = nil
+    bot.man, bot.turnAt = nil, nil
 end
 
 -- Векторы машины: вперёд (fx, fy) и вправо (rx, ry)
@@ -700,16 +700,55 @@ local function rayBack(car, len)
     return best
 end
 
--- Разворот к метке: 'back' - задний ход с выкрученным в обратную сторону рулём (нос
--- поворачивается к метке), 'fwd' - вперёд с полным рулём к метке. Чередуются, пока нос
--- не смотрит на метку. Возвращает true, пока манёвр идёт (обычное управление пропускается).
+-- Луч от центра машины под углом deg к курсу (> 0 вправо, 180 - назад). Только здания и объекты
+-- (свою машину не задевает). Возвращает расстояние от центра или nil.
+local function dirRay(car, deg, len)
+    local r = math.rad(deg)
+    local x1, y1, z1 = getOffsetFromCarInWorldCoords(car, 0, 0, 0.3)
+    local x2, y2, z2 = getOffsetFromCarInWorldCoords(car, math.sin(r) * len, math.cos(r) * len, 0.3)
+    local hit, cp = processLineOfSight(x1, y1, z1, x2, y2, z2, true, false, false, true, false, false, false, false)
+    if not hit or not cp or not cp.pos then return nil end
+    if cp.normal and cp.normal[3] and cp.normal[3] > 0.7 then return nil end
+    return getDistanceBetweenCoords3d(x1, y1, z1, cp.pos[1], cp.pos[2], cp.pos[3])
+end
+
+local function carSize(car)
+    local minX, minY, _, maxX, maxY = getModelDimensions(getCarModel(car))
+    return math.abs(minY or -3), maxY or 3, maxX or 1.2
+end
+
+-- Есть ли место проехать вперёд с поворотом в сторону dir (margin - запас перед бампером, м)
+local function frontFree(car, dir, margin)
+    local _, front, w = carSize(car)
+    for _, a in ipairs({ 0, 25, 50, 80 }) do
+        local need = (a >= 80) and (w + margin * 0.6) or (front + margin)
+        local d = dirRay(car, a * dir, need + 0.5)
+        if d and d < need then return false end
+    end
+    local c = ray(car, 0, margin)            -- машины и прочее прямо перед бампером
+    return not (c and c < margin)
+end
+
+-- Есть ли место сдать назад (нос уходит в сторону dir, значит зад - в противоположную)
+local function rearFree(car, dir, margin)
+    local back = carSize(car)
+    for _, a in ipairs({ 180, 180 + 30 * dir, 180 + 55 * dir }) do
+        local d = dirRay(car, a, back + margin + 0.5)
+        if d and d < back + margin then return false end
+    end
+    local r = rayBack(car, margin)
+    return not (r and r < margin)
+end
+
+-- Разворот к метке. Сначала пробует развернуться вперёд (если перед машиной есть место),
+-- иначе сдаёт назад с рулём в обратную сторону. Чередует фазы, пока нос не смотрит на метку.
+-- Упор (газ есть, а машина стоит) тоже переключает фазу. true - манёвр идёт.
 local function maneuver(car, tx, ty, dist, frontGap)
     local now = os.clock()
     local speed = getCarSpeed(car)
     local lx, ly = toLocal(car, tx, ty)
     local ang = math.deg(math.atan2(lx, ly))   -- угол на метку: > 0 справа, |180| - сзади
     local a = math.abs(ang)
-    local dir = ang >= 0 and 1 or -1
 
     if not bot.man then
         if cfg.bot.turn == false or now < (bot.manCooldown or 0) then return false end
@@ -717,39 +756,46 @@ local function maneuver(car, tx, ty, dist, frontGap)
         local side    = a > 65 and dist < 60 and speed < 6
         local blocked = frontGap and frontGap < 6 and a > 30 and speed < 2 and dist < 100
         if not (behind or side or blocked) then return false end
-        -- Впереди свободно и метка не сзади - разворачиваемся сразу вперёд, иначе сначала назад
-        local first = (not blocked and a < 110 and (not frontGap or frontGap > 10)) and 'fwd' or 'back'
-        bot.man = { phase = first, since = now, start = now, n = 0 }
+        local dir = ang >= 0 and 1 or -1
+        bot.man = { dir = dir, since = now, start = now, n = 0,
+                    phase = frontFree(car, dir, 4) and 'fwd' or 'back' }
     end
     local m = bot.man
+    local dir = m.dir
 
-    -- Готово: нос смотрит на метку
-    if a < 25 or now - m.start > 25 or m.n > 8 then
+    if a < 25 or now - m.start > 30 or m.n > 10 then
         bot.man = nil
         bot.manCooldown = now + ((a < 25) and 1.5 or 6)
         bot.wx, bot.nextPlan = nil, 0
         return false
     end
 
-    if m.phase == 'back' then
-        local rear = rayBack(car, 6)
-        local done = a < 55 or (rear and rear < 1.5) or now - m.since > 4
-        if done and now - m.since > 0.6 then
-            m.phase, m.since, m.n = 'fwd', now, m.n + 1
-        else
-            -- Сзади что-то близко - сдаём совсем медленно
-            local vmax = (rear and rear < 4) and 2 or 4.5
-            keys(-dir, false, (speed < vmax) and 0.6 or 0, false)
-            bot.status = string.format('Разворот: назад, %d м', math.floor(dist))
-            return true
-        end
+    -- Упор: педаль нажата, а машина не едет
+    local pushing = speed < 0.4 and now - m.since > 0.8
+    if pushing then m.stall = m.stall or now else m.stall = nil end
+    local stalled = m.stall and now - m.stall > 0.6
+
+    local function switch(ph)
+        m.phase, m.since, m.n, m.stall = ph, now, m.n + 1, nil
+        keys(0, false, false, false)
     end
 
-    -- Вперёд с полным рулём к метке
-    local blocked = frontGap and frontGap < 2.5
-    if blocked and now - m.since > 0.6 then
-        m.phase, m.since, m.n = 'back', now, m.n + 1
-        keys(0, false, false, false)
+    if m.phase == 'back' then
+        local free = rearFree(car, dir, 1.2)
+        if now - m.since > 0.6 and (not free or stalled or now - m.since > 4
+            or (a < 60) or (now - m.since > 1.2 and frontFree(car, dir, 3))) then
+            switch('fwd')
+            return true
+        end
+        local slow = not rearFree(car, dir, 3.5)
+        keys(-dir, false, (speed < (slow and 2 or 4.5)) and 0.6 or 0, false)
+        bot.status = string.format('Разворот: назад, %d м', math.floor(dist))
+        return true
+    end
+
+    -- Вперёд с полным рулём к метке; места нет или упёрлись - назад
+    if now - m.since > 0.5 and (not frontFree(car, dir, 1.3) or stalled) then
+        switch('back')
         return true
     end
     keys(dir, (speed < 5) and 0.5 or 0, false, false)
@@ -757,31 +803,67 @@ local function maneuver(car, tx, ty, dist, frontGap)
     return true
 end
 
--- Выбор следующей точки: дорожные узлы впереди (прямо и под углами),
--- до которых есть прямой проезд, ближе всего к цели
-local ANGLES = { 0, 20, -20, 45, -45, 75, -75 }
+-- Выбор следующей точки: дорожные узлы впереди (прямо и под углами), до которых есть
+-- прямой проезд. От узлов прямо по курсу смотрим ещё на шаг вперёд (повороты на перекрёстке),
+-- чтобы заранее увидеть нужный поворот и сбросить скорость.
+local ANGLES = { 0, 20, -20, 45, -45, 75, -75, 90, -90 }
+local AHEAD  = { 0, 45, -45, 70, -70, 90, -90 }
+local function nodeNear(sx, sy, z, R)
+    local nx, ny, nz = getClosestCarNode(sx, sy, z)
+    if nx and (nx ~= 0 or ny ~= 0) and getDistanceBetweenCoords2d(nx, ny, sx, sy) < R * 0.6 then
+        return nx, ny, nz or z
+    end
+end
 local function planWaypoint(car, tx, ty, tz)
     local cx, cy, cz = getCarCoordinates(car)
     local fx, fy, rx, ry = carBasis(car)
     local R = math.max(12, math.min(30, 10 + getCarSpeed(car) * 0.8))
-    local bestScore, bx, by
+    local bestScore, bx, by, turn
     for _, a in ipairs(ANGLES) do
         local ar = math.rad(a)
         local dx = fx * math.cos(ar) + rx * math.sin(ar)
         local dy = fy * math.cos(ar) + ry * math.sin(ar)
-        local sx, sy = cx + dx * R, cy + dy * R
-        local nx, ny, nz = getClosestCarNode(sx, sy, cz)
-        if nx and (nx ~= 0 or ny ~= 0) and getDistanceBetweenCoords2d(nx, ny, sx, sy) < R * 0.6 then
+        local Ra = (math.abs(a) >= 75) and R * 0.7 or R
+        local nx, ny, nz = nodeNear(cx + dx * Ra, cy + dy * Ra, cz, Ra)
+        if nx then
             local _, ly = toLocal(car, nx, ny)
-            if ly > 4 and clearLine(cx, cy, cz + 0.6, nx, ny, (nz or cz) + 0.6) then
-                local score = getDistanceBetweenCoords2d(nx, ny, tx, ty) + math.abs(a) * 0.35
-                if not bestScore or score < bestScore then bestScore, bx, by = score, nx, ny end
+            if ly > 3 and clearLine(cx, cy, cz + 0.6, nx, ny, nz + 0.6) then
+                local score = getDistanceBetweenCoords2d(nx, ny, tx, ty)
+                local t = nil
+                if math.abs(a) <= 20 then
+                    -- Шаг вперёд от этого узла
+                    local hx, hy = nx - cx, ny - cy
+                    local hl = math.sqrt(hx * hx + hy * hy)
+                    if hl > 1 then
+                        hx, hy = hx / hl, hy / hl
+                        local straight = score
+                        for _, b in ipairs(AHEAD) do
+                            local br = math.rad(b)
+                            local ex = hx * math.cos(br) + hy * math.sin(br)
+                            local ey = hy * math.cos(br) - hx * math.sin(br)
+                            local mx, my, mz = nodeNear(nx + ex * 18, ny + ey * 18, nz, 18)
+                            if mx and getDistanceBetweenCoords2d(mx, my, nx, ny) > 6
+                                and clearLine(nx, ny, nz + 0.6, mx, my, mz + 0.6) then
+                                local s2 = getDistanceBetweenCoords2d(mx, my, tx, ty) + math.abs(b) * 0.05
+                                if b == 0 then straight = math.min(straight, s2) end
+                                if s2 < score then score = s2; t = (math.abs(b) >= 45) and b or nil end
+                            end
+                        end
+                        if t and straight - score < 8 then t = nil end -- поворот почти не выгоднее прямой
+                    end
+                end
+                score = score + math.abs(a) * 0.35
+                if not bestScore or score < bestScore then
+                    bestScore, bx, by = score, nx, ny
+                    turn = t and { x = nx, y = ny } or nil
+                end
             end
         end
     end
+    bot.turnAt = turn
     -- Цель рядом и к ней прямой проезд - едем прямо к ней
     local dist = getDistanceBetweenCoords2d(cx, cy, tx, ty)
-    if dist < 45 and clearLine(cx, cy, cz + 0.6, tx, ty, tz + 0.6) then return tx, ty, true end
+    if dist < 45 and clearLine(cx, cy, cz + 0.6, tx, ty, tz + 0.6) then bot.turnAt = nil; return tx, ty, true end
     return bx, by, false
 end
 
@@ -799,7 +881,11 @@ local function botControl(car, tx, ty, tz, dist)
     end
 
     -- Метка сзади / сбоку или упёрлись в препятствие - разворот к метке
-    if maneuver(car, tx, ty, dist, ray(car, 0, 12)) then
+    local _, fr = carSize(car)
+    local fg = ray(car, 0, 12)
+    local fc = dirRay(car, 0, fr + 12)
+    if fc then fg = math.min(fg or 999, math.max(0, fc - fr)) end
+    if maneuver(car, tx, ty, dist, fg) then
         bot.vt, bot.stuckSince = 0, nil
         return
     end
@@ -845,11 +931,22 @@ local function botControl(car, tx, ty, tz, dist)
     local left = dist - (tonumber(cfg.bot.radius) or 12)
     v = math.min(v, math.sqrt(2 * decel * math.max(0, left)) + 2)
 
+    -- Впереди нужный поворот на перекрёстке: заранее сбрасываем скорость
+    if bot.turnAt then
+        local cx, cy = getCarCoordinates(car)
+        local jd = getDistanceBetweenCoords2d(cx, cy, bot.turnAt.x, bot.turnAt.y)
+        v = math.min(v, math.sqrt(2 * decel * math.max(0, jd - 4)) + (careful and 6 or 8))
+    end
+
     -- Препятствия. Луч длиной с тормозной путь. Центр тормозит по-настоящему,
     -- боковые лучи только немного сбавляют и подруливают.
     local stopGap = careful and 5 or 3.5
     local len = math.min(60, 6 + speed * speed / (2 * decel) + speed * 0.3)
     local l, c, r = ray(car, -1, len), ray(car, 0, len), ray(car, 1, len)
+    -- Стена вплотную к бамперу (луч от бампера её не видит) - проверяем от центра машины
+    local _, front = carSize(car)
+    local cc = dirRay(car, 0, front + 3)
+    if cc then c = math.min(c or 999, math.max(0, cc - front)) end
     local danger = false
     if c then
         v = math.min(v, math.sqrt(2 * decel * math.max(0, c - stopGap)))
