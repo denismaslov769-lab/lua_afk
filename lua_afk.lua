@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Диагностика вылета при открытом меню: подробные записи в moonloader.log.
+-- @changelog: Найден и исправлен вылет игры после спавна: проверка обновлений запускала загрузку из завершающегося потока. Теперь все загрузки идут из одного постоянного потока.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.0.2')
+script_version('2.0.3')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.0.2'
+local SCRIPT_VERSION = '2.0.3'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -137,32 +137,50 @@ end
 -- а в отдельном потоке после её завершения (иначе MoonLoader может уронить игру).
 --==============================================================
 local TMP_DIR = getWorkingDirectory() .. '\\config'
-local net = { busy = false }
+
+-- ВАЖНО: downloadUrlToFile вызывается только из ОДНОГО постоянного потока, который
+-- всё время живёт и ждёт в wait(). MoonLoader возвращает колбэк загрузки в тот поток,
+-- откуда её запустили. Если поток уже завершился или в этот момент работает другой
+-- код - "cannot resume non-suspended coroutine" и вылет игры (так было в 1.5.3-2.0.2:
+-- вторая загрузка запускалась из короткоживущего потока сразу после спавна).
+local net = { queue = {}, busy = false }
 
 local function download(url, path, onProgress, onDone)
-    if net.busy then return false end
-    net.busy = true
-    if not doesDirectoryExist(TMP_DIR) then createDirectory(TMP_DIR) end
-    os.remove(path)
-    local finished = false
-    downloadUrlToFile(url, path, function(id, status, p1, p2)
-        if status == dlstatus.STATUS_DOWNLOADINGDATA then
-            if onProgress and p2 and p2 > 0 then onProgress(p1 / p2) end
-        elseif status == dlstatus.STATUS_ENDDOWNLOADDATA then
-            finished = true
-        end
-    end)
-    lua_thread.create(function()
-        local t = os.time()
-        while not finished and os.time() - t < 30 do wait(50) end
-        wait(300)
-        local data = readFile(path)
-        os.remove(path)
-        net.busy = false
-        if data == '' then data = nil end
-        onDone(data)
-    end)
+    net.queue[#net.queue + 1] = { url = url, path = path, onProgress = onProgress, onDone = onDone }
     return true
+end
+
+local function netThread()
+    while true do
+        wait(50)
+        local job = table.remove(net.queue, 1)
+        if job then
+            net.busy = true
+            if not doesDirectoryExist(TMP_DIR) then createDirectory(TMP_DIR) end
+            os.remove(job.path)
+            local state = { finished = false, progress = nil }
+            downloadUrlToFile(job.url, job.path, function(id, status, p1, p2)
+                -- только запоминаем, никакого другого кода в колбэке
+                if status == dlstatus.STATUS_DOWNLOADINGDATA then
+                    if p2 and p2 > 0 then state.progress = p1 / p2 end
+                elseif status == dlstatus.STATUS_ENDDOWNLOADDATA then
+                    state.finished = true
+                end
+            end)
+            local t = os.clock()
+            while not state.finished and os.clock() - t < 30 do
+                wait(50)
+                if job.onProgress and state.progress then job.onProgress(state.progress) end
+            end
+            wait(500)
+            local data = readFile(job.path)
+            os.remove(job.path)
+            net.busy = false
+            if data == '' then data = nil end
+            local ok, err = pcall(job.onDone, data)
+            if not ok then log('[update] ошибка: ' .. tostring(err)) end
+        end
+    end
 end
 
 --==============================================================
@@ -208,19 +226,20 @@ local function checkUpdates(manual, periodic)
         end
     end
 
-    local started = download(API_COMMIT .. '?t=' .. os.time(), TMP_SHA, nil, function(info)
+    if net.busy or #net.queue > 0 then
+        if manual then msg('Загрузка уже идёт, подождите пару секунд.') end
+        return
+    end
+    download(API_COMMIT .. '?t=' .. os.time(), TMP_SHA, nil, function(info)
         local sha = info and info:match('"sha"%s*:%s*"(%x+)"')
         upd.url = sha and RAW_BY_SHA:format(sha) or (SCRIPT_URL .. '?t=' .. os.time())
-        if not download(upd.url, TMP_CHECK, nil, onScript) and manual then
-            msg('Загрузка уже идёт, подождите пару секунд.')
-        end
+        download(upd.url, TMP_CHECK, nil, onScript)   -- просто в очередь, загрузит тот же поток
     end)
-    if not started and manual then msg('Загрузка уже идёт, подождите пару секунд.') end
 end
 
 local function startDownload()
     upd.state, upd.progress, upd.shown, upd.error, upd.newCode = 'downloading', 0.0, 0.0, nil, nil
-    local started = download(upd.url or (SCRIPT_URL .. '?t=' .. os.time()), TMP_SCRIPT,
+    download(upd.url or (SCRIPT_URL .. '?t=' .. os.time()), TMP_SCRIPT,
         function(f) upd.progress = math.min(f, 0.99) end,
         function(data)
             if isScript(data) then
@@ -229,7 +248,6 @@ local function startDownload()
                 upd.state, upd.error = 'error', 'Не удалось скачать обновление.'
             end
         end)
-    if not started then upd.state, upd.error = 'error', 'Идёт другая загрузка, нажмите Повторить.' end
 end
 
 local function installUpdate()
@@ -1433,6 +1451,7 @@ function main()
     msg('Загружен v' .. SCRIPT_VERSION .. '. Меню: /lafk')
     log('[lua_afk] v' .. SCRIPT_VERSION .. ', файл: ' .. tostring(thisScript().path))
 
+    lua_thread.create(netThread)
     lua_thread.create(autoSpawnThread)
     lua_thread.create(botThread)
     lua_thread.create(updateScheduler)
