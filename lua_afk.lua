@@ -321,15 +321,8 @@ if hasSampev then
     function sampev.onDisableRaceCheckpoint()   bot.cp = nil end
 end
 
-local arz = { t = -100, v = false }
 local function isArizona()
-    if os.clock() - arz.t < 5 then return arz.v end
-    arz.t = os.clock()
-    local ok, name = pcall(sampGetCurrentServerName)
-    if not ok or type(name) ~= 'string' then arz.v = false return false end
-    local n = ruLower(u8(name))
-    arz.v = n:find('arizona', 1, true) ~= nil or n:find('аризона', 1, true) ~= nil
-    return arz.v
+    return false
 end
 
 local function botTarget()
@@ -2073,7 +2066,7 @@ local function botThread()
                 T.dist = nil
             end
         end
-        if cfg.bot.job == true and not isArizona() then
+        if cfg.bot.job == true then
             local ok, err = pcall(bot.jobTick)
             if not ok then log('[job] ошибка: ' .. tostring(err)) end
         elseif bot.job then
@@ -2092,8 +2085,6 @@ local function botThread()
             end
         elseif cfg.bot.enabled ~= true then
             botRelease(); bot.status = 'Выключен'
-        elseif isArizona() then
-            botRelease(); bot.status = 'Недоступно на Arizona RP'
         elseif not isCharInAnyCar(PLAYER_PED) then
             botRelease(); bot.status = 'Сядьте в транспорт'
         else
@@ -3668,7 +3659,7 @@ local function drawFarmTab()
         cfg.bot.laneOff = ui.botLaneOff[0]; saveCfg(); bot.route = nil
     end
     hint('Задевает бордюр или обочину - уменьшите смещение, всё ещё заезжает на встречку - увеличьте.')
-    hint('Свой автопилот: едет по дорожным узлам игры, светофоров не видит, тормозит перед препятствиями, не срезает углы, разворачивается к метке. Скорость до упора вправо - No Limit. Не работает на Arizona RP.')
+    hint('Свой автопилот: едет по дорожным узлам игры, светофоров не видит, тормозит перед препятствиями, не срезает углы, разворачивается к метке. Скорость до упора вправо - No Limit.')
 end
 
 -- Настройки (шестерня) ---------------------------------------------------
