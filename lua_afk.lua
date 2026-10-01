@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Сцепка: бот больше не уезжает вперёд у самого прицепа из-за небольшого смещения или угла - цепляет с запасом, поправка вперёд только при явном промахе.
+-- @changelog: Сцепка: исправлено торможение у прицепа - раньше бот жал S, а на заднем ходу это газ назад, поэтому он проезжал шкворень и не цеплял. Теперь тормозит газом вперёд и цепляет сразу.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.3.5')
+script_version('2.3.6')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.3.5'
+local SCRIPT_VERSION = '2.3.6'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1174,10 +1174,17 @@ local function hitchControl(car)
     local stuck = hitch.phase == 'reverse' and speed < 0.3 and now - (hitch.st.moved or now) > 0.7
     -- attachTrailerToCab цепляет принудительно, так что точность до сантиметра не нужна
     if ((dHK < 3.2 and math.abs(e) < 1.8) or (dHK < 4.5 and stuck)) and headErr < 25 then
-        keys(0, 0, (speed > 0.5) and 0.4 or 0)
-        if speed < 0.6 then
+        -- Тормозим против хода: на заднем ходу S - это газ назад, поэтому жмём W.
+        local vx, vy = getCarSpeedVector(car)
+        local vf = vx * fx + vy * fy                          -- < 0 - едем назад
+        if vf < -0.3 then keys(0, 0.6, 0)
+        elseif vf > 0.3 then keys(0, 0, 0.6)
+        else keys(0, 0, 0) end
+        -- цепляем сразу, не дожидаясь полной остановки (у шкворня скорость и так ~1-2)
+        if speed < 3 then
             attachTrailerToCab(tr, car)
             hitch.status = 'Сцепка: цепляю'
+            log(string.format('[hitch] цепляю: до шкворня %.1f, вбок %.2f, курс %.0f, скорость %.1f', dHK, e, headErr, speed))
         end
         return
     end
