@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Бот: разворот сначала вперёд, если есть место, назад - только когда тесно; видит стену вплотную и не упирается в неё; заранее замечает нужный поворот на перекрёстке и сбрасывает скорость.
+-- @changelog: Бот: разворот доводится до конца - назад сдаёт до упора или пока нос не смотрит на метку, вперёд едет до препятствия; видит низкие препятствия (бордюры, заборы); больше попыток на тесный разворот.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('1.5.1')
+script_version('1.5.2')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '1.5.1'
+local SCRIPT_VERSION = '1.5.2'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/lua_afk.lua'
 local TAG = '{33AAFF}[lua_afk]{FFFFFF} '
 
@@ -704,12 +704,17 @@ end
 -- (свою машину не задевает). Возвращает расстояние от центра или nil.
 local function dirRay(car, deg, len)
     local r = math.rad(deg)
-    local x1, y1, z1 = getOffsetFromCarInWorldCoords(car, 0, 0, 0.3)
-    local x2, y2, z2 = getOffsetFromCarInWorldCoords(car, math.sin(r) * len, math.cos(r) * len, 0.3)
-    local hit, cp = processLineOfSight(x1, y1, z1, x2, y2, z2, true, false, false, true, false, false, false, false)
-    if not hit or not cp or not cp.pos then return nil end
-    if cp.normal and cp.normal[3] and cp.normal[3] > 0.7 then return nil end
-    return getDistanceBetweenCoords3d(x1, y1, z1, cp.pos[1], cp.pos[2], cp.pos[3])
+    local best
+    for _, h in ipairs({ -0.35, 0.4 }) do              -- низкие (бордюры, заборы) и высокие препятствия
+        local x1, y1, z1 = getOffsetFromCarInWorldCoords(car, 0, 0, h)
+        local x2, y2, z2 = getOffsetFromCarInWorldCoords(car, math.sin(r) * len, math.cos(r) * len, h)
+        local hit, cp = processLineOfSight(x1, y1, z1, x2, y2, z2, true, false, false, true, false, false, false, false)
+        if hit and cp and cp.pos and not (cp.normal and cp.normal[3] and cp.normal[3] > 0.7) then
+            local d = getDistanceBetweenCoords2d(x1, y1, cp.pos[1], cp.pos[2])
+            if not best or d < best then best = d end
+        end
+    end
+    return best
 end
 
 local function carSize(car)
@@ -763,7 +768,7 @@ local function maneuver(car, tx, ty, dist, frontGap)
     local m = bot.man
     local dir = m.dir
 
-    if a < 25 or now - m.start > 30 or m.n > 10 then
+    if a < 25 or now - m.start > 45 or m.n > 16 then
         bot.man = nil
         bot.manCooldown = now + ((a < 25) and 1.5 or 6)
         bot.wx, bot.nextPlan = nil, 0
@@ -781,9 +786,9 @@ local function maneuver(car, tx, ty, dist, frontGap)
     end
 
     if m.phase == 'back' then
-        local free = rearFree(car, dir, 1.2)
-        if now - m.since > 0.6 and (not free or stalled or now - m.since > 4
-            or (a < 60) or (now - m.since > 1.2 and frontFree(car, dir, 3))) then
+        -- Сдаём назад, пока зад не упрётся или нос не повернётся к метке
+        local free = rearFree(car, dir, 0.9)
+        if now - m.since > 0.6 and (not free or stalled or now - m.since > 6 or a < 30) then
             switch('fwd')
             return true
         end
@@ -794,7 +799,7 @@ local function maneuver(car, tx, ty, dist, frontGap)
     end
 
     -- Вперёд с полным рулём к метке; места нет или упёрлись - назад
-    if now - m.since > 0.5 and (not frontFree(car, dir, 1.3) or stalled) then
+    if now - m.since > 0.5 and (not frontFree(car, dir, 0.9) or stalled) then
         switch('back')
         return true
     end
@@ -886,7 +891,7 @@ local function botControl(car, tx, ty, tz, dist)
     local fc = dirRay(car, 0, fr + 12)
     if fc then fg = math.min(fg or 999, math.max(0, fc - fr)) end
     if maneuver(car, tx, ty, dist, fg) then
-        bot.vt, bot.stuckSince = 0, nil
+        bot.vt, bot.stuckSince, bot.bestTime = 0, nil, now
         return
     end
 
