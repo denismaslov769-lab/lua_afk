@@ -4,7 +4,7 @@
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('0.5.2')
+script_version('0.6.0')
 script_description('Скрипт для Arizona RP: меню, авто спавн, автообновление')
 
 local imgui    = require('mimgui')
@@ -12,12 +12,13 @@ local encoding = require('encoding')
 local dlstatus = require('moonloader').download_status
 local inicfg   = require('inicfg')
 local ffi      = require('ffi')
+local hasSampev, sampev = pcall(require, 'lib.samp.events')
 
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
 -- ===================== Настройки =====================
-local SCRIPT_VERSION = '0.5.2'
+local SCRIPT_VERSION = '0.6.0'
 local REPO_RAW    = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/'
 local VERSION_URL = REPO_RAW .. 'version.json'
 local SCRIPT_URL  = REPO_RAW .. 'lua_afk.lua'
@@ -127,41 +128,66 @@ local function fetch(url, path, cb)
     end)
 end
 
-local function checkUpdates(manual)
+-- Пробует адреса по очереди, пока один не ответит
+local function fetchFirst(urls, path, cb, n)
+    n = n or 1
+    if not urls[n] then cb(nil, nil) return end
+    fetch(urls[n] .. '?t=' .. os.time(), path, function(data)
+        if data then cb(data, urls[n]) else fetchFirst(urls, path, cb, n + 1) end
+    end)
+end
+
+-- manual   - ручная проверка (/lafkupd): подробные сообщения
+-- periodic - фоновая проверка: не показывать окно повторно, если эту версию уже отменили
+local function checkUpdates(manual, periodic)
+    if upd.state ~= 'idle' and upd.state ~= 'error' then return end
     if not doesDirectoryExist(TMP_DIR) then createDirectory(TMP_DIR) end
     ulog('Проверка обновлений...', manual)
 
     fetch(API_COMMIT .. '?t=' .. os.time(), TMP_COMMIT, function(cdata)
-        local base = REPO_RAW
+        local urls = {}
         local ok, commit = pcall(decodeJson, cdata or '')
         if ok and type(commit) == 'table' and type(commit.sha) == 'string' then
-            base = RAW_BY_SHA .. commit.sha .. '/'
+            urls[#urls + 1] = RAW_BY_SHA .. commit.sha .. '/'
+            urls[#urls + 1] = 'https://cdn.jsdelivr.net/gh/denismaslov769-lab/lua_afk@' .. commit.sha .. '/'
         else
-            ulog('GitHub API не ответил, проверяю напрямую.', manual)
+            ulog('GitHub API не ответил, пробую другие адреса.', manual)
         end
+        urls[#urls + 1] = REPO_RAW
 
-        fetch(base .. 'version.json?t=' .. os.time(), TMP_VERSION, function(data)
+        local vurls = {}
+        for k, u in ipairs(urls) do vurls[k] = u .. 'version.json' end
+        fetchFirst(vurls, TMP_VERSION, function(data, from)
             if not data then
-                ulog('Ошибка: version.json не скачался (нет доступа к GitHub?).', manual)
+                ulog('Ошибка: не удалось скачать version.json ни с одного адреса.', true)
                 return
             end
             local ok2, info = pcall(decodeJson, data)
             if not ok2 or type(info) ~= 'table' or not info.version then
-                ulog('Ошибка: не удалось прочитать version.json.', manual)
+                ulog('Ошибка: не удалось прочитать version.json.', true)
                 return
             end
+            local base = from:gsub('version%.json$', '')
             ulog('На GitHub версия ' .. tostring(info.version) .. ', у вас ' .. SCRIPT_VERSION .. '.', manual)
             if isNewer(info.version, SCRIPT_VERSION) then
-                upd.latest    = tostring(info.version)
+                local v = tostring(info.version)
+                if periodic and upd.dismissed == v then return end
+                upd.latest    = v
                 upd.changelog = info.changelog
                 upd.url       = base .. 'lua_afk.lua'
                 upd.state     = 'prompt'
                 upd.window[0] = true
+                msg('Доступно обновление ' .. v .. '!')
             elseif manual then
                 msg('У вас последняя версия.')
             end
         end)
     end)
+end
+
+-- Новый вход на сервер (в т.ч. реконнект) - проверить обновления заново
+if hasSampev then
+    function sampev.onInitGame() upd.joined = true end
 end
 
 local function startDownload()
@@ -349,7 +375,7 @@ imgui.OnFrame(
             end
             imgui.SameLine()
             if grayButton('Отмена', imgui.ImVec2(half, 34)) then
-                upd.window[0], upd.state = false, 'idle'
+                upd.window[0], upd.state, upd.dismissed = false, 'idle', upd.latest
                 msg('Обновление отменено. Работаем на версии ' .. SCRIPT_VERSION .. '.')
             end
 
@@ -573,7 +599,6 @@ local bot = { status = 'Выключен', driving = false, cp = nil, tx = nil, 
               lastTask = 0, stuckSince = nil, pauseUntil = 0, arrived = false }
 
 -- Чекпоинты сервера (красные метки) - нужна библиотека SAMP.Lua (lib/samp/events)
-local hasSampev, sampev = pcall(require, 'lib.samp.events')
 if hasSampev then
     function sampev.onSetCheckpoint(pos, radius)      bot.cp = { pos.x, pos.y, pos.z } end
     function sampev.onDisableCheckpoint()             bot.cp = nil end
@@ -616,6 +641,25 @@ local function botStyle() return (tonumber(cfg.bot.style) or 0) == 1 and 4 or 2 
 local function botEnforce(car)
     setCarDrivingStyle(car, botStyle())
     setCarCruiseSpeed(car, tonumber(cfg.bot.speed) or 25)
+end
+
+-- Свободна ли дорога прямо перед машиной (лучом от переднего бампера)
+local function roadAheadClear(car, len)
+    local _, _, _, _, maxY = getModelDimensions(getCarModel(car))
+    local x1, y1, z1 = getOffsetFromCarInWorldCoords(car, 0, (maxY or 3) + 0.6, 0.4)
+    local x2, y2, z2 = getOffsetFromCarInWorldCoords(car, 0, (maxY or 3) + 0.6 + len, 0.4)
+    local hit = processLineOfSight(x1, y1, z1, x2, y2, z2, true, true, true, true, false, false, false, false)
+    return not hit
+end
+
+-- Защита от светофоров: если машина почти встала, а впереди пусто,
+-- ее принудительно толкают вперед. Так бот не стоит на красном ни при каком маршруте.
+local function lightBreaker(car)
+    if getCarSpeed(car) < 4.0 and roadAheadClear(car, 12) then
+        setCarForwardSpeed(car, math.min(tonumber(cfg.bot.speed) or 25, 12))
+        return true
+    end
+    return false
 end
 
 local function botDrive(car, x, y, z)
@@ -671,6 +715,9 @@ local function botThread()
                             bot.stuckSince = nil
                         else
                             botEnforce(car)
+                            if os.clock() - bot.lastTask > 1.0 and lightBreaker(car) then
+                                bot.stuckSince = nil
+                            end
                         end
                         bot.status = string.format('Едет: %s, %d м', name, math.floor(dist))
                     end
@@ -1051,11 +1098,26 @@ function main()
     end)
 
     -- Проверяем обновления после входа на сервер (когда персонаж заспавнился)
+    -- Автопроверка: при запуске, при каждом входе на сервер и каждые 5 минут
     lua_thread.create(function()
-        local t = os.clock()
-        while not sampIsLocalPlayerSpawned() and os.clock() - t < 30 do wait(500) end
+        local t = os.time()
+        while not sampIsLocalPlayerSpawned() and os.time() - t < 20 do wait(500) end
         wait(1500)
         checkUpdates(false)
+        upd.joined = false
+        local last = os.time()
+        while true do
+            wait(1000)
+            if upd.joined then
+                upd.joined = false
+                wait(5000)
+                last = os.time()
+                checkUpdates(false)
+            elseif os.time() - last >= 300 then
+                last = os.time()
+                checkUpdates(false, true)
+            end
+        end
     end)
 
     while true do
