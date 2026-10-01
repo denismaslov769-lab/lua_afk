@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Бот дальнобойщик на собственном автопилоте: сам рулит по дорогам, не видит светофоров, объезжает и тормозит перед препятствиями.
+-- @changelog: Бот: скорость без лимита (ползунок до упора), плавный газ и торможение по ситуации вместо резких остановок.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('1.2.0')
+script_version('1.3.0')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '1.2.0'
+local SCRIPT_VERSION = '1.3.0'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/lua_afk.lua'
 local TAG = '{33AAFF}[lua_afk]{FFFFFF} '
 
@@ -623,17 +623,25 @@ end
 --------------------------------------------------------------
 local KEY_STEER, KEY_GAS, KEY_BRAKE, KEY_HANDBRAKE = 0, 16, 14, 6
 
+-- gas / brake: true/false или сила нажатия 0..1 (педали аналоговые)
+local function pedal(v)
+    if v == true then return 255 elseif not v then return 0 end
+    return math.floor(math.max(0, math.min(1, v)) * 255)
+end
+
 local function keys(steer, gas, brake, handbrake)
     setGameKeyState(KEY_STEER, math.floor(math.max(-128, math.min(128, steer * 128))))
-    setGameKeyState(KEY_GAS, gas and 255 or 0)
-    setGameKeyState(KEY_BRAKE, brake and 255 or 0)
-    setGameKeyState(KEY_HANDBRAKE, handbrake and 255 or 0)
+    setGameKeyState(KEY_GAS, pedal(gas))
+    setGameKeyState(KEY_BRAKE, pedal(brake))
+    setGameKeyState(KEY_HANDBRAKE, pedal(handbrake))
 end
+
+local SPEED_NO_LIMIT = 61 -- ползунок скорости в крайнем правом положении
 
 local function botStop()
     if bot.driving then
         keys(0, false, false, false)
-        bot.driving, bot.wx, bot.wy = false, nil, nil
+        bot.driving, bot.wx, bot.wy, bot.vt = false, nil, nil, nil
     end
 end
 
@@ -707,6 +715,7 @@ local function botControl(car, tx, ty, tz, dist)
     -- Задний ход после застревания
     if now < bot.reverseUntil then
         keys(bot.reverseSteer, false, true, false)
+        bot.vt = 0
         return
     end
 
@@ -725,27 +734,61 @@ local function botControl(car, tx, ty, tz, dist)
     local ang = math.atan2(lx, ly)                       -- > 0 вправо
     local steer = math.max(-1, math.min(1, ang / 0.5))
 
-    -- Скорость: медленнее в поворотах и у цели
-    local v = vmax * (1 - math.min(math.abs(ang) / 1.0, 0.75))
-    if careful then v = v * 0.75 end
-    v = math.min(v, (dist - (tonumber(cfg.bot.radius) or 12)) * 0.5 + 4)
+    -- Желаемая скорость = минимум из нескольких безопасных скоростей.
+    -- decel - комфортное замедление, aLat - допустимое боковое ускорение в повороте.
+    local decel = careful and 5 or 7
+    local aLat  = careful and 6 or 8
+    local v = (vmax >= SPEED_NO_LIMIT) and 999 or vmax
 
-    -- Препятствия: три луча (лево / центр / право)
-    local len = 6 + speed * (careful and 1.6 or 1.2)
+    -- Поворот: скорость по радиусу дуги до точки маршрута (на прямой ограничения нет)
+    local wd = math.max(5, math.sqrt(lx * lx + ly * ly))
+    local s = math.abs(math.sin(math.max(-1.5, math.min(1.5, ang))))
+    if s > 0.02 then v = math.min(v, math.max(6, math.sqrt(aLat * wd / (2 * s)))) end
+
+    -- Цель: плавно подъезжаем и останавливаемся в радиусе прибытия
+    local left = dist - (tonumber(cfg.bot.radius) or 12)
+    v = math.min(v, math.sqrt(2 * decel * math.max(0, left)) + 2)
+
+    -- Препятствия. Луч длиной с тормозной путь. Центр тормозит по-настоящему,
+    -- боковые лучи только немного сбавляют и подруливают.
+    local stopGap = careful and 5 or 3.5
+    local len = math.min(60, 6 + speed * speed / (2 * decel) + speed * 0.3)
     local l, c, r = ray(car, -1, len), ray(car, 0, len), ray(car, 1, len)
-    local nearest = math.min(l or 999, c or 999, r or 999)
-    if nearest < 999 then
-        v = math.min(v, math.max(0, (nearest - 3) * (careful and 0.4 or 0.6)))
-        if l and not r then steer = steer + 0.6 elseif r and not l then steer = steer - 0.6 end
-        steer = math.max(-1, math.min(1, steer))
+    local danger = false
+    if c then
+        v = math.min(v, math.sqrt(2 * decel * math.max(0, c - stopGap)))
+        danger = c < stopGap + 2
+    end
+    local side = math.min(l or 999, r or 999)
+    if side < 999 then v = math.min(v, math.sqrt(2 * decel * math.max(0, side - 1.5)) + 6) end
+    if l and not r then steer = steer + 0.5 elseif r and not l then steer = steer - 0.5 end
+    steer = math.max(-1, math.min(1, steer))
+
+    -- Сглаживание: желаемая скорость меняется плавно, кроме реальной опасности прямо по курсу
+    local dt = math.min(0.2, now - (bot.lastCtl or now))
+    bot.lastCtl = now
+    bot.vt = bot.vt or speed
+    if danger then
+        bot.vt = v
+    elseif v < bot.vt then
+        bot.vt = bot.vt + (v - bot.vt) * math.min(1, dt * 4)
+    else
+        bot.vt = bot.vt + (v - bot.vt) * math.min(1, dt * 1.5)
     end
 
-    local gas   = speed < v - 0.5
-    local brake = speed > v + 2
+    -- Педали: газ пропорционально нехватке скорости, небольшое превышение - просто отпускаем газ,
+    -- тормоз только при заметном превышении и тоже пропорционально
+    local diff = bot.vt - speed
+    local gas, brake = 0, 0
+    if diff > 0.3 then
+        gas = math.max(0.25, math.min(1, diff / 6))
+    elseif diff < -3 then
+        brake = math.max(0.15, math.min(1, (-diff - 3) / 8))
+    end
     keys(steer, gas, brake, false)
 
     -- Застряли: жмём газ, но не едем 2.5 секунды - сдаём назад
-    if gas and speed < 0.5 then
+    if gas > 0 and speed < 0.5 then
         bot.stuckSince = bot.stuckSince or now
         if now - bot.stuckSince > 2.5 then
             bot.reverseUntil, bot.reverseSteer, bot.stuckSince = now + 1.5, -steer, nil
@@ -935,7 +978,8 @@ local function drawFarmTab()
     if segmented('bot_style', ui.botStyle, { 'Обычный', 'Аккуратный' }) then
         cfg.bot.style = ui.botStyle[0]; saveCfg()
     end
-    if sliderInt('Скорость:', '##bot_speed', ui.botSpeed, 5, 60, '%d') then
+    if sliderInt('Скорость:', '##bot_speed', ui.botSpeed, 5, SPEED_NO_LIMIT,
+                 ui.botSpeed[0] >= SPEED_NO_LIMIT and 'Без лимита' or '%d') then
         cfg.bot.speed = ui.botSpeed[0]; saveCfg()
     end
     if sliderInt('Радиус прибытия:', '##bot_radius', ui.botRadius, 3, 40, '%d м') then
@@ -944,7 +988,7 @@ local function drawFarmTab()
     if toggle('##bot_take', 'W / S забирают управление', ui.botTake) then
         cfg.bot.takeover = ui.botTake[0]; saveCfg()
     end
-    hint('Собственный автопилот: едет по дорожным узлам игры, светофоров не видит, тормозит и объезжает препятствия по лучам. Аккуратный режим медленнее и раньше тормозит. Рекомендуемая скорость 15-25. Не работает на серверах Arizona RP.')
+    hint('Собственный автопилот: едет по дорожным узлам игры, светофоров не видит, тормозит и объезжает препятствия по лучам. Аккуратный режим медленнее и раньше тормозит. Ползунок скорости до упора вправо - без лимита, бот сбавляет только в поворотах, у препятствий и у метки. Не работает на серверах Arizona RP.')
 end
 
 ------------------------- Оформление ---------------------------
