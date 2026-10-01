@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Сцепка: новый регулятор заднего хода по углу и смещению относительно прицепа (раньше мог уводить мимо). Запись хода сцепки в moonloader.log для настройки.
+-- @changelog: Сцепка: издалека бот сразу сдаёт задом, если стоит примерно перед прицепом (раньше ехал вперёд и наматывал круги). Подъезд больше не кружит вокруг точки, задний ход не сбрасывается из-за небольшого смещения вдали.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.3.3')
+script_version('2.3.4')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.3.3'
+local SCRIPT_VERSION = '2.3.4'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1188,9 +1188,14 @@ local function hitchControl(car)
     local s = senseFront(car, 8)
     local reach = g.front + g.back + 14                      -- стартовая точка перед прицепом (запас на выравнивание)
     local ax, ay = kx + tfx * reach, ky + tfy * reach
+    -- Допустимое смещение вбок растёт с расстоянием: издалека задний ход сам
+    -- выведет седло на линию прицепа (конус ~20 градусов от линии).
+    local eTol = 2 + math.max(0, along) * 0.35
 
-    -- Уже стоим ровно перед прицепом - сразу задним ходом
-    if hitch.phase == 'approach' and along > 0 and along < 30 and math.abs(e) < 2 and headErr < 20 then
+    -- Стоим примерно перед прицепом и смотрим в ту же сторону - сразу задним ходом,
+    -- без подъезда вперёд, даже если до прицепа далеко
+    if (hitch.phase == 'approach' or hitch.phase == 'align') and along > 0 and along < 120
+        and math.abs(e) < eTol and headErr < 30 then
         hitch.phase, hitch.st = 'reverse', {}
     end
 
@@ -1199,11 +1204,16 @@ local function hitchControl(car)
         local da = getDistanceBetweenCoords2d(cx, cy, ax, ay)
         local lx, ly = toLocal(car, ax, ay)
         local ang = math.atan2(lx, ly)
-        if da < 4 or (da < 15 and math.abs(math.deg(ang)) > 100) then
+        local angD = math.abs(math.deg(ang))
+        -- ближайшее расстояние до точки: если начали удаляться - значит кружим, хватит
+        hitch.st.best = math.min(hitch.st.best or da, da)
+        if da < 6 or (da < 15 and angD > 60) or (da < 25 and da > hitch.st.best + 3) then
             hitch.phase, hitch.st = 'align', {}
             return
         end
         local v = math.min(8, math.sqrt(2 * 4 * math.max(0, da - 2)) + 1.5)
+        -- точка сбоку - медленнее, чтобы радиус поворота был меньше
+        if angD > 25 then v = math.min(v, 3) end
         if s.fc then v = math.min(v, math.sqrt(2 * 5 * math.max(0, s.fc - 2.5))) end
         local steer = clamp(ang / 0.5, -1, 1)
         if math.abs(math.deg(ang)) > 100 then
@@ -1257,7 +1267,7 @@ local function hitchControl(car)
     hitch.status = string.format('Сцепка: сдаю назад, %.1f м', dHK)
     if speed > 0.4 then hitch.st.moved = now end
     hitch.st.moved = hitch.st.moved or now
-    if along < -1.5 or (along > 6 and (math.abs(e) > 3 or headErr > 35)) then
+    if along < -1.5 or (along > 6 and (math.abs(e) > eTol + 1 or headErr > 45)) then
         hitch.tries = hitch.tries + 1
         if hitch.tries > 5 then return hitchStop('Бот: не получилось ровно подъехать к прицепу.') end
         hitch.phase, hitch.st = 'approach', {}
@@ -2044,3 +2054,4 @@ function onScriptTerminate(s, quit)
         pcall(deleteTrailer)
     end
 end
+
