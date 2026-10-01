@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Работа дальнобойщика (/ljob): бот сам едет на базу к надписи «Получить загруженный прицеп», цепляет прицеп, сигналит у ворот и едет по чекпоинтам, после рейса - снова на базу. Бот не разворачивается и не зацикливается, когда дорога временно уводит от метки (продвижение считается по пути по дороге). Исправлено направление односторонних дорог: бот больше не едет по встречной половине трассы. Команда /lafkdbg - показывает линию маршрута и полосу бота на экране. Правая полоса по самой дороге: бот находит правый край асфальта (бордюр, разделительная, газон) и держится своей полосы. Правая полоса: сдвиг как у машин трафика игры (крайняя правая полоса, с учётом разделительной), в поворотах не срезает угол через встречку. Повороты проходит быстрее (точнее считает радиус поворота). Своя карта дорог всего штата (из файлов игры) и свой поиск пути: бот видит маршрут до далёкой метки сразу, учитывает односторонние дороги и трассы, не мечется вперёд-назад. Бот ездит только по дорогам: убрана езда напрямую. Нет продвижения - отъезжает и ищет другой маршрут по дорогам (с разворотом и без), без слепой езды. Метка в стороне от дороги - останавливается у ближайшей точки дороги. Гифки по ссылке или коду встраивания Tenor/Giphy прямо в меню (фон и частицы). Бот больше не сдаётся: если не может приблизиться к метке, пробует другие пути (напрямую вне дорог, отъезд и новый маршрут). Метка вдали от дороги - доезжает до неё по бездорожью. Развязки и развилки: бот едет по самой линии маршрута (не срезает через отбойник), не путает эстакады, быстрее замечает, что ушёл не в ту ветку, и заранее сбрасывает скорость перед изгибами. Сцепка: мало места перед прицепом - бот подъезжает ближе и сдаёт с короткого расстояния, не крутится бесконечно (останавливается с подсказкой). Новый виджет бота во вкладке Авто фарм (дорога, скорость, расстояние, прицеп, прогресс, кнопка запуска). Частицы Arizona и Hearts. ПКМ - Убрать фон у своих частиц. Сцепка: прицеп далеко или за забором - бот едет к нему в объезд и быстрее, без качелей вперёд-назад. Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
+-- @changelog: Работа дальнобойщика без метки: бот сам едет к «Получить загруженный прицеп» (бот на фуре без метки и чекпоинта включает работу сам), запоминает место базы и ворот (едет к ним даже издалека), ждёт выбора груза в окне, цепляет только настоящий прицеп сервера той же модели, что и визуальный (не свой визуальный), и только потом едет к «Посигнальте». Работа дальнобойщика (/ljob): бот сам едет на базу к надписи «Получить загруженный прицеп», цепляет прицеп, сигналит у ворот и едет по чекпоинтам, после рейса - снова на базу. Бот не разворачивается и не зацикливается, когда дорога временно уводит от метки (продвижение считается по пути по дороге). Исправлено направление односторонних дорог: бот больше не едет по встречной половине трассы. Команда /lafkdbg - показывает линию маршрута и полосу бота на экране. Правая полоса по самой дороге: бот находит правый край асфальта (бордюр, разделительная, газон) и держится своей полосы. Правая полоса: сдвиг как у машин трафика игры (крайняя правая полоса, с учётом разделительной), в поворотах не срезает угол через встречку. Повороты проходит быстрее (точнее считает радиус поворота). Своя карта дорог всего штата (из файлов игры) и свой поиск пути: бот видит маршрут до далёкой метки сразу, учитывает односторонние дороги и трассы, не мечется вперёд-назад. Бот ездит только по дорогам: убрана езда напрямую. Нет продвижения - отъезжает и ищет другой маршрут по дорогам (с разворотом и без), без слепой езды. Метка в стороне от дороги - останавливается у ближайшей точки дороги. Гифки по ссылке или коду встраивания Tenor/Giphy прямо в меню (фон и частицы). Бот больше не сдаётся: если не может приблизиться к метке, пробует другие пути (напрямую вне дорог, отъезд и новый маршрут). Метка вдали от дороги - доезжает до неё по бездорожью. Развязки и развилки: бот едет по самой линии маршрута (не срезает через отбойник), не путает эстакады, быстрее замечает, что ушёл не в ту ветку, и заранее сбрасывает скорость перед изгибами. Сцепка: мало места перед прицепом - бот подъезжает ближе и сдаёт с короткого расстояния, не крутится бесконечно (останавливается с подсказкой). Новый виджет бота во вкладке Авто фарм (дорога, скорость, расстояние, прицеп, прогресс, кнопка запуска). Частицы Arizona и Hearts. ПКМ - Убрать фон у своих частиц. Сцепка: прицеп далеко или за забором - бот едет к нему в объезд и быстрее, без качелей вперёд-назад. Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.8')
+script_version('2.5.9')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.8'
+local SCRIPT_VERSION = '2.5.9'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -40,6 +40,8 @@ local cfg = inicfg.load({
         laneOff  = 2.5,     -- смещение от оси дороги, м
         turn     = true,    -- разворот к метке
         gps      = true,    -- маршрут по дорогам GTA (встроенный поиск пути игры)
+        jobLx = 0, jobLy = 0, jobLz = 0,   -- запомненная надпись «Получить загруженный прицеп»
+        jobGx = 0, jobGy = 0, jobGz = 0,   -- запомненная надпись «Посигнальте»
     },
     theme = {
         accent     = '#3F99FF',
@@ -325,9 +327,23 @@ local function isArizona()
     return false
 end
 
+-- Работа дальнобойщика нужна: включена (/ljob) или бот на фуре без метки и чекпоинта
+function bot.jobWanted()
+    if cfg.bot.job == true then return true end
+    if cfg.bot.enabled ~= true or not isCharInAnyCar(PLAYER_PED) then return false end
+    local car = storeCarCharIsInNoSave(PLAYER_PED)
+    if getDriverOfCar(car) ~= PLAYER_PED or not bot.TRACTORS or not bot.TRACTORS[getCarModel(car)] then return false end
+    if bot.job then
+        -- поставили метку, пока ехали на базу без прицепа - едем к метке
+        if bot.job.phase == 'label' and getTargetBlipCoordinates() then bot.job = nil return false end
+        return true
+    end
+    return not bot.cp and not getTargetBlipCoordinates()
+end
+
 local function botTarget()
     local src = num(cfg.bot.source, 0)
-    if bot.job and cfg.bot.job == true then
+    if bot.job and bot.jobWanted() then
         local J = bot.job
         if (J.phase == 'label' or J.phase == 'gate') and J.x then return J.x, J.y, J.z, J.name end
         if J.phase == 'cp' and bot.cp then return bot.cp[1], bot.cp[2], bot.cp[3], 'чекпоинт рейса' end
@@ -1530,6 +1546,7 @@ end
 --==============================================================
 local TRAILER_MODEL = 591                         -- прицеп фуры (artict3)
 local TRACTORS = { [403] = true, [514] = true, [515] = true } -- Linerunner, Tanker, Roadtrain
+bot.TRACTORS = TRACTORS
 local trailer = { handle = nil }
 local hitch = { active = false, status = '' }
 
@@ -1619,25 +1636,65 @@ bot.hookedTrailer = function(car)
     end
 end
 
--- Ближайший свободный прицеп (не прицеплен к другой фуре)
-bot.findTrailer = function(car)
+-- Надпись с запоминанием места: 3D-текст виден только рядом (стрим),
+-- поэтому координаты сохраняем в конфиг и едем к ним даже издалека.
+bot.labelPos = function(word, key)
+    local x, y, z, d = bot.findLabel(word)
+    local kx, ky, kz = 'job' .. key .. 'x', 'job' .. key .. 'y', 'job' .. key .. 'z'
+    if x then
+        local ox, oy = num(cfg.bot[kx], 0), num(cfg.bot[ky], 0)
+        if math.abs(ox - x) + math.abs(oy - y) > 3 then
+            cfg.bot[kx], cfg.bot[ky], cfg.bot[kz] = x, y, z; saveCfg()
+        end
+        return x, y, z, d, false
+    end
+    local cx, cy, cz = num(cfg.bot[kx], 0), num(cfg.bot[ky], 0), num(cfg.bot[kz], 0)
+    if cx ~= 0 or cy ~= 0 then
+        local px, py, pz = getCharCoordinates(PLAYER_PED)
+        return cx, cy, cz, getDistanceBetweenCoords3d(px, py, pz, cx, cy, cz), true
+    end
+end
+
+-- Прицеп сервера (не наш визуальный /pricep): у него есть id в SA-MP
+bot.isServerVeh = function(v)
+    local ok, res = pcall(sampGetVehicleIdByCarHandle, v)
+    return ok and res == true
+end
+
+-- Ближайший свободный настоящий прицеп той же модели, что и визуальный (TRAILER_MODEL).
+-- known - прицепы, стоявшие до выбора груза: новые (выданные нам) в приоритете.
+bot.findTrailer = function(car, known, onlyNew)
     local cx, cy, cz = getCarCoordinates(car)
-    local cabs, best, bd = {}, nil, nil
+    local cabs, best, bd, bestNew, bdNew = {}, nil, nil, nil, nil
     for _, v in ipairs(getAllVehicles()) do
         if v ~= car and doesVehicleExist(v) and TRACTORS[getCarModel(v)] then cabs[#cabs + 1] = v end
     end
     for _, v in ipairs(getAllVehicles()) do
-        if v ~= car and doesVehicleExist(v) and bot.JOBTRAILERS[getCarModel(v)] then
+        if v ~= car and doesVehicleExist(v) and getCarModel(v) == TRAILER_MODEL and bot.isServerVeh(v) then
             local x, y, z = getCarCoordinates(v)
             local d = getDistanceBetweenCoords3d(cx, cy, cz, x, y, z)
             local free = true
             for _, c in ipairs(cabs) do
                 if isTrailerAttachedToCab(v, c) then free = false break end
             end
-            if free and d < 150 and (not bd or d < bd) then best, bd = v, d end
+            if free and d < 200 then
+                if known and not known[v] then
+                    if not bdNew or d < bdNew then bestNew, bdNew = v, d end
+                elseif not bd or d < bd then best, bd = v, d end
+            end
         end
     end
+    if bestNew then return bestNew, bdNew end
+    if onlyNew then return nil end
     return best, bd
+end
+
+bot.trailerSnapshot = function()
+    local t = {}
+    for _, v in ipairs(getAllVehicles()) do
+        if doesVehicleExist(v) and getCarModel(v) == TRAILER_MODEL then t[v] = true end
+    end
+    return t
 end
 
 bot.jobTick = function()
@@ -1668,16 +1725,34 @@ bot.jobTick = function()
         if hooked then return go('gate', 'Работа: прицеп уже прицеплен, еду к воротам.') end
         if not J.scan or now > J.scan then
             J.scan = now + 1
-            local x, y, z, d = bot.findLabel('получить загруженный прицеп')
+            local x, y, z, d, cached = bot.labelPos('получить загруженный прицеп', 'L')
+            -- издалека (по запомненной точке) - ко входу на базу, рядом - точно к надписи
+            if J.x and x and getDistanceBetweenCoords2d(J.x, J.y, x, y) < 3 then x, y, z = J.x, J.y, J.z end
             J.x, J.y, J.z, J.r, J.name = x, y, z, 3.5, 'база дальнобойщика'
-            J.status = x and string.format('Работа: еду на базу, %d м', math.floor(d)) or 'Работа: не вижу базу (надпись «Получить загруженный прицеп» не рядом)'
+            J.status = x and string.format('Работа: еду на базу%s, %d м', cached and ' (запомненная точка)' or '', math.floor(d))
+                or 'Работа: не знаю, где база - подъедьте один раз к надписи «Получить загруженный прицеп», бот запомнит'
         end
-        if bot.arrived and J.x then go('take', 'Работа: на месте, жду прицеп.') end
+        if bot.arrived and J.x then
+            local _, _, _, _, cached = bot.labelPos('получить загруженный прицеп', 'L')
+            if cached then
+                -- приехали к запомненной точке, а надписи нет - она могла сдвинуться, ищем ещё
+                J.status = 'Работа: на базе, ищу надпись «Получить загруженный прицеп»'
+            else
+                go('take', 'Работа: на месте. Выберите груз - бот возьмёт выданный прицеп.')
+                J.known, J.cursorT = bot.trailerSnapshot(), nil
+            end
+        end
     elseif J.phase == 'take' then
-        J.status = sampIsDialogActive() and 'Работа: выберите груз в окне' or 'Работа: жду прицеп'
         if hooked then return go('gate', 'Работа: прицеп прицеплен, еду к воротам.') end
-        if now - J.t > 1.5 and not sampIsDialogActive() then
-            local v = bot.findTrailer(car)
+        J.known = J.known or bot.trailerSnapshot()
+        -- окно выбора груза (CEF) - с курсором; пока оно открыто, ждём
+        local menu = sampIsDialogActive() or sampIsCursorActive()
+        if menu then J.cursorT = now end
+        J.status = menu and 'Работа: выберите груз в окне' or 'Работа: жду прицеп'
+        if not menu and now - J.t > 1.5 then
+            -- сначала ждём новый (выданный) прицеп; старый ближайший - только если нового нет 10 с
+            local since = J.cursorT or J.t
+            local v = bot.findTrailer(car, J.known, now - since < 10)
             if v then
                 trailer.handle, trailer.server = v, true
                 J.tries = 0
@@ -1686,7 +1761,7 @@ bot.jobTick = function()
                 return
             end
         end
-        if now - J.t > 25 then go('label', 'Работа: прицеп не появился, пробую ещё раз.') end
+        if not menu and now - (J.cursorT or J.t) > 60 then go('label', 'Работа: прицеп не появился, пробую ещё раз.') end
     elseif J.phase == 'hitch' then
         J.status = hitch.status ~= '' and hitch.status or 'Работа: цепляю прицеп'
         if hooked then
@@ -1695,9 +1770,9 @@ bot.jobTick = function()
         end
         if not hitch.active and now - J.t > 2 then
             J.tries = (J.tries or 0) + 1
-            if J.tries > 3 then return go('take', 'Работа: не получилось прицепиться, ищу прицеп заново.') end
+            if J.tries > 3 then go('take', 'Работа: не получилось прицепиться, ищу прицеп заново.'); J.known = {}; return end
             if not trailerExists() then
-                local v = bot.findTrailer(car)
+                local v = bot.findTrailer(car, J.known)
                 if not v then return go('take') end
                 trailer.handle, trailer.server = v, true
             end
@@ -1707,9 +1782,9 @@ bot.jobTick = function()
     elseif J.phase == 'gate' then
         if not J.scan or now > J.scan then
             J.scan = now + 1
-            local x, y, z, d = bot.findLabel('посигнальте')
+            local x, y, z, d, cached = bot.labelPos('посигнальте', 'G')
             J.x, J.y, J.z, J.r, J.name = x, y, z, 9, 'ворота'
-            J.status = x and string.format('Работа: еду к воротам, %d м', math.floor(d)) or 'Работа: не вижу ворота'
+            J.status = x and string.format('Работа: еду к воротам%s, %d м', cached and ' (запомненная точка)' or '', math.floor(d)) or 'Работа: не вижу ворота «Посигнальте»'
             if not x and bot.cp then return go('cp', 'Работа: еду по чекпоинтам.') end
         end
         if bot.arrived and J.x then
@@ -2066,7 +2141,7 @@ local function botThread()
                 T.dist = nil
             end
         end
-        if cfg.bot.job == true then
+        if bot.jobWanted() then
             local ok, err = pcall(bot.jobTick)
             if not ok then log('[job] ошибка: ' .. tostring(err)) end
         elseif bot.job then
