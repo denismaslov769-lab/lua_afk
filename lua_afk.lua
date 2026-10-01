@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Сцепка: бот сдаёт к прицепу заметно быстрее (до 16 км/ч издалека), у самого прицепа по-прежнему аккуратно.
+-- @changelog: Сцепка: точнее и быстрее - ровный задний ход по линии прицепа от седла, короткая поправка вперёд вместо полного захода, сцепка с запасом по расстоянию, быстрее подъезд.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.3.1')
+script_version('2.3.2')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.3.1'
+local SCRIPT_VERSION = '2.3.2'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1170,7 +1170,9 @@ local function hitchControl(car)
     local e = (hx - kx) * tfy - (hy - ky) * tfx
 
     -- Рядом и ровно - цепляем
-    if (dHK < 1.6 or (dHK < 3 and speed < 0.3 and hitch.phase == 'reverse')) and headErr < 25 then
+    -- Рядом и ровно - цепляем (с запасом: точки седла и шкворня у моделей примерные)
+    local stuck = hitch.phase == 'reverse' and speed < 0.3 and now - (hitch.st.moved or now) > 0.7
+    if ((dHK < 2.6 and math.abs(e) < 1.3) or (dHK < 4 and stuck)) and headErr < 22 then
         keys(0, 0, (speed > 0.5) and 0.4 or 0)
         if speed < 0.6 then
             attachTrailerToCab(tr, car)
@@ -1180,11 +1182,11 @@ local function hitchControl(car)
     end
 
     local s = senseFront(car, 8)
-    local reach = g.front + g.back + 10                      -- стартовая точка перед прицепом
+    local reach = g.front + g.back + 14                      -- стартовая точка перед прицепом (запас на выравнивание)
     local ax, ay = kx + tfx * reach, ky + tfy * reach
 
     -- Уже стоим ровно перед прицепом - сразу задним ходом
-    if hitch.phase == 'approach' and along > 0 and along < 25 and math.abs(e) < 1.5 and headErr < 15 then
+    if hitch.phase == 'approach' and along > 0 and along < 30 and math.abs(e) < 2 and headErr < 20 then
         hitch.phase, hitch.st = 'reverse', {}
     end
 
@@ -1197,7 +1199,7 @@ local function hitchControl(car)
             hitch.phase, hitch.st = 'align', {}
             return
         end
-        local v = math.min(7, math.sqrt(2 * 4 * math.max(0, da - 2)) + 1.5)
+        local v = math.min(11, math.sqrt(2 * 5 * math.max(0, da - 2)) + 2)
         if s.fc then v = math.min(v, math.sqrt(2 * 5 * math.max(0, s.fc - 2.5))) end
         local steer = clamp(ang / 0.5, -1, 1)
         if math.abs(math.deg(ang)) > 100 then
@@ -1216,29 +1218,65 @@ local function hitchControl(car)
     if hitch.phase == 'align' then
         hitch.status = 'Сцепка: выравниваюсь'
         local lx, ly = toLocal(car, cx + tfx * 60, cy + tfy * 60)
-        if turnToHeading(car, hitch.st, math.deg(math.atan2(lx, ly)), s, now, speed) then
+        local hang = math.deg(math.atan2(lx, ly))
+        if math.abs(hang) < 20 and speed < 1.5 then hitch.phase, hitch.st = 'reverse', {} return end
+        if turnToHeading(car, hitch.st, hang, s, now, speed) then
             keys(0, 0, (speed > 0.5) and 0.6 or 0)
             if speed < 0.5 then hitch.phase, hitch.st = 'reverse', {} end
         end
         return
     end
 
-    -- Задний ход по линии прицепа (чистое преследование точки на линии)
+    -- Короткая поправка вперёд: встать на линию прицепа и снова сдавать
+    if hitch.phase == 'pull' then
+        hitch.status = 'Сцепка: поправляюсь'
+        local st = hitch.st
+        st.from = st.from or along
+        -- точка на линии прицепа впереди машины
+        local px, py = kx + tfx * (along + 12), ky + tfy * (along + 12)
+        local lx, ly = toLocal(car, px, py)
+        local steer = clamp(math.atan2(lx, ly) / 0.4, -1, 1)
+        if along - st.from > 7 or (math.abs(e) < 0.4 and headErr < 6 and along - st.from > 3)
+            or (s.fc and s.fc < 2) then
+            keys(0, 0, (speed > 0.5) and 0.7 or 0)
+            if speed < 0.5 then hitch.phase, hitch.st = 'reverse', {} end
+            return
+        end
+        keys(steer, (speed < 3.5) and 0.55 or 0, 0)
+        return
+    end
+
+    -- Задний ход по линии прицепа. Опорная точка - седло (H), цель - точка на линии
+    -- прицепа на расстоянии L перед шкворнем по ходу. Руль: при заднем ходе вправо -
+    -- зад уходит вправо. Плюс поправка на курс, чтобы подъехать ровно, а не под углом.
     hitch.status = string.format('Сцепка: сдаю назад, %.1f м', dHK)
-    if along < -1.5 or (along > 4 and (math.abs(e) > 2.5 or headErr > 30)) then
+    if speed > 0.4 then hitch.st.moved = now end
+    hitch.st.moved = hitch.st.moved or now
+    if along < -1.5 or (along > 6 and (math.abs(e) > 3 or headErr > 35)) then
         hitch.tries = hitch.tries + 1
-        if hitch.tries > 4 then return hitchStop('Бот: не получилось ровно подъехать к прицепу.') end
+        if hitch.tries > 5 then return hitchStop('Бот: не получилось ровно подъехать к прицепу.') end
         hitch.phase, hitch.st = 'approach', {}
         return
     end
-    local L = clamp(along * 0.5, 2.5, 6)
+    -- Близко, но сбоку - короткая поправка вперёд вместо полного захода
+    if along < 6 and (math.abs(e) > 0.9 or headErr > 12) then
+        hitch.tries = hitch.tries + 1
+        if hitch.tries > 8 then return hitchStop('Бот: не получилось ровно подъехать к прицепу.') end
+        hitch.phase, hitch.st = 'pull', {}
+        keys(0, 0, 0)
+        return
+    end
+    local L = clamp(along * 0.6, 4, 10)
     local px, py = kx + tfx * math.max(0, along - L), ky + tfy * math.max(0, along - L)
+    local hlx, hly = toLocal(car, hx, hy)
     local lx, ly = toLocal(car, px, py)
-    local steer = clamp(math.atan2(lx, -ly) / 0.35, -1, 1)   -- задний ход: руль вправо - зад уходит вправо
+    lx, ly = lx - hlx, ly - hly                               -- цель относительно седла
+    local steer = clamp(math.atan2(lx, -ly) / 0.5, -1, 1)
     -- далеко - быстро, у самого прицепа - аккуратно
     local v = (dHK > 10) and 4.5 or (dHK > 5) and 3.0 or (dHK > 2.5) and 1.8 or 1.1
+    if math.abs(e) > 1 then v = math.min(v, 2.5) end
     local diff = v - speed
-    keys(steer, 0, (diff > 0.2) and clamp(0.45 + diff * 0.15, 0.45, 0.9) or 0)
+    keys(steer, (diff < -1) and 0.3 or 0, (diff > 0.2) and clamp(0.45 + diff * 0.15, 0.45, 0.9) or 0)
 end
 
 local function botThread()
