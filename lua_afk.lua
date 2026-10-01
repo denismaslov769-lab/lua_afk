@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Бот: режим езды по своей полосе (правая сторона дороги) с настройкой смещения. Надпись No Limit на ползунке скорости.
+-- @changelog: Бот: разворот к метке. Если метка сзади или сбоку, бот сдаёт назад с поворотом и едет прямо к ней, упёрся в препятствие - аккуратно отъезжает назад.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('1.4.0')
+script_version('1.5.0')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '1.4.0'
+local SCRIPT_VERSION = '1.5.0'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/lua_afk.lua'
 local TAG = '{33AAFF}[lua_afk]{FFFFFF} '
 
@@ -42,6 +42,7 @@ local cfg = inicfg.load({
         takeover = true,    -- W / S забирают управление
         lane     = false,   -- держаться своей (правой) полосы
         laneOff  = 2.5,     -- смещение от оси дороги, м
+        turn     = true,    -- разворот к метке задним ходом
     },
     theme = {
         accent     = '#3F99FF',
@@ -645,6 +646,7 @@ local function botStop()
         keys(0, false, false, false)
         bot.driving, bot.wx, bot.wy, bot.vt = false, nil, nil, nil
     end
+    bot.man = nil
 end
 
 -- Векторы машины: вперёд (fx, fy) и вправо (rx, ry)
@@ -678,6 +680,81 @@ local function ray(car, side, len)
     if not hit or not cp or not cp.pos then return nil end
     if cp.normal and cp.normal[3] and cp.normal[3] > 0.7 then return nil end
     return getDistanceBetweenCoords3d(x1, y1, z1, cp.pos[1], cp.pos[2], cp.pos[3])
+end
+
+-- Препятствие сзади: минимальное расстояние по трём лучам от заднего бампера или nil
+local function rayBack(car, len)
+    local minX, minY, _, maxX = getModelDimensions(getCarModel(car))
+    local back = (minY or -3) - 0.3
+    local best
+    for _, side in ipairs({ -1, 0, 1 }) do
+        local half = ((maxX or 1.2) - 0.2) * side
+        local x1, y1, z1 = getOffsetFromCarInWorldCoords(car, half, back, 0.3)
+        local x2, y2, z2 = getOffsetFromCarInWorldCoords(car, half * 1.3, back - len, 0.3)
+        local hit, cp = processLineOfSight(x1, y1, z1, x2, y2, z2, true, true, true, true, false, false, false, false)
+        if hit and cp and cp.pos and not (cp.normal and cp.normal[3] and cp.normal[3] > 0.7) then
+            local d = getDistanceBetweenCoords3d(x1, y1, z1, cp.pos[1], cp.pos[2], cp.pos[3])
+            if not best or d < best then best = d end
+        end
+    end
+    return best
+end
+
+-- Разворот к метке: 'back' - задний ход с выкрученным в обратную сторону рулём (нос
+-- поворачивается к метке), 'fwd' - вперёд с полным рулём к метке. Чередуются, пока нос
+-- не смотрит на метку. Возвращает true, пока манёвр идёт (обычное управление пропускается).
+local function maneuver(car, tx, ty, dist, frontGap)
+    local now = os.clock()
+    local speed = getCarSpeed(car)
+    local lx, ly = toLocal(car, tx, ty)
+    local ang = math.deg(math.atan2(lx, ly))   -- угол на метку: > 0 справа, |180| - сзади
+    local a = math.abs(ang)
+    local dir = ang >= 0 and 1 or -1
+
+    if not bot.man then
+        if cfg.bot.turn == false or now < (bot.manCooldown or 0) then return false end
+        local behind  = a > 110 and dist < 400
+        local side    = a > 65 and dist < 60 and speed < 6
+        local blocked = frontGap and frontGap < 6 and a > 30 and speed < 2 and dist < 100
+        if not (behind or side or blocked) then return false end
+        -- Впереди свободно и метка не сзади - разворачиваемся сразу вперёд, иначе сначала назад
+        local first = (not blocked and a < 110 and (not frontGap or frontGap > 10)) and 'fwd' or 'back'
+        bot.man = { phase = first, since = now, start = now, n = 0 }
+    end
+    local m = bot.man
+
+    -- Готово: нос смотрит на метку
+    if a < 25 or now - m.start > 25 or m.n > 8 then
+        bot.man = nil
+        bot.manCooldown = now + ((a < 25) and 1.5 or 6)
+        bot.wx, bot.nextPlan = nil, 0
+        return false
+    end
+
+    if m.phase == 'back' then
+        local rear = rayBack(car, 6)
+        local done = a < 55 or (rear and rear < 1.5) or now - m.since > 4
+        if done and now - m.since > 0.6 then
+            m.phase, m.since, m.n = 'fwd', now, m.n + 1
+        else
+            -- Сзади что-то близко - сдаём совсем медленно
+            local vmax = (rear and rear < 4) and 2 or 4.5
+            keys(-dir, false, (speed < vmax) and 0.6 or 0, false)
+            bot.status = string.format('Разворот: назад, %d м', math.floor(dist))
+            return true
+        end
+    end
+
+    -- Вперёд с полным рулём к метке
+    local blocked = frontGap and frontGap < 2.5
+    if blocked and now - m.since > 0.6 then
+        m.phase, m.since, m.n = 'back', now, m.n + 1
+        keys(0, false, false, false)
+        return true
+    end
+    keys(dir, (speed < 5) and 0.5 or 0, false, false)
+    bot.status = string.format('Разворот: вперёд, %d м', math.floor(dist))
+    return true
 end
 
 -- Выбор следующей точки: дорожные узлы впереди (прямо и под углами),
@@ -718,6 +795,12 @@ local function botControl(car, tx, ty, tz, dist)
     if now < bot.reverseUntil then
         keys(bot.reverseSteer, false, true, false)
         bot.vt = 0
+        return
+    end
+
+    -- Метка сзади / сбоку или упёрлись в препятствие - разворот к метке
+    if maneuver(car, tx, ty, dist, ray(car, 0, 12)) then
+        bot.vt, bot.stuckSince = 0, nil
         return
     end
 
@@ -856,8 +939,8 @@ local function botThread()
                         bot.status = 'Управление у вас'
                     elseif os.clock() >= bot.pauseUntil then
                         bot.driving = true
-                        botControl(car, x, y, z, dist)
                         bot.status = string.format('Едет: %s, %d м', name, math.floor(dist))
+                        botControl(car, x, y, z, dist)
                     end
                 end
             end
@@ -887,6 +970,7 @@ local ui = {
     botRadius  = imgui.new.int(tonumber(cfg.bot.radius) or 12),
     botTake    = imgui.new.bool(cfg.bot.takeover),
     botLane    = imgui.new.bool(cfg.bot.lane),
+    botTurn    = imgui.new.bool(cfg.bot.turn ~= false),
     botLaneOff = imgui.new.float(tonumber(cfg.bot.laneOff) or 2.5),
 
     accent     = f3(cfg.theme.accent),
@@ -1002,6 +1086,10 @@ local function drawFarmTab()
     end
     if toggle('##bot_take', 'W / S забирают управление', ui.botTake) then
         cfg.bot.takeover = ui.botTake[0]; saveCfg()
+    end
+
+    if toggle('##bot_turn', 'Разворот к метке задним ходом', ui.botTurn) then
+        cfg.bot.turn = ui.botTurn[0]; saveCfg()
     end
 
     section('Полоса')
