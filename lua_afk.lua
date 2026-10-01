@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Найден и исправлен вылет игры после спавна: проверка обновлений запускала загрузку из завершающегося потока. Теперь все загрузки идут из одного постоянного потока.
+-- @changelog: Безопасная установка обновлений: окна закрываются до записи файла, нет двойного перезапуска вместе с AutoReboot. Все загрузки из одного постоянного потока (фикс вылета после спавна).
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.0.3')
+script_version('2.0.4')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.0.3'
+local SCRIPT_VERSION = '2.0.4'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -259,7 +259,7 @@ local function installUpdate()
     f:write(upd.newCode)
     f:close()
     msg('Обновлено до версии ' .. upd.latest .. '. Перезапуск...')
-    thisScript():reload()
+    log('[update] файл записан, перезапуск')
     return true
 end
 
@@ -1464,8 +1464,17 @@ function main()
             log('[main] жив, меню открыто, кадров: ' .. menu.frames)
         end
         if upd.state == 'installing' and (upd.shown >= 0.999 or not upd.window[0]) then
-            wait(500)
-            if installUpdate() then return end
+            -- Сначала закрываем окна и отпускаем клавиши, ждём пока mimgui перестанет рисовать,
+            -- и только потом пишем файл. AutoReboot.lua сам перезапускает скрипт при изменении
+            -- файла - если он это сделал, второй перезапуск не нужен (двойной перезапуск опасен).
+            upd.window[0], menu.window[0] = false, false
+            botRelease()
+            wait(700)
+            if installUpdate() then
+                wait(2500)
+                thisScript():reload()
+                return
+            end
         end
     end
 end
