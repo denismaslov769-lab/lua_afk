@@ -4,7 +4,7 @@
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('0.6.1')
+script_version('0.6.2')
 script_description('Скрипт для Arizona RP: меню, авто спавн, автообновление')
 
 local imgui    = require('mimgui')
@@ -18,7 +18,7 @@ encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
 -- ===================== Настройки =====================
-local SCRIPT_VERSION = '0.6.1'
+local SCRIPT_VERSION = '0.6.2'
 local REPO_RAW    = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/'
 local VERSION_URL = REPO_RAW .. 'version.json'
 local SCRIPT_URL  = REPO_RAW .. 'lua_afk.lua'
@@ -340,9 +340,13 @@ imgui.OnInitialize(function()
     for _, name in ipairs({ 'trebucbd.ttf', 'segoeui.ttf', 'arial.ttf', 'tahoma.ttf' }) do
         if doesFileExist(fontsDir .. '\\' .. name) then font = fontsDir .. '\\' .. name break end
     end
-    if font then
-        io.Fonts:Clear()
-        io.Fonts:AddFontFromFileTTF(font, 16.0, nil, io.Fonts:GetGlyphRangesCyrillic())
+    local ranges = io.Fonts:GetGlyphRangesCyrillic()
+    io.Fonts:Clear()
+    local loaded = nil
+    if font then loaded = io.Fonts:AddFontFromFileTTF(font, 16.0, nil, ranges) end
+    if loaded == nil then
+        print('[menu] font not loaded, using default')
+        io.Fonts:AddFontDefault()
     end
 
     applyTheme()
@@ -567,6 +571,7 @@ end
 
 -- ===================== Меню =====================
 local menu = {
+    trace  = true,   -- пишет шаги первого кадра в moonloader.log (для поиска крашей)
     window = imgui.new.bool(false),
     tab    = 1,
 }
@@ -910,7 +915,6 @@ local function presetSwatches()
         if cfg.theme.accent:upper() == pr.accent:upper() then
             dl:AddCircle(c, d / 2 - 0.5, U32(V4(1, 1, 1, 0.9)), 32, 2)
         end
-        if hovered then imgui.SetTooltip(pr.name) end
     end
 end
 
@@ -997,27 +1001,29 @@ local TABS = {
 imgui.OnFrame(
     function() return menu.window[0] end,
     function(player)
+        local function T(s) if menu.trace then print('[menu] ' .. s) end end
+        T('frame start')
         local sw, sh = getScreenResolution()
         imgui.SetNextWindowPos(vec(sw / 2, sh / 2), imgui.Cond.FirstUseEver, vec(0.5, 0.5))
         imgui.SetNextWindowSize(vec(700, 480), imgui.Cond.Always)
-        imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, vec(10, 10))
         imgui.Begin('##lua_afk_menu', menu.window,
             imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoCollapse)
-        imgui.PopStyleVar()
+        T('begin ok')
 
         -- Частицы рисуются на фоне окна, панели поверх них полупрозрачные
         drawParticles(imgui.GetWindowDrawList(), imgui.GetWindowPos(), imgui.GetWindowSize())
+        T('particles ok')
 
         -- Боковая панель: вкладки столбиком
         imgui.BeginChild('##sidebar', vec(190, 0), true)
-        imgui.SetWindowFontScale(1.35)
+        T('sidebar begin')
         centerText('lua_afk', ACCENT)
-        imgui.SetWindowFontScale(1.0)
         centerText('v' .. SCRIPT_VERSION, COLOR_GRAY)
         imgui.Spacing(); imgui.Separator(); imgui.Spacing()
 
         for i, tab in ipairs(TABS) do
             if sidebarButton('##tab' .. i, tab.name, tab.icon, menu.tab == i) then menu.tab = i end
+            T('tab button ' .. i)
         end
 
         -- Кнопка закрытия внизу панели
@@ -1029,14 +1035,16 @@ imgui.OnFrame(
 
         -- Содержимое вкладки
         imgui.BeginChild('##content', vec(0, 0), true)
+        T('content begin')
         local tab = TABS[menu.tab]
-        imgui.SetWindowFontScale(1.25)
-        imgui.Text(tab.name)
-        imgui.SetWindowFontScale(1.0)
+        imgui.TextColored(ACCENT, tab.name)
         tab.draw()
+        T('tab drawn')
         imgui.EndChild()
 
         imgui.End()
+        T('frame end')
+        menu.trace = false
     end
 )
 

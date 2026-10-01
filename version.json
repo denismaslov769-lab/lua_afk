@@ -1,5 +1,5 @@
 {
-  "version": "0.6.1",
+  "version": "0.6.2",
   "url": "https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/lua_afk.lua",
-  "changelog": "Исправлен вылет скрипта при проверке обновлений (device or resource busy)."
+  "changelog": "Исправлен краш игры при открытии меню /lafk."
 }
