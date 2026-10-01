@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Отключение лишних копий скрипта (две копии сами рулили машиной и роняли игру при открытии меню). Защита меню от ошибок.
+-- @changelog: Скрипт переписан с нуля: новый автопилот, разворот к метке, объезд углов, защита от вылетов меню и копий.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('1.5.7')
+script_version('2.0.0')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,8 +17,11 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '1.5.7'
-local SCRIPT_URL = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/lua_afk.lua'
+local SCRIPT_VERSION = '2.0.0'
+local REPO       = 'denismaslov769-lab/lua_afk'
+local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
+local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
+local RAW_BY_SHA = 'https://raw.githubusercontent.com/' .. REPO .. '/%s/lua_afk.lua'
 local TAG = '{33AAFF}[lua_afk]{FFFFFF} '
 
 --==============================================================
@@ -36,13 +39,13 @@ local cfg = inicfg.load({
     bot = {
         enabled  = false,
         source   = 0,       -- 0 = авто, 1 = чекпоинт, 2 = метка на карте
-        speed    = 25,
-        style    = 0,       -- 0 = объезжать машины, 1 = тормозить перед машинами
-        radius   = 12,      -- м
+        speed    = 25,      -- м/с, 61 = без ограничения
+        style    = 0,       -- 0 = обычный, 1 = аккуратный
+        radius   = 12,      -- радиус прибытия, м
         takeover = true,    -- W / S забирают управление
         lane     = false,   -- держаться своей (правой) полосы
         laneOff  = 2.5,     -- смещение от оси дороги, м
-        turn     = true,    -- разворот к метке задним ходом
+        turn     = true,    -- разворот к метке
     },
     theme = {
         accent     = '#3F99FF',
@@ -64,11 +67,12 @@ local cfg = inicfg.load({
     },
 }, INI)
 local function saveCfg() inicfg.save(cfg, INI) end
+local function num(v, d) return tonumber(v) or d end
 
 --==============================================================
 -- Утилиты
 --==============================================================
--- Текст в файле в UTF-8, чат игры в CP1251
+-- Текст в файле в UTF-8, чат и лог игры в CP1251
 local function msg(text) sampAddChatMessage(TAG .. u8:decode(text), -1) end
 local function log(text) print(u8:decode(text)) end
 
@@ -114,12 +118,23 @@ local function hsv(h, s, v)
     elseif i == 4 then return t, p, v else return v, p, q end
 end
 
+local function clamp(v, a, b) return math.max(a, math.min(b, v)) end
+
+local RU_MAP = {}
+do
+    local up, lo = {}, {}
+    for ch in ('АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ'):gmatch('[\208\209][\128-\191]') do up[#up + 1] = ch end
+    for ch in ('абвгдеёжзийклмнопрстуфхцчшщъыьэюя'):gmatch('[\208\209][\128-\191]') do lo[#lo + 1] = ch end
+    for i = 1, #up do RU_MAP[up[i]] = lo[i] end
+end
+local function ruLower(s)
+    local r = tostring(s):lower():gsub('[\208\209][\128-\191]', RU_MAP)
+    return r
+end
+
 --==============================================================
--- Загрузка файлов
--- Строго одна загрузка за раз. Файл читается не в колбэке загрузчика,
--- а в отдельном потоке после завершения - так MoonLoader не выбрасывает
--- исключений ("device or resource busy"), которые ломают игру.
--- JSON не используется вообще.
+-- Загрузка файлов: строго по одной. Файл читается не в колбэке загрузки,
+-- а в отдельном потоке после её завершения (иначе MoonLoader может уронить игру).
 --==============================================================
 local TMP_DIR = getWorkingDirectory() .. '\\config'
 local net = { busy = false }
@@ -151,35 +166,25 @@ local function download(url, path, onProgress, onDone)
 end
 
 --==============================================================
--- Автообновление
+-- Автообновление.
+-- Ветка main на raw.githubusercontent.com кэшируется до 5 минут, поэтому сначала узнаём
+-- хэш последнего коммита (API) и качаем файл по хэшу - такая ссылка всегда свежая.
 --==============================================================
-local TMP_CHECK  = TMP_DIR .. '\\lua_afk_check.tmp'
 local TMP_SHA    = TMP_DIR .. '\\lua_afk_sha.tmp'
--- raw.githubusercontent.com по ветке main кэшируется до 5 минут. Поэтому сначала узнаём
--- хэш последнего коммита через API (кэш ~1 минута) и качаем файл по этому хэшу - такая
--- ссылка всегда свежая. Если API недоступен - старый способ через main.
-local API_COMMIT = 'https://api.github.com/repos/denismaslov769-lab/lua_afk/commits/main'
-local RAW_BY_SHA = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/%s/lua_afk.lua'
+local TMP_CHECK  = TMP_DIR .. '\\lua_afk_check.tmp'
 local TMP_SCRIPT = TMP_DIR .. '\\lua_afk_update.tmp'
 
 local upd = {
-    window    = imgui.new.bool(false),
-    state     = 'idle',   -- idle | prompt | downloading | installing | error
-    latest    = nil,
-    changelog = nil,
-    progress  = 0.0,
-    shown     = 0.0,
-    newCode   = nil,
-    error     = nil,
-    dismissed = nil,
+    window = imgui.new.bool(false),
+    state = 'idle',        -- idle | prompt | downloading | installing | error
+    latest = nil, changelog = nil, url = nil,
+    progress = 0.0, shown = 0.0, newCode = nil, error = nil, dismissed = nil,
 }
 
 local function isScript(data)
     return data and data:find("script_version%('") and data:find('function main', 1, true)
 end
 
--- manual   = ручная проверка (/lafkupd), пишет всё в чат
--- periodic = фоновая проверка, не показывает окно для уже отменённой версии
 local function checkUpdates(manual, periodic)
     if not manual and not cfg.update.auto then return end
     if upd.state == 'prompt' or upd.state == 'downloading' or upd.state == 'installing' then return end
@@ -195,10 +200,8 @@ local function checkUpdates(manual, periodic)
         log('[update] на GitHub ' .. tostring(v) .. ', установлена ' .. SCRIPT_VERSION)
         if isNewer(v, SCRIPT_VERSION) then
             if periodic and upd.dismissed == v then return end
-            upd.latest    = v
-            upd.changelog = data:match('%-%- @changelog: ([^\r\n]+)')
-            upd.state     = 'prompt'
-            upd.window[0] = true
+            upd.latest, upd.changelog = v, data:match('%-%- @changelog: ([^\r\n]+)')
+            upd.state, upd.window[0] = 'prompt', true
             msg('Доступно обновление ' .. v .. '!')
         elseif manual then
             msg('У вас последняя версия (' .. SCRIPT_VERSION .. ').')
@@ -208,7 +211,6 @@ local function checkUpdates(manual, periodic)
     local started = download(API_COMMIT .. '?t=' .. os.time(), TMP_SHA, nil, function(info)
         local sha = info and info:match('"sha"%s*:%s*"(%x+)"')
         upd.url = sha and RAW_BY_SHA:format(sha) or (SCRIPT_URL .. '?t=' .. os.time())
-        log('[update] источник: ' .. upd.url)
         if not download(upd.url, TMP_CHECK, nil, onScript) and manual then
             msg('Загрузка уже идёт, подождите пару секунд.')
         end
@@ -227,9 +229,7 @@ local function startDownload()
                 upd.state, upd.error = 'error', 'Не удалось скачать обновление.'
             end
         end)
-    if not started then
-        upd.state, upd.error = 'error', 'Идёт другая загрузка, нажмите Повторить.'
-    end
+    if not started then upd.state, upd.error = 'error', 'Идёт другая загрузка, нажмите Повторить.' end
 end
 
 local function installUpdate()
@@ -251,14 +251,12 @@ local function updateScheduler()
     while not sampIsLocalPlayerSpawned() and os.time() - t < 20 do wait(500) end
     wait(2000)
     checkUpdates(false)
-
     local last, offSince = os.time(), nil
     while true do
         wait(1000)
         if not sampIsLocalPlayerSpawned() then
             offSince = offSince or os.time()
         elseif offSince then
-            -- персонаж не был заспавнен 10+ секунд: это вход / перезаход на сервер
             if os.time() - offSince >= 10 then
                 wait(3000)
                 last = os.time()
@@ -274,301 +272,18 @@ local function updateScheduler()
 end
 
 --==============================================================
--- Тема mimgui
---==============================================================
-local V4 = imgui.ImVec4
-local function vec(x, y) return imgui.ImVec2(x, y) end
-local U32 = imgui.ColorConvertFloat4ToU32
-
-local WHITE = V4(1, 1, 1, 1)
-local GRAY  = V4(0.60, 0.63, 0.70, 1.00)
-local GREEN = V4(0.35, 0.85, 0.45, 1.00)
-local RED   = V4(1.00, 0.40, 0.40, 1.00)
-local ACCENT = V4(0.25, 0.60, 1.00, 1.00)
-
-local function applyTheme()
-    local style = imgui.GetStyle()
-    local c, col = style.Colors, imgui.Col
-    local ar, ag, ab = hexToRGB(cfg.theme.accent)
-    local br, bg, bb = hexToRGB(cfg.theme.bg)
-    local function mix(k, a)
-        if k >= 0 then return V4(ar + (1 - ar) * k, ag + (1 - ag) * k, ab + (1 - ab) * k, a or 1) end
-        return V4(ar * (1 + k), ag * (1 + k), ab * (1 + k), a or 1)
-    end
-    local function lift(k, a) return V4(math.min(1, br + k), math.min(1, bg + k), math.min(1, bb + k), a or 1) end
-    local rnd = tonumber(cfg.theme.rounding) or 12
-
-    ACCENT = V4(ar, ag, ab, 1)
-
-    style.WindowPadding     = vec(14, 14)
-    style.FramePadding      = vec(10, 6)
-    style.ItemSpacing       = vec(10, 10)
-    style.WindowRounding    = rnd
-    style.ChildRounding     = rnd * 0.8
-    style.FrameRounding     = rnd * 0.6
-    style.GrabRounding      = rnd * 0.6
-    style.ScrollbarRounding = rnd * 0.6
-    style.GrabMinSize       = 14
-    style.WindowBorderSize  = 1
-    style.ChildBorderSize   = 1
-    style.WindowTitleAlign  = vec(0.5, 0.5)
-
-    c[col.WindowBg]         = V4(br, bg, bb, 0.97)
-    c[col.ChildBg]          = lift(0.03, tonumber(cfg.theme.childAlpha) or 0.8)
-    c[col.PopupBg]          = lift(0.02, 0.98)
-    c[col.Border]           = V4(ar, ag, ab, 0.40)
-    c[col.Separator]        = V4(ar, ag, ab, 0.25)
-    c[col.TitleBg]          = lift(0.03)
-    c[col.TitleBgActive]    = lift(0.06)
-    c[col.Text]             = V4(0.92, 0.94, 0.97, 1.00)
-    c[col.TextDisabled]     = GRAY
-    c[col.FrameBg]          = lift(0.06)
-    c[col.FrameBgHovered]   = lift(0.09)
-    c[col.FrameBgActive]    = lift(0.12)
-    c[col.Button]           = mix(-0.15)
-    c[col.ButtonHovered]    = mix(0.12)
-    c[col.ButtonActive]     = mix(-0.30)
-    c[col.Header]           = V4(ar, ag, ab, 0.35)
-    c[col.HeaderHovered]    = V4(ar, ag, ab, 0.50)
-    c[col.HeaderActive]     = V4(ar, ag, ab, 0.65)
-    c[col.PlotHistogram]    = ACCENT
-    c[col.SliderGrab]       = ACCENT
-    c[col.SliderGrabActive] = mix(0.25)
-    c[col.CheckMark]        = ACCENT
-    c[col.ScrollbarBg]      = lift(0.0)
-    c[col.ScrollbarGrab]    = lift(0.12)
-    c[col.TextSelectedBg]   = V4(ar, ag, ab, 0.35)
-end
-
-imgui.OnInitialize(function()
-    local io = imgui.GetIO()
-    io.IniFilename = nil
-
-    -- Шрифт с кириллицей. Если не загрузится - стандартный, чтобы у меню всегда был шрифт.
-    local dir = getFolderPath(0x14)
-    local file
-    for _, name in ipairs({ 'trebucbd.ttf', 'segoeui.ttf', 'arial.ttf', 'tahoma.ttf' }) do
-        if doesFileExist(dir .. '\\' .. name) then file = dir .. '\\' .. name break end
-    end
-    local ranges = io.Fonts:GetGlyphRangesCyrillic()
-    io.Fonts:Clear()
-    local font = nil
-    if file then font = io.Fonts:AddFontFromFileTTF(file, 16.0, nil, ranges) end
-    if font == nil then io.Fonts:AddFontDefault() end
-
-    applyTheme()
-end)
-
---==============================================================
--- Виджеты (рисуются кодом, без icon-шрифтов - никаких "???")
---==============================================================
-local anim = {}
-local function lerp(a, b, t) return a + (b - a) * t end
-local function lerpV4(a, b, t) return V4(lerp(a.x, b.x, t), lerp(a.y, b.y, t), lerp(a.z, b.z, t), lerp(a.w, b.w, t)) end
-local function approach(id, target, speed)
-    local v = anim[id] or target
-    v = v + (target - v) * math.min(1, imgui.GetIO().DeltaTime * (speed or 12))
-    anim[id] = v
-    return v
-end
-
-local function centerText(text, color)
-    local w = imgui.CalcTextSize(text).x
-    imgui.SetCursorPosX((imgui.GetWindowWidth() - w) / 2)
-    imgui.TextColored(color or WHITE, text)
-end
-
-local function section(title)
-    imgui.Spacing()
-    imgui.TextColored(ACCENT, title)
-    imgui.Separator()
-end
-
-local function hint(text)
-    imgui.PushTextWrapPos(0)
-    imgui.TextDisabled(text)
-    imgui.PopTextWrapPos()
-end
-
-local function grayButton(label, size)
-    imgui.PushStyleColor(imgui.Col.Button,        V4(0.22, 0.24, 0.30, 1.00))
-    imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.30, 0.32, 0.40, 1.00))
-    imgui.PushStyleColor(imgui.Col.ButtonActive,  V4(0.18, 0.20, 0.25, 1.00))
-    local pressed = imgui.Button(label, size)
-    imgui.PopStyleColor(3)
-    return pressed
-end
-
--- Переключатель с анимацией
-local function toggle(id, label, ptr)
-    local dl = imgui.GetWindowDrawList()
-    local p  = imgui.GetCursorScreenPos()
-    local h  = imgui.GetFrameHeight()
-    local w  = h * 1.9
-    local clicked = imgui.InvisibleButton(id, vec(w, h))
-    if clicked then ptr[0] = not ptr[0] end
-    local hovered = imgui.IsItemHovered()
-    local t = approach(id, ptr[0] and 1 or 0)
-    local bg = lerpV4(V4(0.22, 0.24, 0.30, 1), ACCENT, t)
-    if hovered then bg = lerpV4(bg, WHITE, 0.08) end
-    dl:AddRectFilled(p, vec(p.x + w, p.y + h), U32(bg), h / 2)
-    dl:AddCircleFilled(vec(p.x + h / 2 + t * (w - h), p.y + h / 2), h / 2 - 3, U32(WHITE), 24)
-    imgui.SameLine()
-    imgui.AlignTextToFramePadding()
-    imgui.Text(label)
-    return clicked
-end
-
--- Сегментированный выбор
-local function segmented(id, ptr, items)
-    local sp = imgui.GetStyle().ItemSpacing.x
-    local w  = (imgui.GetContentRegionAvail().x - sp * (#items - 1)) / #items
-    local changed = false
-    for i, name in ipairs(items) do
-        if i > 1 then imgui.SameLine() end
-        local active = ptr[0] == i - 1
-        if not active then
-            imgui.PushStyleColor(imgui.Col.Button,        V4(0.16, 0.18, 0.24, 1.00))
-            imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.22, 0.25, 0.33, 1.00))
-            imgui.PushStyleColor(imgui.Col.ButtonActive,  V4(0.18, 0.20, 0.27, 1.00))
-        end
-        if imgui.Button(name .. '##' .. id .. i, vec(w, 32)) then ptr[0] = i - 1; changed = true end
-        if not active then imgui.PopStyleColor(3) end
-    end
-    return changed
-end
-
---==============================================================
--- Иконки
---==============================================================
-local function iconPerson(dl, c, col)
-    dl:AddCircleFilled(vec(c.x, c.y - 4.5), 3.8, col, 20)
-    dl:AddRectFilled(vec(c.x - 6.5, c.y + 1), vec(c.x + 6.5, c.y + 9), col, 4)
-end
-
--- Фура: x, y - левый верхний угол, s - масштаб (примерно 58s x 26s)
-local function drawTruck(dl, x, y, s, body, cab)
-    local function R(a, b, c2, d, col, r)
-        dl:AddRectFilled(vec(x + a * s, y + b * s), vec(x + c2 * s, y + d * s), col, (r or 0) * s)
-    end
-    local dark  = U32(V4(0.05, 0.06, 0.08, 1))
-    local wheel = U32(V4(0.16, 0.17, 0.20, 1))
-    local hub   = U32(V4(0.70, 0.72, 0.78, 1))
-    R(0, 0, 38, 18, body, 2)                               -- прицеп
-    R(2, 2, 36, 4, U32(V4(1, 1, 1, 0.12)), 1)              -- блик
-    R(38, 14, 41, 19, dark)                                -- сцепка
-    R(41, 3, 54, 19, cab, 2.5)                             -- кабина
-    R(54, 10, 58, 19, cab, 1.5)                            -- капот
-    R(47, 5, 53, 11, U32(V4(0.55, 0.80, 1.00, 0.85)), 1)   -- окно
-    R(56.5, 12, 58, 14, U32(V4(1.00, 0.85, 0.35, 1)))      -- фара
-    R(0, 18.5, 58, 21, dark, 1)                            -- рама
-    for _, wx in ipairs({ 7, 15, 49 }) do
-        dl:AddCircleFilled(vec(x + wx * s, y + 22 * s), 3.6 * s, wheel, 16)
-        dl:AddCircleFilled(vec(x + wx * s, y + 22 * s), 1.4 * s, hub, 12)
-    end
-end
-
-local function iconTruck(dl, c, col) drawTruck(dl, c.x - 9.3, c.y - 6, 0.32, col, col) end
-
-local function iconPalette(dl, c, col)
-    dl:AddCircle(c, 8, col, 24, 1.8)
-    dl:AddCircleFilled(vec(c.x - 3.2, c.y - 2.5), 1.7, col, 12)
-    dl:AddCircleFilled(vec(c.x + 3.2, c.y - 2.5), 1.7, col, 12)
-    dl:AddCircleFilled(vec(c.x, c.y + 3.5), 1.7, col, 12)
-end
-
-local function iconInfo(dl, c, col)
-    dl:AddCircle(c, 8, col, 24, 1.8)
-    dl:AddCircleFilled(vec(c.x, c.y - 3.8), 1.4, col, 12)
-    dl:AddRectFilled(vec(c.x - 1, c.y - 1), vec(c.x + 1, c.y + 4.5), col)
-end
-
-local function iconClose(dl, c, col)
-    dl:AddLine(vec(c.x - 5, c.y - 5), vec(c.x + 5, c.y + 5), col, 2)
-    dl:AddLine(vec(c.x + 5, c.y - 5), vec(c.x - 5, c.y + 5), col, 2)
-end
-
--- Вкладка в боковой панели
-local function sidebarButton(id, name, icon, active)
-    local dl = imgui.GetWindowDrawList()
-    local p  = imgui.GetCursorScreenPos()
-    local w  = imgui.GetContentRegionAvail().x
-    local h  = 40
-    local clicked = imgui.InvisibleButton(id, vec(w, h))
-    local t = approach(id, active and 1 or (imgui.IsItemHovered() and 0.45 or 0), 14)
-    if t > 0.01 then
-        dl:AddRectFilled(p, vec(p.x + w, p.y + h), U32(V4(ACCENT.x, ACCENT.y, ACCENT.z, 0.18 * t)), 8)
-    end
-    if active then
-        dl:AddRectFilled(vec(p.x, p.y + 8), vec(p.x + 4, p.y + h - 8), U32(ACCENT), 2)
-    end
-    local col = U32(lerpV4(GRAY, WHITE, t))
-    icon(dl, vec(p.x + 22, p.y + h / 2), col)
-    dl:AddText(vec(p.x + 42, p.y + (h - imgui.GetTextLineHeight()) / 2), col, name)
-    return clicked
-end
-
---==============================================================
--- Падающие частицы
---==============================================================
-local particles = {}
-
-local function newParticle(w, h, fromTop)
-    return {
-        x = math.random() * w,
-        y = fromTop and -math.random() * 20 or math.random() * h,
-        sp = 0.5 + math.random(), sz = 0.6 + math.random() * 0.8,
-        a = 0.4 + math.random() * 0.6, drift = (math.random() - 0.5) * 20, hue = math.random(),
-    }
-end
-
-local function drawParticles(dl, pos, size)
-    local P = cfg.particles
-    if not P.enabled then return end
-    local n = math.floor(tonumber(P.count) or 0)
-    while #particles < n do particles[#particles + 1] = newParticle(size.x, size.y, false) end
-    while #particles > n do particles[#particles] = nil end
-    local dt, time = imgui.GetIO().DeltaTime, imgui.GetTime()
-    local r, g, b = hexToRGB(P.color)
-    for i = 1, #particles do
-        local p = particles[i]
-        p.y = p.y + P.speed * p.sp * dt
-        p.x = p.x + p.drift * dt
-        if p.y > size.y + 6 or p.x < -6 or p.x > size.x + 6 then
-            p = newParticle(size.x, size.y, true)
-            particles[i] = p
-        end
-        local cr, cg, cb = r, g, b
-        if P.rainbow then cr, cg, cb = hsv((p.hue + time * 0.1) % 1, 0.65, 1) end
-        dl:AddCircleFilled(vec(pos.x + p.x, pos.y + p.y), P.size * p.sz, U32(V4(cr, cg, cb, P.alpha * p.a)), 12)
-    end
-end
-
---==============================================================
 -- Авто спавн
 --==============================================================
-local RU_MAP = {}
-do
-    local up, lo = {}, {}
-    for ch in ('АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ'):gmatch('[\208\209][\128-\191]') do up[#up + 1] = ch end
-    for ch in ('абвгдеёжзийклмнопрстуфхцчшщъыьэюя'):gmatch('[\208\209][\128-\191]') do lo[#lo + 1] = ch end
-    for i = 1, #up do RU_MAP[up[i]] = lo[i] end
-end
-local function ruLower(s)
-    local r = tostring(s):lower():gsub('[\208\209][\128-\191]', RU_MAP)
-    return r
-end
-
 local function autoSpawnThread()
     local lastSpawn, lastDialogId, lastDialogTime = 0, -1, 0
     while true do
         wait(200)
         if cfg.spawn.enabled then
-            if tonumber(cfg.spawn.mode) == 0 then
+            if num(cfg.spawn.mode, 0) == 0 then
                 local connected = sampGetPlayerIdByCharHandle(PLAYER_PED)
                 if connected and not sampIsLocalPlayerSpawned() and not sampIsDialogActive()
                    and os.clock() - lastSpawn > 3 then
-                    wait(tonumber(cfg.spawn.delay) or 1000)
+                    wait(num(cfg.spawn.delay, 1000))
                     if not sampIsLocalPlayerSpawned() and not sampIsDialogActive() then
                         sampSendRequestSpawn()
                         sampSpawnPlayer()
@@ -583,9 +298,9 @@ local function autoSpawnThread()
                     local kw = ruLower(cfg.spawn.keyword)
                     if kw ~= '' and ruLower(caption):find(kw, 1, true) then
                         lastDialogId, lastDialogTime = id, os.clock()
-                        wait(tonumber(cfg.spawn.delay) or 1000)
+                        wait(num(cfg.spawn.delay, 1000))
                         if sampIsDialogActive() and sampGetCurrentDialogId() == id then
-                            sampSetCurrentDialogListItem((tonumber(cfg.spawn.item) or 1) - 1)
+                            sampSetCurrentDialogListItem(num(cfg.spawn.item, 1) - 1)
                             sampCloseCurrentDialogWithButton(1)
                             msg('Авто спавн: выбран пункт ' .. cfg.spawn.item .. '.')
                         end
@@ -597,33 +312,40 @@ local function autoSpawnThread()
 end
 
 --==============================================================
--- Бот дальнобойщик (для личного сервера, на Arizona RP отключён)
+-- Бот дальнобойщик: собственный автопилот.
+-- Управляет только виртуальными клавишами (руль, газ, тормоз/задний ход).
+-- Ничего не делает, пока бот не включён в меню или командой /ltruck.
 --==============================================================
+local KEY_STEER, KEY_GAS, KEY_BRAKE = 0, 16, 14
+local SPEED_NO_LIMIT = 61 -- ползунок скорости в крайнем правом положении
+
 local bot = {
-    status = 'Выключен', driving = false, cp = nil,
-    wx = nil, wy = nil, nextPlan = 0,             -- текущая точка маршрута
-    tx = nil, ty = nil,                           -- цель, к которой едем
-    best = nil, bestTime = 0, gaveUp = false,     -- защита от кружения
-    pauseUntil = 0, arrived = false,
-    stuckSince = nil, reverseUntil = 0, reverseSteer = 0,
+    status = 'Выключен', active = false, cp = nil,
+    tx = nil, ty = nil, best = nil, bestTime = 0, gaveUp = false, arrived = false, pauseUntil = 0,
+    wx = nil, wy = nil, nextPlan = 0, turnAt = nil, vt = nil, lastCtl = nil,
+    stuckSince = nil, recover = nil, man = nil, manCooldown = 0,
 }
 
 if hasSampev then
-    function sampev.onSetCheckpoint(pos)             bot.cp = { pos.x, pos.y, pos.z } end
-    function sampev.onDisableCheckpoint()            bot.cp = nil end
-    function sampev.onSetRaceCheckpoint(t, pos)      bot.cp = { pos.x, pos.y, pos.z } end
-    function sampev.onDisableRaceCheckpoint()        bot.cp = nil end
+    function sampev.onSetCheckpoint(pos)        bot.cp = { pos.x, pos.y, pos.z } end
+    function sampev.onDisableCheckpoint()       bot.cp = nil end
+    function sampev.onSetRaceCheckpoint(t, pos) bot.cp = { pos.x, pos.y, pos.z } end
+    function sampev.onDisableRaceCheckpoint()   bot.cp = nil end
 end
 
+local arz = { t = -100, v = false }
 local function isArizona()
+    if os.clock() - arz.t < 5 then return arz.v end
+    arz.t = os.clock()
     local ok, name = pcall(sampGetCurrentServerName)
-    if not ok or type(name) ~= 'string' then return false end
+    if not ok or type(name) ~= 'string' then arz.v = false return false end
     local n = ruLower(u8(name))
-    return n:find('arizona', 1, true) ~= nil or n:find('аризона', 1, true) ~= nil
+    arz.v = n:find('arizona', 1, true) ~= nil or n:find('аризона', 1, true) ~= nil
+    return arz.v
 end
 
 local function botTarget()
-    local src = tonumber(cfg.bot.source) or 0
+    local src = num(cfg.bot.source, 0)
     if src ~= 2 and bot.cp then return bot.cp[1], bot.cp[2], bot.cp[3], 'чекпоинт' end
     if src ~= 1 then
         local ok, x, y, z = getTargetBlipCoordinates()
@@ -635,33 +357,40 @@ local function botTarget()
     end
 end
 
---------------------------------------------------------------
--- Собственный автопилот. ИИ GTA не используется вообще, поэтому
--- светофоров для бота не существует. Скрипт сам жмёт газ / тормоз / руль.
---------------------------------------------------------------
-local KEY_STEER, KEY_GAS, KEY_BRAKE, KEY_HANDBRAKE = 0, 16, 14, 6
+-- Клавиши ---------------------------------------------------------------
+local function pedal(v) return math.floor(clamp(v or 0, 0, 1) * 255) end
 
--- gas / brake: true/false или сила нажатия 0..1 (педали аналоговые)
-local function pedal(v)
-    if v == true then return 255 elseif not v then return 0 end
-    return math.floor(math.max(0, math.min(1, v)) * 255)
-end
-
-local function keys(steer, gas, brake, handbrake)
-    setGameKeyState(KEY_STEER, math.floor(math.max(-128, math.min(128, steer * 128))))
+local function keys(steer, gas, brake)
+    setGameKeyState(KEY_STEER, math.floor(clamp(steer, -1, 1) * 128))
     setGameKeyState(KEY_GAS, pedal(gas))
     setGameKeyState(KEY_BRAKE, pedal(brake))
-    setGameKeyState(KEY_HANDBRAKE, pedal(handbrake))
+    bot.active = true
 end
 
-local SPEED_NO_LIMIT = 61 -- ползунок скорости в крайнем правом положении
-
-local function botStop()
-    if bot.driving then
-        keys(0, false, false, false)
-        bot.driving, bot.wx, bot.wy, bot.vt = false, nil, nil, nil
+-- Отпустить всё и забыть маршрут. Клавиши трогаем только если бот ими управлял.
+local function botRelease()
+    if bot.active then
+        setGameKeyState(KEY_STEER, 0)
+        setGameKeyState(KEY_GAS, 0)
+        setGameKeyState(KEY_BRAKE, 0)
+        bot.active = false
     end
-    bot.man, bot.turnAt = nil, nil
+    bot.wx, bot.wy, bot.vt, bot.turnAt = nil, nil, nil, nil
+    bot.man, bot.recover, bot.stuckSince = nil, nil, nil
+end
+
+-- Геометрия -------------------------------------------------------------
+local geoCache = {}
+local function geo(car)
+    local m = getCarModel(car)
+    local g = geoCache[m]
+    if not g then
+        local minX, minY, _, maxX, maxY = getModelDimensions(m)
+        g = { front = maxY or 3, back = math.abs(minY or -3),
+              half = math.max(math.abs(minX or -1.2), maxX or 1.2) }
+        geoCache[m] = g
+    end
+    return g
 end
 
 -- Векторы машины: вперёд (fx, fy) и вправо (rx, ry)
@@ -678,191 +407,100 @@ local function toLocal(car, x, y)
     return dx * rx + dy * ry, dx * fx + dy * fy
 end
 
--- Безопасный луч. processLineOfSight иногда падает с ошибкой "cannot resume non-suspended
--- coroutine" (из-за этого скрипт умирал). Проверяем координаты, не пускаем нулевые и слишком
--- длинные лучи, а ошибку ловим через pcall - тогда считаем, что препятствия нет.
+local function minOf(...)
+    local m
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if v and (not m or v < m) then m = v end
+    end
+    return m
+end
+
+-- Лучи ------------------------------------------------------------------
+-- Все лучи начинаются СНАРУЖИ машины (не изнутри кузова и не у земли) - так
+-- processLineOfSight работает стабильно. Битые и нулевые лучи не пускаем.
 local function fin(v) return type(v) == 'number' and v == v and v > -1e5 and v < 1e5 end
-local function los(x1, y1, z1, x2, y2, z2, ...)
+local function los(x1, y1, z1, x2, y2, z2, cars)
     if not (fin(x1) and fin(y1) and fin(z1) and fin(x2) and fin(y2) and fin(z2)) then return false end
     local dx, dy, dz = x2 - x1, y2 - y1, z2 - z1
     local l2 = dx * dx + dy * dy + dz * dz
-    if l2 < 0.01 or l2 > 200 * 200 then return false end
-    -- Без pcall: если игра всё же сломается внутри луча, пусть лучше остановится скрипт, чем вылетит игра
-    return processLineOfSight(x1, y1, z1, x2, y2, z2, ...)
+    if l2 < 0.04 or l2 > 150 * 150 then return false end
+    return processLineOfSight(x1, y1, z1, x2, y2, z2, true, cars, cars, true, false, false, false, false)
 end
 
--- Прямая видимость между точками (здания и объекты), без учёта машин
+-- Прямая видимость (здания и объекты)
 local function clearLine(x1, y1, z1, x2, y2, z2)
-    local hit = los(x1, y1, z1, x2, y2, z2, true, false, false, true, false, false, false, false)
-    return not hit
+    return not los(x1, y1, z1, x2, y2, z2, false)
 end
 
--- Луч вперёд от бампера: расстояние до препятствия или nil. Подъёмы дороги не считаются.
-local function ray(car, side, len)
-    local minX, _, _, maxX, maxY = getModelDimensions(getCarModel(car))
-    local half = ((maxX or 1.2) - 0.2) * side
-    local front = (maxY or 3) + 0.3
-    local x1, y1, z1 = getOffsetFromCarInWorldCoords(car, half, front, 0.3)
-    local x2, y2, z2 = getOffsetFromCarInWorldCoords(car, half * 1.6, front + len, 0.3)
-    local hit, cp = los(x1, y1, z1, x2, y2, z2, true, true, true, true, false, false, false, false)
+-- Луч в координатах машины (x вправо, y вперёд) на высоте +0.3. Расстояние до препятствия или nil.
+-- Почти горизонтальные поверхности (подъём дороги) препятствием не считаются.
+local function cast(car, ax, ay, bx, by, cars)
+    local x1, y1, z1 = getOffsetFromCarInWorldCoords(car, ax, ay, 0.3)
+    local x2, y2, z2 = getOffsetFromCarInWorldCoords(car, bx, by, 0.3)
+    local hit, cp = los(x1, y1, z1, x2, y2, z2, cars)
     if not hit or not cp or not cp.pos then return nil end
     if cp.normal and cp.normal[3] and cp.normal[3] > 0.7 then return nil end
-    return getDistanceBetweenCoords3d(x1, y1, z1, cp.pos[1], cp.pos[2], cp.pos[3])
+    return getDistanceBetweenCoords2d(x1, y1, cp.pos[1], cp.pos[2])
 end
 
--- Препятствие сзади: минимальное расстояние по трём лучам от заднего бампера или nil
-local function rayBack(car, len)
-    local minX, minY, _, maxX = getModelDimensions(getCarModel(car))
-    local back = (minY or -3) - 0.3
-    local best
-    for _, side in ipairs({ -1, 0, 1 }) do
-        local half = ((maxX or 1.2) - 0.2) * side
-        local x1, y1, z1 = getOffsetFromCarInWorldCoords(car, half, back, 0.3)
-        local x2, y2, z2 = getOffsetFromCarInWorldCoords(car, half * 1.3, back - len, 0.3)
-        local hit, cp = los(x1, y1, z1, x2, y2, z2, true, true, true, true, false, false, false, false)
-        if hit and cp and cp.pos and not (cp.normal and cp.normal[3] and cp.normal[3] > 0.7) then
-            local d = getDistanceBetweenCoords3d(x1, y1, z1, cp.pos[1], cp.pos[2], cp.pos[3])
-            if not best or d < best then best = d end
+-- Датчики спереди: fl/fc/fr - лучи вперёд от бампера длиной len,
+-- cl/cr - лучи от передних углов наружу (видят угол дома или столб на повороте)
+local function senseFront(car, len)
+    local g = geo(car)
+    local h, f = g.half - 0.2, g.front + 0.2
+    local s = {
+        fl = cast(car, -h, f, -h * 1.15, f + len, true),
+        fc = cast(car, 0, f, 0, f + len, true),
+        fr = cast(car, h, f, h * 1.15, f + len, true),
+    }
+    for _, sd in ipairs({ -1, 1 }) do
+        local ox, oy = sd * (g.half + 0.15), g.front - 0.3
+        local best
+        for _, a in ipairs({ 35, 70 }) do
+            local r = math.rad(a)
+            best = minOf(best, cast(car, ox, oy, ox + sd * math.sin(r) * 2.8, oy + math.cos(r) * 2.8, false))
         end
+        if sd < 0 then s.cl = best else s.cr = best end
     end
-    return best
+    return s
 end
 
--- Луч от центра машины под углом deg к курсу (> 0 вправо, 180 - назад). Только здания и объекты
--- (свою машину не задевает). Возвращает расстояние от центра или nil.
-local function dirRay(car, deg, len)
-    local r = math.rad(deg)
-    local sn, cs = math.sin(r), math.cos(r)
-    -- Луч начинается у края кузова (не изнутри машины), но расстояние считаем от центра
-    local minX, minY, _, maxX, maxY = getModelDimensions(getCarModel(car))
-    local hy = (cs >= 0) and (maxY or 3) or math.abs(minY or -3)
-    local hx = (sn >= 0) and (maxX or 1.2) or math.abs(minX or -1.2)
-    local body = math.min(math.abs(cs) > 0.01 and hy / math.abs(cs) or 99, math.abs(sn) > 0.01 and hx / math.abs(sn) or 99)
-    local st = body + 0.3                               -- старт снаружи кузова, как у проверенного луча от бампера
-    if st >= len - 0.3 then return nil end
-    local best
-    for _, h in ipairs({ 0.3 }) do                      -- та же высота, что у луча от бампера (работал без проблем)
-        local x1, y1, z1 = getOffsetFromCarInWorldCoords(car, sn * st, cs * st, h)
-        local x2, y2, z2 = getOffsetFromCarInWorldCoords(car, sn * len, cs * len, h)
-        local hit, cp = los(x1, y1, z1, x2, y2, z2, true, false, false, true, false, false, false, false)
-        if hit and cp and cp.pos and not (cp.normal and cp.normal[3] and cp.normal[3] > 0.7) then
-            local d = st + getDistanceBetweenCoords2d(x1, y1, cp.pos[1], cp.pos[2])
-            if not best or d < best then best = d end
+-- Датчики сзади: bl/bc/br - назад от заднего бампера, rl/rr - от задних углов наружу
+local function senseRear(car)
+    local g = geo(car)
+    local h, b = g.half - 0.2, -(g.back + 0.2)
+    local s = {
+        bl = cast(car, -h, b, -h * 1.15, b - 4, true),
+        bc = cast(car, 0, b, 0, b - 4, true),
+        br = cast(car, h, b, h * 1.15, b - 4, true),
+    }
+    for _, sd in ipairs({ -1, 1 }) do
+        local ox, oy = sd * (g.half + 0.15), -(g.back - 0.3)
+        local best
+        for _, a in ipairs({ 35, 70 }) do
+            local r = math.rad(a)
+            best = minOf(best, cast(car, ox, oy, ox + sd * math.sin(r) * 2.8, oy - math.cos(r) * 2.8, false))
         end
+        if sd < 0 then s.rl = best else s.rr = best end
     end
-    return best
+    return s
 end
 
-local function carSize(car)
-    local minX, minY, _, maxX, maxY = getModelDimensions(getCarModel(car))
-    return math.abs(minY or -3), maxY or 3, maxX or 1.2
-end
-
--- Есть ли место проехать вперёд с поворотом в сторону dir (margin - запас перед бампером, м)
-local function frontFree(car, dir, margin)
-    local _, front, w = carSize(car)
-    for _, a in ipairs({ 0, 25, 50, 80 }) do
-        local need = (a >= 80) and (w + margin * 0.6) or (front + margin)
-        local d = dirRay(car, a * dir, need + 0.5)
-        if d and d < need then return false end
-    end
-    local c = ray(car, 0, margin)            -- машины и прочее прямо перед бампером
-    return not (c and c < margin)
-end
-
--- Есть ли место сдать назад (нос уходит в сторону dir, значит зад - в противоположную)
-local function rearFree(car, dir, margin)
-    local back = carSize(car)
-    for _, a in ipairs({ 180, 180 + 30 * dir, 180 + 55 * dir }) do
-        local d = dirRay(car, a, back + margin + 0.5)
-        if d and d < back + margin then return false end
-    end
-    local r = rayBack(car, margin)
-    return not (r and r < margin)
-end
-
--- Разворот к метке. Сначала пробует развернуться вперёд (если перед машиной есть место),
--- иначе сдаёт назад с рулём в обратную сторону. Чередует фазы, пока нос не смотрит на метку.
--- Упор (газ есть, а машина стоит) тоже переключает фазу. true - манёвр идёт.
-local function maneuver(car, tx, ty, dist, frontGap)
-    local now = os.clock()
-    local speed = getCarSpeed(car)
-    local lx, ly = toLocal(car, tx, ty)
-    local ang = math.deg(math.atan2(lx, ly))   -- угол на метку: > 0 справа, |180| - сзади
-    local a = math.abs(ang)
-
-    if not bot.man then
-        if cfg.bot.turn == false or now < (bot.manCooldown or 0) then return false end
-        local behind  = a > 110 and dist < 400
-        local side    = a > 65 and dist < 60 and speed < 6
-        local blocked = frontGap and frontGap < 6 and a > 30 and speed < 2 and dist < 100
-        if not (behind or side or blocked) then return false end
-        local dir = ang >= 0 and 1 or -1
-        bot.man = { dir = dir, since = now, start = now, n = 0,
-                    phase = frontFree(car, dir, 4) and 'fwd' or 'back' }
-    end
-    local m = bot.man
-    local dir = m.dir
-
-    if a < 25 or now - m.start > 45 or m.n > 16 then
-        bot.man = nil
-        bot.manCooldown = now + ((a < 25) and 1.5 or 6)
-        bot.wx, bot.nextPlan = nil, 0
-        return false
-    end
-
-    -- Упор: педаль нажата, а машина не едет
-    local pushing = speed < 0.4 and now - m.since > 0.8
-    if pushing then m.stall = m.stall or now else m.stall = nil end
-    local stalled = m.stall and now - m.stall > 0.6
-
-    local function switch(ph)
-        m.phase, m.since, m.n, m.stall = ph, now, m.n + 1, nil
-        keys(0, false, false, false)
-    end
-
-    if m.phase == 'back' then
-        -- Сдаём назад, пока зад не упрётся или нос не повернётся к метке
-        local free = rearFree(car, dir, 0.9)
-        if now - m.since > 0.6 and (not free or stalled or now - m.since > 6 or a < 30) then
-            switch('fwd')
-            return true
-        end
-        local slow = not rearFree(car, dir, 3.5)
-        keys(-dir, false, (speed < (slow and 2 or 4.5)) and 0.6 or 0, false)
-        bot.status = string.format('Разворот: назад, %d м', math.floor(dist))
-        return true
-    end
-
-    -- Вперёд с полным рулём к метке; места нет или упёрлись - назад
-    if now - m.since > 0.5 and (not frontFree(car, dir, 0.9) or stalled) then
-        switch('back')
-        return true
-    end
-    keys(dir, (speed < 5) and 0.5 or 0, false, false)
-    bot.status = string.format('Разворот: вперёд, %d м', math.floor(dist))
-    return true
-end
-
--- Выбор следующей точки: дорожные узлы впереди (прямо и под углами), до которых есть
--- прямой проезд. От узлов прямо по курсу смотрим ещё на шаг вперёд (повороты на перекрёстке),
--- чтобы заранее увидеть нужный поворот и сбросить скорость.
--- Проезд по ширине машины: две линии вдоль левого и правого борта до точки, на двух высотах.
--- Простая линия из центра не видит угол дома, о который цепляется край машины на повороте.
+-- Проезд по ширине машины: линии вдоль левого и правого борта до точки.
+-- Линия из центра не видит угол дома, о который цепляется край машины.
 local function corridorClear(car, x, y, z)
     local cx, cy, cz = getCarCoordinates(car)
-    local _, _, w = carSize(car)
-    local hw = w + 0.5
+    local g = geo(car)
+    local hw = g.half + 0.5
     local dx, dy = x - cx, y - cy
     local l = math.sqrt(dx * dx + dy * dy)
     if l < 2 then return true end
     local px, py = dy / l * hw, -dx / l * hw
-    local found, gz = pcall(getGroundZFor3dCoord, cx, cy, cz + 1)
-    local lift = (found and gz and gz ~= 0 and cz - gz > 0 and cz - gz < 3) and (cz - gz) or 0.8
-    local ez = (z or (cz - lift))
+    local ez = (z and fin(z) and math.abs(z - cz) < 30) and z + 0.8 or cz
     for _, sd in ipairs({ -1, 1 }) do
-        for _, h in ipairs({ 0.2, 0.6 }) do
-            if not clearLine(cx + px * sd, cy + py * sd, cz + h, x + px * sd, y + py * sd, ez + lift + h) then
+        for _, h in ipairs({ 0.2, 0.7 }) do
+            if not clearLine(cx + px * sd, cy + py * sd, cz + h, x + px * sd, y + py * sd, ez + h) then
                 return false
             end
         end
@@ -870,18 +508,24 @@ local function corridorClear(car, x, y, z)
     return true
 end
 
+-- Маршрут ---------------------------------------------------------------
+-- Дорожные узлы игры впереди (прямо и под углами), до которых есть проезд.
+-- От узлов прямо по курсу смотрим ещё на шаг вперёд, чтобы заранее увидеть нужный
+-- поворот на перекрёстке и сбросить скорость.
 local ANGLES = { 0, 20, -20, 45, -45, 75, -75, 90, -90 }
 local AHEAD  = { 0, 45, -45, 70, -70, 90, -90 }
+
 local function nodeNear(sx, sy, z, R)
     local nx, ny, nz = getClosestCarNode(sx, sy, z)
-    if nx and (nx ~= 0 or ny ~= 0) and getDistanceBetweenCoords2d(nx, ny, sx, sy) < R * 0.6 then
-        return nx, ny, nz or z
+    if nx and fin(nx) and fin(ny) and (nx ~= 0 or ny ~= 0) and getDistanceBetweenCoords2d(nx, ny, sx, sy) < R * 0.6 then
+        return nx, ny, (nz and fin(nz)) and nz or z
     end
 end
+
 local function planWaypoint(car, tx, ty, tz)
     local cx, cy, cz = getCarCoordinates(car)
     local fx, fy, rx, ry = carBasis(car)
-    local R = math.max(12, math.min(30, 10 + getCarSpeed(car) * 0.8))
+    local R = clamp(10 + getCarSpeed(car) * 0.8, 12, 30)
     local bestScore, bx, by, turn
     for _, a in ipairs(ANGLES) do
         local ar = math.rad(a)
@@ -893,9 +537,8 @@ local function planWaypoint(car, tx, ty, tz)
             local _, ly = toLocal(car, nx, ny)
             if ly > 3 and clearLine(cx, cy, cz + 0.6, nx, ny, nz + 0.6) then
                 local score = getDistanceBetweenCoords2d(nx, ny, tx, ty)
-                local t = nil
+                local t
                 if math.abs(a) <= 20 then
-                    -- Шаг вперёд от этого узла
                     local hx, hy = nx - cx, ny - cy
                     local hl = math.sqrt(hx * hx + hy * hy)
                     if hl > 1 then
@@ -913,11 +556,10 @@ local function planWaypoint(car, tx, ty, tz)
                                 if s2 < score then score = s2; t = (math.abs(b) >= 45) and b or nil end
                             end
                         end
-                        if t and straight - score < 8 then t = nil end -- поворот почти не выгоднее прямой
+                        if t and straight - score < 8 then t = nil end
                     end
                 end
                 score = score + math.abs(a) * 0.35
-                -- Узел, к которому машина не пролезает по ширине (срежет угол дома) - почти запрещён
                 if not corridorClear(car, nx, ny, nz) then score = score + 1000 end
                 if not bestScore or score < bestScore then
                     bestScore, bx, by = score, nx, ny
@@ -927,162 +569,208 @@ local function planWaypoint(car, tx, ty, tz)
         end
     end
     bot.turnAt = turn
-    -- Цель рядом и к ней прямой проезд - едем прямо к ней
+    -- Цель рядом и к ней есть проезд - едем прямо к ней
     local dist = getDistanceBetweenCoords2d(cx, cy, tx, ty)
-    if dist < 45 and clearLine(cx, cy, cz + 0.6, tx, ty, tz + 0.6) and corridorClear(car, tx, ty, tz) then bot.turnAt = nil; return tx, ty, true end
+    if dist < 45 and clearLine(cx, cy, cz + 0.6, tx, ty, tz + 0.6) and corridorClear(car, tx, ty, tz) then
+        bot.turnAt = nil
+        return tx, ty, true
+    end
     return bx, by, false
 end
 
+-- Разворот к метке --------------------------------------------------------
+-- Метка сзади или сбоку (или впереди стена). Если перед машиной есть место -
+-- разворачиваемся вперёд с полным рулём. Иначе сдаём назад с рулём в обратную
+-- сторону (нос уходит к метке). Фаза меняется, когда до препятствия меньше метра,
+-- когда машина упёрлась (педаль нажата, а не едет) или когда нос уже смотрит на метку.
+local function maneuver(car, tx, ty, dist, s, now, speed)
+    if cfg.bot.turn == false then bot.man = nil return false end
+    local lx, ly = toLocal(car, tx, ty)
+    local ang = math.deg(math.atan2(lx, ly))   -- > 0 справа, 180 - сзади
+    local a = math.abs(ang)
+    local m = bot.man
+
+    if not m then
+        if now < bot.manCooldown then return false end
+        local frontGap = minOf(s.fl, s.fc, s.fr)
+        local behind  = a > 110 and dist < 400 and speed < 12
+        local side    = a > 65 and dist < 60 and speed < 6
+        local blocked = frontGap and frontGap < 4 and a > 30 and speed < 2 and dist < 100
+        if not (behind or side or blocked) then return false end
+        local dir = ang >= 0 and 1 or -1
+        local cornerGap = (dir > 0) and s.cr or s.cl
+        local room = (not frontGap or frontGap > 3.5) and (not cornerGap or cornerGap > 1.5)
+        m = { dir = dir, phase = room and 'fwd' or 'back', since = now, start = now, n = 0 }
+        bot.man = m
+    end
+
+    if a < 25 or now - m.start > 45 or m.n > 16 then
+        bot.man = nil
+        bot.manCooldown = now + ((a < 25) and 1.5 or 8)
+        bot.wx, bot.nextPlan = nil, 0
+        return false
+    end
+
+    local t = now - m.since
+    if speed > 0.6 then m.moved = now end
+    local stalled = t > 1.0 and now - (m.moved or m.since) > 0.8
+    local dir = m.dir
+
+    if m.phase == 'fwd' then
+        local frontGap = minOf(s.fl, s.fc, s.fr)
+        local cornerGap = (dir > 0) and s.cr or s.cl
+        if t > 0.4 and ((frontGap and frontGap < 1.0) or (cornerGap and cornerGap < 0.6) or stalled) then
+            m.phase, m.since, m.n, m.moved = 'back', now, m.n + 1, nil
+            keys(0, 0, 1)
+            return true
+        end
+        keys(dir, (speed < 4.5) and 0.5 or 0, 0)
+        bot.status = string.format('Разворот: вперёд, %d м', math.floor(dist))
+        return true
+    end
+
+    -- Назад: при развороте носом к dir зад уходит в сторону -dir, его угол и проверяем
+    local r = senseRear(car)
+    local rearGap = minOf(r.bl, r.bc, r.br)
+    local cornerGap = (dir > 0) and r.rl or r.rr
+    if t > 0.4 and ((rearGap and rearGap < 1.0) or (cornerGap and cornerGap < 0.6) or stalled or a < 30 or t > 6) then
+        m.phase, m.since, m.n, m.moved = 'fwd', now, m.n + 1, nil
+        keys(0, 0, 0)
+        return true
+    end
+    local slow = (rearGap and rearGap < 3) or (cornerGap and cornerGap < 1.5)
+    keys(-dir, 0, (speed < (slow and 1.8 or 4)) and 0.6 or 0)
+    bot.status = string.format('Разворот: назад, %d м', math.floor(dist))
+    return true
+end
+
+-- Управление (каждый кадр) -------------------------------------------------
 local function botControl(car, tx, ty, tz, dist)
     local now = os.clock()
-    local careful = tonumber(cfg.bot.style) == 1
-    local vmax = tonumber(cfg.bot.speed) or 25
+    local careful = num(cfg.bot.style, 0) == 1
+    local vmax = num(cfg.bot.speed, 25)
     local speed = getCarSpeed(car)
+    local decel = careful and 5 or 7      -- комфортное замедление
+    local aLat  = careful and 6 or 8      -- боковое ускорение в повороте
+    local stopGap = careful and 5 or 3.5  -- сколько оставлять до препятствия
 
-    -- Задний ход после застревания
-    if now < bot.reverseUntil then
-        local rb = rayBack(car, 2)
-        if rb and rb < 1.2 then bot.reverseUntil = 0
+    -- 1. Отъезд назад после упора
+    if bot.recover then
+        local rc = bot.recover
+        local r = senseRear(car)
+        local rearGap = minOf(r.bl, r.bc, r.br, r.rl, r.rr)
+        if speed > 0.6 then rc.moved = now end
+        local stalled = now - rc.start > 1.0 and now - (rc.moved or rc.start) > 0.8
+        if now > rc.till or (rearGap and rearGap < 0.8) or stalled then
+            bot.recover, bot.wx, bot.nextPlan = nil, nil, 0
         else
-            keys(bot.reverseSteer, false, (speed < 4) and 0.7 or 0, false)
-            bot.vt = 0
+            keys(rc.steer, 0, (speed < 3.5) and 0.6 or 0)
+            bot.status = 'Отъезжаю от препятствия'
+            bot.bestTime = now
             return
         end
     end
 
-    -- Метка сзади / сбоку или упёрлись в препятствие - разворот к метке
-    local _, fr = carSize(car)
-    local fg = ray(car, 0, 12)
-    local fc = dirRay(car, 0, fr + 12)
-    if fc then fg = math.min(fg or 999, math.max(0, fc - fr)) end
-    if maneuver(car, tx, ty, dist, fg) then
+    local len = math.min(60, 6 + speed * speed / (2 * decel) + speed * 0.3)
+    local s = senseFront(car, len)
+
+    -- 2. Разворот к метке
+    if maneuver(car, tx, ty, dist, s, now, speed) then
         bot.vt, bot.stuckSince, bot.bestTime = 0, nil, now
         return
     end
 
+    -- 3. Точка маршрута (5 раз в секунду)
     if now >= bot.nextPlan or not bot.wx then
         bot.nextPlan = now + 0.2
         local wx, wy, direct = planWaypoint(car, tx, ty, tz)
         if wx and cfg.bot.lane and not direct then
-            -- Своя полоса: сдвигаем точку маршрута вправо от оси дороги (правостороннее движение)
+            -- Своя полоса: сдвигаем точку вправо от оси дороги (правостороннее движение)
             local cx, cy, cz = getCarCoordinates(car)
             local dx, dy = wx - cx, wy - cy
-            local len = math.sqrt(dx * dx + dy * dy)
-            if len > 1 then
-                local off = tonumber(cfg.bot.laneOff) or 2.5
-                local sx, sy = wx + dy / len * off, wy - dx / len * off
+            local l = math.sqrt(dx * dx + dy * dy)
+            if l > 1 then
+                local off = num(cfg.bot.laneOff, 2.5)
+                local sx, sy = wx + dy / l * off, wy - dx / l * off
                 if clearLine(cx, cy, cz + 0.6, sx, sy, cz + 0.6) then wx, wy = sx, sy end
             end
         end
-        if wx then bot.wx, bot.wy = wx, wy end
-    end
-    if not bot.wx then
-        -- Дороги рядом не нашли: аккуратно катимся вперёд
-        keys(0, speed < 4, false, false)
-        return
+        bot.wx, bot.wy = wx, wy
     end
 
-    local lx, ly = toLocal(car, bot.wx, bot.wy)
-    local ang = math.atan2(lx, ly)                       -- > 0 вправо
-    local steer = math.max(-1, math.min(1, ang / 0.5))
+    local steer, v = 0, 4
+    if bot.wx then
+        local lx, ly = toLocal(car, bot.wx, bot.wy)
+        local ang = math.atan2(lx, ly)
+        steer = clamp(ang / 0.5, -1, 1)
+        v = (vmax >= SPEED_NO_LIMIT) and 999 or vmax
+        -- Поворот: скорость по радиусу дуги до точки
+        local wd = math.max(5, math.sqrt(lx * lx + ly * ly))
+        local sn = math.abs(math.sin(clamp(ang, -1.5, 1.5)))
+        if sn > 0.02 then v = math.min(v, math.max(6, math.sqrt(aLat * wd / (2 * sn)))) end
+    end
 
-    -- Желаемая скорость = минимум из нескольких безопасных скоростей.
-    -- decel - комфортное замедление, aLat - допустимое боковое ускорение в повороте.
-    local decel = careful and 5 or 7
-    local aLat  = careful and 6 or 8
-    local v = (vmax >= SPEED_NO_LIMIT) and 999 or vmax
-
-    -- Поворот: скорость по радиусу дуги до точки маршрута (на прямой ограничения нет)
-    local wd = math.max(5, math.sqrt(lx * lx + ly * ly))
-    local s = math.abs(math.sin(math.max(-1.5, math.min(1.5, ang))))
-    if s > 0.02 then v = math.min(v, math.max(6, math.sqrt(aLat * wd / (2 * s)))) end
-
-    -- Цель: плавно подъезжаем и останавливаемся в радиусе прибытия
-    local left = dist - (tonumber(cfg.bot.radius) or 12)
-    v = math.min(v, math.sqrt(2 * decel * math.max(0, left)) + 2)
-
-    -- Впереди нужный поворот на перекрёстке: заранее сбрасываем скорость
+    -- Подъезд к метке и к нужному повороту
+    v = math.min(v, math.sqrt(2 * decel * math.max(0, dist - num(cfg.bot.radius, 12))) + 2)
     if bot.turnAt then
         local cx, cy = getCarCoordinates(car)
         local jd = getDistanceBetweenCoords2d(cx, cy, bot.turnAt.x, bot.turnAt.y)
         v = math.min(v, math.sqrt(2 * decel * math.max(0, jd - 4)) + (careful and 6 or 8))
     end
 
-    -- Препятствия. Луч длиной с тормозной путь. Центр тормозит по-настоящему,
-    -- боковые лучи только немного сбавляют и подруливают.
-    local stopGap = careful and 5 or 3.5
-    local len = math.min(60, 6 + speed * speed / (2 * decel) + speed * 0.3)
-    local l, c, r = ray(car, -1, len), ray(car, 0, len), ray(car, 1, len)
-    -- Стена вплотную к бамперу (луч от бампера её не видит) - проверяем от центра машины
-    local _, front = carSize(car)
-    local cc = dirRay(car, 0, front + 3)
-    if cc then c = math.min(c or 999, math.max(0, cc - front)) end
+    -- Препятствие прямо по курсу - настоящее торможение
     local danger = false
-    if c then
-        v = math.min(v, math.sqrt(2 * decel * math.max(0, c - stopGap)))
-        danger = c < stopGap + 2
+    if s.fc then
+        v = math.min(v, math.sqrt(2 * decel * math.max(0, s.fc - stopGap)))
+        danger = s.fc < stopGap + 2
     end
-    local side = math.min(l or 999, r or 999)
-    if side < 999 then v = math.min(v, math.sqrt(2 * decel * math.max(0, side - 1.5)) + 6) end
-    if l and not r then steer = steer + 0.5 elseif r and not l then steer = steer - 0.5 end
-    steer = math.max(-1, math.min(1, steer))
+    -- Боковые лучи бампера - немного сбавить и подрулить
+    local side = minOf(s.fl, s.fr)
+    if side then v = math.min(v, math.sqrt(2 * decel * math.max(0, side - 1.5)) + 6) end
+    if s.fl and not s.fr then steer = steer + 0.5 elseif s.fr and not s.fl then steer = steer - 0.5 end
+    -- Углы кузова: угол дома/столб рядом - выпрямить руль, отвести машину, сбавить
+    local gap = 1.0 + math.min(speed, 10) * 0.1
+    local nearL = s.cl and s.cl < gap and s.cl or nil
+    local nearR = s.cr and s.cr < gap and s.cr or nil
+    if nearL then
+        v = math.min(v, 4 + nearL * 4)
+        if steer < 0 then steer = steer * 0.25 end
+        if not nearR then steer = steer + 0.35 end
+    end
+    if nearR then
+        v = math.min(v, 4 + nearR * 4)
+        if steer > 0 then steer = steer * 0.25 end
+        if not nearL then steer = steer - 0.35 end
+    end
+    steer = clamp(steer, -1, 1)
 
-    -- Углы машины в повороте: лучи от центра под 30 и 60 градусов в обе стороны.
-    -- Препятствие сбоку близко к кузову - выравниваем руль (не цепляем угол) и сбавляем.
-    local _, _, w = carSize(car)
-    local gap = 1.0 + math.min(speed, 10) * 0.1      -- до 2 м: отбойники вдоль трассы не мешают
-    local near = {}
-    for _, a in ipairs({ 30, 60 }) do
-        local body = math.min(front / math.cos(math.rad(a)), w / math.sin(math.rad(a)))
-        for _, sd in ipairs({ -1, 1 }) do
-            local d = dirRay(car, a * sd, body + gap + 1)
-            if d and d < body + gap then near[sd] = math.min(near[sd] or 99, d - body) end
-        end
-    end
-    for _, sd in ipairs({ -1, 1 }) do
-        if near[sd] then
-            v = math.min(v, 4 + near[sd] * 4)
-            if steer * sd > 0 then steer = steer * 0.25 end   -- рулили на препятствие - выпрямляем
-            if not near[-sd] then steer = steer - sd * 0.35 end -- отходим от него
-        end
-    end
-    steer = math.max(-1, math.min(1, steer))
-    bot.nearL, bot.nearR = near[-1], near[1]
-
-    -- Сглаживание: желаемая скорость меняется плавно, кроме реальной опасности прямо по курсу
+    -- Плавная желаемая скорость (кроме опасности прямо по курсу)
     local dt = math.min(0.2, now - (bot.lastCtl or now))
     bot.lastCtl = now
     bot.vt = bot.vt or speed
-    if danger then
-        bot.vt = v
-    elseif v < bot.vt then
-        bot.vt = bot.vt + (v - bot.vt) * math.min(1, dt * 4)
-    else
-        bot.vt = bot.vt + (v - bot.vt) * math.min(1, dt * 1.5)
-    end
+    if danger then bot.vt = v
+    elseif v < bot.vt then bot.vt = bot.vt + (v - bot.vt) * math.min(1, dt * 4)
+    else bot.vt = bot.vt + (v - bot.vt) * math.min(1, dt * 1.5) end
 
-    -- Педали: газ пропорционально нехватке скорости, небольшое превышение - просто отпускаем газ,
-    -- тормоз только при заметном превышении и тоже пропорционально
+    -- Педали пропорционально; небольшое превышение - просто отпускаем газ
     local diff = bot.vt - speed
     local gas, brake = 0, 0
-    if diff > 0.3 then
-        gas = math.max(0.25, math.min(1, diff / 6))
-    elseif diff < -3 then
-        brake = math.max(0.15, math.min(1, (-diff - 3) / 8))
-    end
-    keys(steer, gas, brake, false)
+    if diff > 0.3 then gas = clamp(diff / 6, 0.25, 1)
+    elseif diff < -3 then brake = clamp((-diff - 3) / 8, 0.15, 1) end
+    keys(steer, gas, brake)
 
-    -- Застряли: жмём газ и не едем или стоим носом в препятствие - сдаём назад 2 секунды.
+    -- Упёрлись: стоим 1.2 с (газ нажат или нос у препятствия) - отъезжаем назад 2 с.
     -- Руль при заднем ходе в сторону препятствия: нос уходит от него.
-    if speed < 0.5 and (gas > 0 or (c and c < stopGap + 1) or bot.nearL or bot.nearR) then
+    if speed < 0.5 and (gas > 0 or danger or nearL or nearR) then
         bot.stuckSince = bot.stuckSince or now
         if now - bot.stuckSince > 1.2 then
             local rs
-            if bot.nearR and not bot.nearL then rs = 1
-            elseif bot.nearL and not bot.nearR then rs = -1
+            if nearR and not nearL then rs = 1
+            elseif nearL and not nearR then rs = -1
+            elseif s.fr and not s.fl then rs = 1
+            elseif s.fl and not s.fr then rs = -1
             else rs = (steer >= 0) and 1 or -1 end
-            bot.reverseUntil, bot.reverseSteer, bot.stuckSince = now + 2, rs, nil
-            bot.wx, bot.nextPlan = nil, 0
+            bot.recover, bot.stuckSince = { start = now, till = now + 2, steer = rs }, nil
         end
     else
         bot.stuckSince = nil
@@ -1091,49 +779,47 @@ end
 
 local function botThread()
     while true do
-        wait(bot.driving and 0 or 100)
-        if not cfg.bot.enabled then
-            botStop(); bot.status = 'Выключен'
+        wait(bot.active and 0 or 100)
+        if cfg.bot.enabled ~= true then
+            botRelease(); bot.status = 'Выключен'
         elseif isArizona() then
-            botStop(); bot.status = 'Недоступно на Arizona RP'
+            botRelease(); bot.status = 'Недоступно на Arizona RP'
         elseif not isCharInAnyCar(PLAYER_PED) then
-            botStop(); bot.status = 'Сядьте в транспорт'
+            botRelease(); bot.status = 'Сядьте в транспорт'
         else
             local car = storeCarCharIsInNoSave(PLAYER_PED)
             if getDriverOfCar(car) ~= PLAYER_PED then
-                botStop(); bot.status = 'Сядьте за руль'
+                botRelease(); bot.status = 'Сядьте за руль'
             else
                 local x, y, z, name = botTarget()
                 if not x then
-                    botStop(); bot.status = 'Нет метки'; bot.arrived = false
+                    botRelease(); bot.status = 'Нет метки'; bot.arrived = false
                 else
                     local px, py = getCharCoordinates(PLAYER_PED)
                     local dist = getDistanceBetweenCoords2d(px, py, x, y)
                     local typing = sampIsChatInputActive() or sampIsDialogActive() or isSampfuncsConsoleActive()
                     local manual = cfg.bot.takeover and not typing and (isKeyDown(0x57) or isKeyDown(0x53))
 
-                    -- новая цель - сбрасываем прогресс
                     if not bot.tx or getDistanceBetweenCoords2d(bot.tx, bot.ty, x, y) > 10 then
                         bot.tx, bot.ty = x, y
                         bot.best, bot.bestTime, bot.gaveUp, bot.arrived = dist, os.clock(), false, false
+                        bot.man, bot.recover, bot.wx = nil, nil, nil
                     end
                     if dist < bot.best - 5 then bot.best, bot.bestTime = dist, os.clock() end
 
-                    if dist <= (tonumber(cfg.bot.radius) or 12) then
-                        if getCarSpeed(car) > 1 then keys(0, false, true, false); bot.driving = true
-                        else botStop() end
+                    if dist <= num(cfg.bot.radius, 12) then
+                        if getCarSpeed(car) > 1 then keys(0, 0, 1) else botRelease() end
                         if not bot.arrived then msg('Бот: прибыли (' .. name .. ').') end
                         bot.arrived, bot.status = true, 'Прибыл'
                     elseif bot.gaveUp then
-                        botStop(); bot.status = 'Ближе по дороге не подъехать'
+                        botRelease(); bot.status = 'Ближе по дороге не подъехать'
                     elseif os.clock() - bot.bestTime > 45 then
-                        botStop(); bot.gaveUp = true
+                        botRelease(); bot.gaveUp = true
                         msg('Бот: 45 секунд не получается приблизиться к метке, остановился.')
                     elseif manual then
-                        botStop(); bot.pauseUntil = os.clock() + 3
+                        botRelease(); bot.pauseUntil = os.clock() + 3
                         bot.status = 'Управление у вас'
                     elseif os.clock() >= bot.pauseUntil then
-                        bot.driving = true
                         bot.status = string.format('Едет: %s, %d м', name, math.floor(dist))
                         botControl(car, x, y, z, dist)
                     end
@@ -1144,44 +830,192 @@ local function botThread()
 end
 
 --==============================================================
--- Меню
+-- Меню (mimgui)
 --==============================================================
-local menu = { window = imgui.new.bool(false), tab = 1 }
+local V4  = imgui.ImVec4
+local function vec(x, y) return imgui.ImVec2(x, y) end
+local function U32(c) return imgui.ColorConvertFloat4ToU32(c) end
+local WHITE = V4(1, 1, 1, 1)
+local GRAY  = V4(0.55, 0.58, 0.65, 1)
+local GREEN = V4(0.35, 0.85, 0.45, 1)
+local ACCENT = V4(0.25, 0.6, 1, 1)
 
 local function f3(hex) local r, g, b = hexToRGB(hex) return imgui.new.float[3](r, g, b) end
 local function setF3(arr, hex) local r, g, b = hexToRGB(hex) arr[0], arr[1], arr[2] = r, g, b end
 
-local ui = {
-    spawnOn    = imgui.new.bool(cfg.spawn.enabled),
-    spawnMode  = imgui.new.int(tonumber(cfg.spawn.mode) or 0),
-    spawnDelay = imgui.new.int(tonumber(cfg.spawn.delay) or 1000),
-    spawnItem  = imgui.new.int(tonumber(cfg.spawn.item) or 1),
-    spawnKw    = imgui.new.char[64](tostring(cfg.spawn.keyword)),
+local menu = { window = imgui.new.bool(false), tab = 1, frames = 0, err = nil }
 
-    botOn      = imgui.new.bool(cfg.bot.enabled),
-    botSource  = imgui.new.int(tonumber(cfg.bot.source) or 0),
-    botSpeed   = imgui.new.int(tonumber(cfg.bot.speed) or 25),
-    botStyle   = imgui.new.int(tonumber(cfg.bot.style) or 0),
-    botRadius  = imgui.new.int(tonumber(cfg.bot.radius) or 12),
-    botTake    = imgui.new.bool(cfg.bot.takeover),
-    botLane    = imgui.new.bool(cfg.bot.lane),
+local ui = {
+    spawnOn    = imgui.new.bool(cfg.spawn.enabled == true),
+    spawnMode  = imgui.new.int(num(cfg.spawn.mode, 0)),
+    spawnDelay = imgui.new.int(num(cfg.spawn.delay, 1000)),
+    spawnItem  = imgui.new.int(num(cfg.spawn.item, 1)),
+    spawnKw    = imgui.new.char[64](tostring(cfg.spawn.keyword or '')),
+
+    botOn      = imgui.new.bool(cfg.bot.enabled == true),
+    botSource  = imgui.new.int(num(cfg.bot.source, 0)),
+    botSpeed   = imgui.new.int(num(cfg.bot.speed, 25)),
+    botStyle   = imgui.new.int(num(cfg.bot.style, 0)),
+    botRadius  = imgui.new.int(num(cfg.bot.radius, 12)),
+    botTake    = imgui.new.bool(cfg.bot.takeover ~= false),
     botTurn    = imgui.new.bool(cfg.bot.turn ~= false),
-    botLaneOff = imgui.new.float(tonumber(cfg.bot.laneOff) or 2.5),
+    botLane    = imgui.new.bool(cfg.bot.lane == true),
+    botLaneOff = imgui.new.float(num(cfg.bot.laneOff, 2.5)),
 
     accent     = f3(cfg.theme.accent),
     bg         = f3(cfg.theme.bg),
-    childAlpha = imgui.new.float(tonumber(cfg.theme.childAlpha) or 0.8),
-    rounding   = imgui.new.int(tonumber(cfg.theme.rounding) or 12),
-    pOn        = imgui.new.bool(cfg.particles.enabled),
-    pRainbow   = imgui.new.bool(cfg.particles.rainbow),
+    childAlpha = imgui.new.float(num(cfg.theme.childAlpha, 0.8)),
+    rounding   = imgui.new.int(num(cfg.theme.rounding, 12)),
+    pOn        = imgui.new.bool(cfg.particles.enabled ~= false),
+    pRainbow   = imgui.new.bool(cfg.particles.rainbow == true),
     pColor     = f3(cfg.particles.color),
-    pCount     = imgui.new.int(tonumber(cfg.particles.count) or 70),
-    pSpeed     = imgui.new.int(tonumber(cfg.particles.speed) or 60),
-    pSize      = imgui.new.float(tonumber(cfg.particles.size) or 2.0),
-    pAlpha     = imgui.new.float(tonumber(cfg.particles.alpha) or 0.6),
+    pCount     = imgui.new.int(num(cfg.particles.count, 70)),
+    pSpeed     = imgui.new.int(num(cfg.particles.speed, 60)),
+    pSize      = imgui.new.float(num(cfg.particles.size, 2.0)),
+    pAlpha     = imgui.new.float(num(cfg.particles.alpha, 0.6)),
 
-    autoUpd    = imgui.new.bool(cfg.update.auto),
+    autoUpd    = imgui.new.bool(cfg.update.auto ~= false),
 }
+
+-- Тема ------------------------------------------------------------------
+local function applyTheme()
+    local style = imgui.GetStyle()
+    local c, col = style.Colors, imgui.Col
+    local ar, ag, ab = hexToRGB(cfg.theme.accent)
+    local br, bg, bb = hexToRGB(cfg.theme.bg)
+    local function mix(k, a)
+        if k >= 0 then return V4(ar + (1 - ar) * k, ag + (1 - ag) * k, ab + (1 - ab) * k, a or 1) end
+        return V4(ar * (1 + k), ag * (1 + k), ab * (1 + k), a or 1)
+    end
+    local function lift(k, a) return V4(math.min(1, br + k), math.min(1, bg + k), math.min(1, bb + k), a or 1) end
+    local rnd = num(cfg.theme.rounding, 12)
+    ACCENT = V4(ar, ag, ab, 1)
+
+    style.WindowPadding     = vec(14, 14)
+    style.FramePadding      = vec(10, 6)
+    style.ItemSpacing       = vec(10, 10)
+    style.WindowRounding    = rnd
+    style.ChildRounding     = rnd * 0.8
+    style.FrameRounding     = rnd * 0.6
+    style.GrabRounding      = rnd * 0.6
+    style.ScrollbarRounding = rnd * 0.6
+    style.GrabMinSize       = 14
+    style.WindowBorderSize  = 1
+    style.ChildBorderSize   = 1
+
+    c[col.WindowBg]         = V4(br, bg, bb, 0.97)
+    c[col.ChildBg]          = lift(0.03, num(cfg.theme.childAlpha, 0.8))
+    c[col.PopupBg]          = lift(0.02, 0.98)
+    c[col.Border]           = V4(ar, ag, ab, 0.40)
+    c[col.Separator]        = V4(ar, ag, ab, 0.25)
+    c[col.Text]             = V4(0.92, 0.94, 0.97, 1.00)
+    c[col.TextDisabled]     = GRAY
+    c[col.FrameBg]          = lift(0.06)
+    c[col.FrameBgHovered]   = lift(0.09)
+    c[col.FrameBgActive]    = lift(0.12)
+    c[col.Button]           = mix(-0.15)
+    c[col.ButtonHovered]    = mix(0.12)
+    c[col.ButtonActive]     = mix(-0.30)
+    c[col.Header]           = V4(ar, ag, ab, 0.35)
+    c[col.HeaderHovered]    = V4(ar, ag, ab, 0.50)
+    c[col.HeaderActive]     = V4(ar, ag, ab, 0.65)
+    c[col.PlotHistogram]    = ACCENT
+    c[col.SliderGrab]       = ACCENT
+    c[col.SliderGrabActive] = mix(0.25)
+    c[col.CheckMark]        = ACCENT
+    c[col.ScrollbarBg]      = lift(0.0)
+    c[col.ScrollbarGrab]    = lift(0.12)
+end
+
+-- Шрифт с кириллицей. Таблица диапазонов хранится глобально, чтобы её не собрал сборщик мусора.
+local fontRanges
+imgui.OnInitialize(function()
+    log('[menu] инициализация...')
+    local io = imgui.GetIO()
+    io.IniFilename = nil
+    local dir = getFolderPath(0x14)
+    local file
+    for _, name in ipairs({ 'trebucbd.ttf', 'segoeui.ttf', 'arial.ttf', 'tahoma.ttf' }) do
+        if dir and doesFileExist(dir .. '\\' .. name) then file = dir .. '\\' .. name break end
+    end
+    if file then
+        fontRanges = io.Fonts:GetGlyphRangesCyrillic()
+        io.Fonts:Clear()
+        local font = io.Fonts:AddFontFromFileTTF(file, 16.0, nil, fontRanges)
+        if font == nil then io.Fonts:AddFontDefault() end
+        log('[menu] шрифт: ' .. file)
+    end
+    local ok, err = pcall(applyTheme)
+    if not ok then log('[menu] ошибка темы: ' .. tostring(err)) end
+    log('[menu] инициализация готова')
+end)
+
+-- Виджеты ---------------------------------------------------------------
+local anim = {}
+local function approach(id, target, speed)
+    local v = anim[id] or target
+    v = v + (target - v) * math.min(1, imgui.GetIO().DeltaTime * (speed or 12))
+    anim[id] = v
+    return v
+end
+local function lerp(a, b, t) return a + (b - a) * t end
+local function lerpV4(a, b, t) return V4(lerp(a.x, b.x, t), lerp(a.y, b.y, t), lerp(a.z, b.z, t), lerp(a.w, b.w, t)) end
+
+local function section(title)
+    imgui.Spacing()
+    imgui.TextColored(ACCENT, title)
+    imgui.Separator()
+end
+
+local function hint(text)
+    imgui.PushTextWrapPos(0)
+    imgui.TextDisabled(text)
+    imgui.PopTextWrapPos()
+end
+
+local function centerText(text, color)
+    local w = imgui.CalcTextSize(text).x
+    imgui.SetCursorPosX((imgui.GetWindowWidth() - w) / 2)
+    imgui.TextColored(color or WHITE, text)
+end
+
+local function toggle(id, label, ptr)
+    local dl = imgui.GetWindowDrawList()
+    local p  = imgui.GetCursorScreenPos()
+    local h  = imgui.GetFrameHeight()
+    local w  = h * 1.9
+    local clicked = imgui.InvisibleButton(id, vec(w, h))
+    if clicked then ptr[0] = not ptr[0] end
+    local t = approach(id, ptr[0] and 1 or 0)
+    local bg = lerpV4(V4(0.22, 0.24, 0.30, 1), ACCENT, t)
+    if imgui.IsItemHovered() then bg = lerpV4(bg, WHITE, 0.08) end
+    dl:AddRectFilled(p, vec(p.x + w, p.y + h), U32(bg), h / 2)
+    dl:AddCircleFilled(vec(p.x + h / 2 + t * (w - h), p.y + h / 2), h / 2 - 3, U32(WHITE), 24)
+    imgui.SameLine()
+    imgui.AlignTextToFramePadding()
+    imgui.Text(label)
+    return clicked
+end
+
+local function segmented(id, ptr, items)
+    local sp = imgui.GetStyle().ItemSpacing.x
+    local w  = (imgui.GetContentRegionAvail().x - sp * (#items - 1)) / #items
+    local changed = false
+    for i, name in ipairs(items) do
+        if i > 1 then imgui.SameLine() end
+        local active = ptr[0] == i - 1
+        if not active then
+            imgui.PushStyleColor(imgui.Col.Button, V4(0.22, 0.24, 0.30, 1))
+            imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.30, 0.32, 0.40, 1))
+        end
+        if imgui.Button(name .. '##' .. id .. i, vec(w, 30)) and not active then
+            ptr[0] = i - 1
+            changed = true
+        end
+        if not active then imgui.PopStyleColor(2) end
+    end
+    return changed
+end
 
 local function sliderInt(label, id, ptr, min, max, fmt)
     imgui.Text(label)
@@ -1206,13 +1040,106 @@ local function colorRow(id, label, arr)
     return changed
 end
 
-------------------------- Авто спавн ---------------------------
+local function grayButton(label, size)
+    imgui.PushStyleColor(imgui.Col.Button,        V4(0.22, 0.24, 0.30, 1))
+    imgui.PushStyleColor(imgui.Col.ButtonHovered, V4(0.30, 0.32, 0.40, 1))
+    imgui.PushStyleColor(imgui.Col.ButtonActive,  V4(0.18, 0.20, 0.25, 1))
+    local pressed = imgui.Button(label, size)
+    imgui.PopStyleColor(3)
+    return pressed
+end
+
+-- Иконки (рисуются линиями) ------------------------------------------------
+local function iconPerson(dl, c, col)
+    dl:AddCircleFilled(vec(c.x, c.y - 4), 3.5, col, 16)
+    dl:AddRectFilled(vec(c.x - 6, c.y + 1), vec(c.x + 6, c.y + 8), col, 4)
+end
+
+local function drawTruck(dl, x, y, s, body, cab)
+    local function R(a, b, c2, d, col, r) dl:AddRectFilled(vec(x + a * s, y + b * s), vec(x + c2 * s, y + d * s), col, r or 0) end
+    R(0, 4, 38, 26, body, 3 * s)          -- кузов
+    R(40, 10, 56, 26, cab, 3 * s)         -- кабина
+    R(44, 13, 53, 19, U32(V4(0.6, 0.8, 1, 0.9)), 1.5 * s) -- окно
+    for _, wx in ipairs({ 9, 30, 48 }) do
+        dl:AddCircleFilled(vec(x + wx * s, y + 28 * s), 4.5 * s, U32(V4(0.1, 0.1, 0.12, 1)), 16)
+        dl:AddCircleFilled(vec(x + wx * s, y + 28 * s), 2 * s, U32(V4(0.6, 0.6, 0.65, 1)), 12)
+    end
+end
+local function iconTruck(dl, c, col) drawTruck(dl, c.x - 9.3, c.y - 6, 0.32, col, col) end
+
+local function iconPalette(dl, c, col)
+    dl:AddCircle(c, 7.5, col, 20, 2)
+    for i = 0, 2 do
+        local a = i * 2.1 - 1.2
+        dl:AddCircleFilled(vec(c.x + math.cos(a) * 3.8, c.y + math.sin(a) * 3.8), 1.8, col, 8)
+    end
+end
+
+local function iconInfo(dl, c, col)
+    dl:AddCircle(c, 7.5, col, 20, 2)
+    dl:AddRectFilled(vec(c.x - 1, c.y - 1), vec(c.x + 1, c.y + 4.5), col)
+    dl:AddCircleFilled(vec(c.x, c.y - 3.5), 1.3, col, 8)
+end
+
+local function iconClose(dl, c, col)
+    dl:AddLine(vec(c.x - 5, c.y - 5), vec(c.x + 5, c.y + 5), col, 2)
+    dl:AddLine(vec(c.x + 5, c.y - 5), vec(c.x - 5, c.y + 5), col, 2)
+end
+
+local function sidebarButton(id, name, icon, active)
+    local dl = imgui.GetWindowDrawList()
+    local p  = imgui.GetCursorScreenPos()
+    local w  = imgui.GetContentRegionAvail().x
+    local h  = 40
+    local clicked = imgui.InvisibleButton(id, vec(w, h))
+    local t = approach(id, active and 1 or (imgui.IsItemHovered() and 0.45 or 0), 14)
+    if t > 0.01 then
+        dl:AddRectFilled(p, vec(p.x + w, p.y + h), U32(V4(ACCENT.x, ACCENT.y, ACCENT.z, 0.18 * t)), 8)
+    end
+    if active then dl:AddRectFilled(vec(p.x, p.y + 8), vec(p.x + 4, p.y + h - 8), U32(ACCENT), 2) end
+    local col = U32(lerpV4(GRAY, WHITE, t))
+    icon(dl, vec(p.x + 22, p.y + h / 2), col)
+    dl:AddText(vec(p.x + 42, p.y + (h - imgui.GetTextLineHeight()) / 2), col, name)
+    return clicked
+end
+
+-- Падающие частицы ---------------------------------------------------------
+local particles = {}
+local function newParticle(w, h, fromTop)
+    return { x = math.random() * w, y = fromTop and -math.random() * 20 or math.random() * h,
+             sp = 0.5 + math.random(), drift = (math.random() - 0.5) * 12,
+             sz = 0.6 + math.random() * 0.8, a = 0.4 + math.random() * 0.6, hue = math.random() }
+end
+
+local function drawParticles(dl, pos, size)
+    local P = cfg.particles
+    if not P.enabled then return end
+    local n = math.floor(clamp(num(P.count, 0), 0, 300))
+    while #particles < n do particles[#particles + 1] = newParticle(size.x, size.y, false) end
+    while #particles > n do particles[#particles] = nil end
+    local dt, time = imgui.GetIO().DeltaTime, imgui.GetTime()
+    local r, g, b = hexToRGB(P.color)
+    for i = 1, #particles do
+        local p = particles[i]
+        p.y = p.y + num(P.speed, 60) * p.sp * dt
+        p.x = p.x + p.drift * dt
+        if p.y > size.y + 6 or p.x < -6 or p.x > size.x + 6 then
+            p = newParticle(size.x, size.y, true)
+            particles[i] = p
+        end
+        local cr, cg, cb = r, g, b
+        if P.rainbow then cr, cg, cb = hsv((p.hue + time * 0.1) % 1, 0.65, 1) end
+        dl:AddCircleFilled(vec(pos.x + p.x, pos.y + p.y), num(P.size, 2) * p.sz,
+                           U32(V4(cr, cg, cb, num(P.alpha, 0.6) * p.a)), 12)
+    end
+end
+
+-- Вкладки ----------------------------------------------------------------
 local function drawSpawnTab()
     section('Основное')
     if toggle('##spawn_on', 'Включить авто спавн', ui.spawnOn) then
         cfg.spawn.enabled = ui.spawnOn[0]; saveCfg()
     end
-
     section('Режим')
     if segmented('spawn_mode', ui.spawnMode, { 'Кнопка Spawn', 'Пункт в диалоге' }) then
         cfg.spawn.mode = ui.spawnMode[0]; saveCfg()
@@ -1231,33 +1158,28 @@ local function drawSpawnTab()
             cfg.spawn.item = ui.spawnItem[0]; saveCfg()
         end
     end
-
     section('Задержка')
     if sliderInt('Перед спавном:', '##spawn_delay', ui.spawnDelay, 0, 5000, '%d мс') then
         cfg.spawn.delay = ui.spawnDelay[0]; saveCfg()
     end
 end
 
-------------------------- Авто фарм ----------------------------
 local function drawFarmTab()
     section('Бот дальнобойщик')
-
     local dl = imgui.GetWindowDrawList()
     local p  = imgui.GetCursorScreenPos()
     local w  = imgui.GetContentRegionAvail().x
     local h  = 92
     dl:AddRectFilled(p, vec(p.x + w, p.y + h), U32(V4(ACCENT.x, ACCENT.y, ACCENT.z, 0.10)), 10)
-    dl:AddLine(vec(p.x + 14, p.y + h - 16), vec(p.x + 150, p.y + h - 16), U32(V4(1, 1, 1, 0.10)), 2)
-    local sway = bot.driving and math.sin(imgui.GetTime() * 12) * 0.6 or 0
+    local sway = bot.active and math.sin(imgui.GetTime() * 12) * 0.6 or 0
     drawTruck(dl, p.x + 14, p.y + 14 + sway, 2.3, U32(V4(0.85, 0.87, 0.92, 1)), U32(ACCENT))
     dl:AddText(vec(p.x + 170, p.y + 22), U32(WHITE), 'Статус:')
-    local scol = bot.driving and GREEN or (cfg.bot.enabled and V4(1.0, 0.8, 0.35, 1) or GRAY)
-    dl:AddText(vec(p.x + 170, p.y + 44), U32(scol), bot.status)
+    local scol = bot.active and GREEN or (cfg.bot.enabled == true and V4(1.0, 0.8, 0.35, 1) or GRAY)
+    dl:AddText(vec(p.x + 170, p.y + 44), U32(scol), tostring(bot.status or ''))
     imgui.Dummy(vec(w, h))
 
     if toggle('##bot_on', 'Включить бота', ui.botOn) then
         cfg.bot.enabled = ui.botOn[0]; saveCfg()
-        if not cfg.bot.enabled then botStop() end
     end
 
     section('Куда ехать')
@@ -1272,8 +1194,8 @@ local function drawFarmTab()
     if segmented('bot_style', ui.botStyle, { 'Обычный', 'Аккуратный' }) then
         cfg.bot.style = ui.botStyle[0]; saveCfg()
     end
-    if sliderInt('Скорость:', '##bot_speed', ui.botSpeed, 5, SPEED_NO_LIMIT,
-                 ui.botSpeed[0] >= SPEED_NO_LIMIT and 'No Limit' or '%d') then
+    local speedFmt = (ui.botSpeed[0] >= SPEED_NO_LIMIT) and 'No Limit' or '%d'
+    if sliderInt('Скорость:', '##bot_speed', ui.botSpeed, 5, SPEED_NO_LIMIT, speedFmt) then
         cfg.bot.speed = ui.botSpeed[0]; saveCfg()
     end
     if sliderInt('Радиус прибытия:', '##bot_radius', ui.botRadius, 3, 40, '%d м') then
@@ -1282,8 +1204,7 @@ local function drawFarmTab()
     if toggle('##bot_take', 'W / S забирают управление', ui.botTake) then
         cfg.bot.takeover = ui.botTake[0]; saveCfg()
     end
-
-    if toggle('##bot_turn', 'Разворот к метке задним ходом', ui.botTurn) then
+    if toggle('##bot_turn', 'Разворот к метке (вперёд или задним ходом)', ui.botTurn) then
         cfg.bot.turn = ui.botTurn[0]; saveCfg()
     end
 
@@ -1295,20 +1216,15 @@ local function drawFarmTab()
         if sliderFloat('Смещение от середины дороги:', '##bot_lane_off', ui.botLaneOff, 1.0, 6.0, '%.1f м') then
             cfg.bot.laneOff = ui.botLaneOff[0]; saveCfg()
         end
-        hint('Бот едет по правой стороне дороги. Если он задевает бордюр - уменьшите смещение, если выезжает на встречку - увеличьте.')
+        hint('Задевает бордюр - уменьшите смещение, выезжает на встречку - увеличьте.')
     end
-    hint('Собственный автопилот: едет по дорожным узлам игры, светофоров не видит, тормозит и объезжает препятствия по лучам. Аккуратный режим медленнее и раньше тормозит. Ползунок скорости до упора вправо - No Limit, бот сбавляет только в поворотах, у препятствий и у метки. Не работает на серверах Arizona RP.')
+    hint('Свой автопилот: едет по дорожным узлам игры, светофоров не видит, тормозит перед препятствиями, не срезает углы, разворачивается к метке. Скорость до упора вправо - No Limit. Не работает на Arizona RP.')
 end
 
-------------------------- Оформление ---------------------------
 local PRESETS = {
-    { name = 'Синий',      accent = '#3F99FF', bg = '#12141C' },
-    { name = 'Фиолетовый', accent = '#9B5CFF', bg = '#15121E' },
-    { name = 'Розовый',    accent = '#FF4FA3', bg = '#1A1218' },
-    { name = 'Красный',    accent = '#FF4D4D', bg = '#1A1214' },
-    { name = 'Оранжевый',  accent = '#FF9A3C', bg = '#1A1612' },
-    { name = 'Зелёный',    accent = '#3CD27A', bg = '#111A15' },
-    { name = 'Бирюзовый',  accent = '#2FD6D0', bg = '#101A1A' },
+    { accent = '#3F99FF', bg = '#12141C' }, { accent = '#9B5CFF', bg = '#15121C' },
+    { accent = '#FF4D6A', bg = '#1A1214' }, { accent = '#2ED47A', bg = '#111A15' },
+    { accent = '#FFB020', bg = '#1A1610' }, { accent = '#21C7D9', bg = '#10181A' },
 }
 
 local function presetSwatches()
@@ -1322,10 +1238,9 @@ local function presetSwatches()
             setF3(ui.accent, pr.accent); setF3(ui.bg, pr.bg)
             applyTheme(); saveCfg()
         end
-        local hovered = imgui.IsItemHovered()
         local r, g, b = hexToRGB(pr.accent)
         local c = vec(p.x + d / 2, p.y + d / 2)
-        dl:AddCircleFilled(c, d / 2 - (hovered and 2 or 4), U32(V4(r, g, b, 1)), 32)
+        dl:AddCircleFilled(c, d / 2 - (imgui.IsItemHovered() and 2 or 4), U32(V4(r, g, b, 1)), 32)
         if tostring(cfg.theme.accent):upper() == pr.accent then
             dl:AddCircle(c, d / 2 - 0.5, U32(V4(1, 1, 1, 0.9)), 32, 2)
         end
@@ -1345,7 +1260,6 @@ end
 local function drawThemeTab()
     section('Готовые темы')
     presetSwatches()
-
     section('Цвета меню')
     if colorRow('##accent', 'Основной цвет', ui.accent) then
         cfg.theme.accent = rgbToHex(ui.accent[0], ui.accent[1], ui.accent[2]); applyTheme(); saveCfg()
@@ -1359,7 +1273,6 @@ local function drawThemeTab()
     if sliderInt('Скругление:', '##rounding', ui.rounding, 0, 20, '%d px') then
         cfg.theme.rounding = ui.rounding[0]; applyTheme(); saveCfg()
     end
-
     section('Падающие частицы')
     local P = cfg.particles
     if toggle('##p_on', 'Включить частицы', ui.pOn) then P.enabled = ui.pOn[0]; saveCfg() end
@@ -1371,23 +1284,19 @@ local function drawThemeTab()
     if sliderInt('Скорость:', '##p_speed', ui.pSpeed, 5, 400, '%d') then P.speed = ui.pSpeed[0]; saveCfg() end
     if sliderFloat('Размер:', '##p_size', ui.pSize, 0.5, 6.0, '%.1f') then P.size = ui.pSize[0]; saveCfg() end
     if sliderFloat('Яркость:', '##p_alpha', ui.pAlpha, 0.05, 1.0, '%.2f') then P.alpha = ui.pAlpha[0]; saveCfg() end
-
     imgui.Spacing()
     if grayButton('Сбросить оформление', vec(-1, 34)) then resetTheme() end
 end
 
-------------------------- Информация ---------------------------
 local function drawInfoTab()
     section('Скрипт')
     imgui.Text('Версия:'); imgui.SameLine(110); imgui.TextColored(GREEN, SCRIPT_VERSION)
     imgui.Text('Автор:');  imgui.SameLine(110); imgui.TextColored(GRAY, 'denismaslov769-lab')
-
     section('Обновления')
     if toggle('##auto_upd', 'Автоматически проверять обновления', ui.autoUpd) then
         cfg.update.auto = ui.autoUpd[0]; saveCfg()
     end
     if imgui.Button('Проверить обновления', vec(-1, 34)) then checkUpdates(true) end
-
     section('Команды')
     imgui.Text('/lafk');    imgui.SameLine(110); imgui.TextDisabled('открыть / закрыть меню')
     imgui.Text('/lafkupd'); imgui.SameLine(110); imgui.TextDisabled('проверить обновления')
@@ -1401,47 +1310,57 @@ local TABS = {
     { name = 'Информация', icon = iconInfo,    draw = drawInfoTab  },
 }
 
+-- Ошибка внутри вкладки ловится и показывается текстом: Begin/End всегда парные,
+-- поэтому окно не ломается и игра не вылетает.
+local function safe(where, fn)
+    local ok, err = pcall(fn)
+    if not ok then
+        err = tostring(err)
+        if menu.err ~= err then menu.err = err; log('[menu] ошибка (' .. where .. '): ' .. err) end
+        imgui.TextColored(V4(1, 0.4, 0.4, 1), 'Ошибка: ' .. err)
+    end
+end
+
 imgui.OnFrame(
     function() return menu.window[0] end,
     function()
+        menu.frames = menu.frames + 1
+        if menu.frames == 1 then log('[menu] первый кадр меню') end
         local sw, sh = getScreenResolution()
         imgui.SetNextWindowPos(vec(sw / 2, sh / 2), imgui.Cond.FirstUseEver, vec(0.5, 0.5))
         imgui.SetNextWindowSize(vec(700, 480), imgui.Cond.Always)
         imgui.Begin('##lua_afk_menu', menu.window,
             imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoCollapse)
 
-        pcall(drawParticles, imgui.GetWindowDrawList(), imgui.GetWindowPos(), imgui.GetWindowSize())
+        safe('частицы', function()
+            drawParticles(imgui.GetWindowDrawList(), imgui.GetWindowPos(), imgui.GetWindowSize())
+        end)
 
-        -- Боковая панель: вкладки столбиком
         imgui.BeginChild('##sidebar', vec(190, 0), true)
-        centerText('lua_afk', ACCENT)
-        centerText('v' .. SCRIPT_VERSION, GRAY)
-        imgui.Spacing(); imgui.Separator(); imgui.Spacing()
-        for i, tab in ipairs(TABS) do
-            if sidebarButton('##tab' .. i, tab.name, tab.icon, menu.tab == i) then menu.tab = i end
-        end
-        imgui.SetCursorPosY(imgui.GetWindowHeight() - 40 - imgui.GetStyle().WindowPadding.y)
-        if sidebarButton('##close', 'Закрыть', iconClose, false) then menu.window[0] = false end
+        safe('меню слева', function()
+            centerText('lua_afk', ACCENT)
+            centerText('v' .. SCRIPT_VERSION, GRAY)
+            imgui.Spacing(); imgui.Separator(); imgui.Spacing()
+            for i, tab in ipairs(TABS) do
+                if sidebarButton('##tab' .. i, tab.name, tab.icon, menu.tab == i) then menu.tab = i end
+            end
+            imgui.SetCursorPosY(imgui.GetWindowHeight() - 40 - imgui.GetStyle().WindowPadding.y)
+            if sidebarButton('##close', 'Закрыть', iconClose, false) then menu.window[0] = false end
+        end)
         imgui.EndChild()
 
         imgui.SameLine()
 
-        -- Содержимое вкладки
         imgui.BeginChild('##content', vec(0, 0), true)
         local tab = TABS[menu.tab] or TABS[1]
-        imgui.TextColored(ACCENT, tab.name)
-        -- Ошибка во вкладке не должна ломать окно (иначе игра вылетает): ловим и показываем
-        local ok, err = pcall(tab.draw)
-        if not ok then
-            if menu.lastErr ~= tostring(err) then
-                menu.lastErr = tostring(err)
-                log('[menu] ошибка во вкладке: ' .. menu.lastErr)
-            end
-            imgui.TextColored(V4(1, 0.4, 0.4, 1), 'Ошибка вкладки: ' .. menu.lastErr)
-        end
+        safe(tab.name, function()
+            imgui.TextColored(ACCENT, tab.name)
+            tab.draw()
+        end)
         imgui.EndChild()
 
         imgui.End()
+        if menu.frames == 1 then log('[menu] первый кадр нарисован') end
     end
 )
 
@@ -1449,50 +1368,40 @@ imgui.OnFrame(
 -- Окно обновления
 --==============================================================
 local UPD_W = 360
-
 imgui.OnFrame(
     function() return upd.window[0] end,
     function()
         local sw, sh = getScreenResolution()
-        imgui.SetNextWindowPos(vec(sw / 2, sh / 2), imgui.Cond.Always, vec(0.5, 0.5))
-        imgui.Begin('lua_afk - обновление', nil, imgui.WindowFlags.NoResize + imgui.WindowFlags.NoCollapse
-            + imgui.WindowFlags.NoMove + imgui.WindowFlags.AlwaysAutoResize)
-
-        centerText('Доступно обновление!', GREEN)
-        imgui.Separator()
-        imgui.Text('Текущая версия:'); imgui.SameLine(150); imgui.TextColored(GRAY, SCRIPT_VERSION)
-        imgui.Text('Новая версия:');   imgui.SameLine(150); imgui.TextColored(GREEN, upd.latest or '?')
-        if upd.changelog and upd.changelog ~= '' then
-            imgui.Spacing()
-            imgui.TextDisabled('Что нового:')
-            imgui.PushTextWrapPos(imgui.GetCursorPosX() + UPD_W)
-            imgui.TextUnformatted(upd.changelog)
-            imgui.PopTextWrapPos()
-        end
-        imgui.Spacing()
-
-        local half = (UPD_W - imgui.GetStyle().ItemSpacing.x) / 2
-        if upd.state == 'prompt' then
-            if imgui.Button('Обновить', vec(half, 34)) then startDownload() end
-            imgui.SameLine()
-            if grayButton('Отмена', vec(half, 34)) then
-                upd.window[0], upd.state, upd.dismissed = false, 'idle', upd.latest
-                msg('Обновление отменено. Работаем на версии ' .. SCRIPT_VERSION .. '.')
+        imgui.SetNextWindowPos(vec(sw / 2, sh / 2), imgui.Cond.FirstUseEver, vec(0.5, 0.5))
+        imgui.SetNextWindowSize(vec(UPD_W, 0), imgui.Cond.Always)
+        imgui.Begin('lua_afk - обновление', nil, imgui.WindowFlags.NoResize + imgui.WindowFlags.NoCollapse)
+        safe('обновление', function()
+            upd.shown = upd.shown + (upd.progress - upd.shown) * math.min(1, imgui.GetIO().DeltaTime * 6)
+            if upd.state == 'prompt' then
+                imgui.Text('Доступна новая версия: ')
+                imgui.SameLine(); imgui.TextColored(GREEN, tostring(upd.latest))
+                imgui.TextDisabled('Установлена: ' .. SCRIPT_VERSION)
+                if upd.changelog then imgui.Spacing(); hint(upd.changelog) end
+                imgui.Spacing()
+                local bw = (imgui.GetContentRegionAvail().x - imgui.GetStyle().ItemSpacing.x) / 2
+                if imgui.Button('Обновить', vec(bw, 32)) then startDownload() end
+                imgui.SameLine()
+                if grayButton('Отмена', vec(bw, 32)) then
+                    upd.dismissed, upd.state, upd.window[0] = upd.latest, 'idle', false
+                end
+            elseif upd.state == 'downloading' or upd.state == 'installing' then
+                imgui.Text(upd.state == 'downloading' and 'Загрузка обновления...' or 'Установка...')
+                imgui.ProgressBar(upd.shown, vec(-1, 22))
+            elseif upd.state == 'error' then
+                imgui.TextColored(V4(1, 0.45, 0.45, 1), tostring(upd.error))
+                local bw = (imgui.GetContentRegionAvail().x - imgui.GetStyle().ItemSpacing.x) / 2
+                if imgui.Button('Повторить', vec(bw, 32)) then startDownload() end
+                imgui.SameLine()
+                if grayButton('Закрыть', vec(bw, 32)) then upd.state, upd.window[0] = 'idle', false end
+            else
+                upd.window[0] = false
             end
-        elseif upd.state == 'downloading' or upd.state == 'installing' then
-            local dt = imgui.GetIO().DeltaTime
-            if upd.shown < upd.progress then
-                upd.shown = math.min(upd.progress, upd.shown + math.max(dt * 0.8, (upd.progress - upd.shown) * dt * 4))
-            end
-            imgui.ProgressBar(upd.shown, vec(UPD_W, 26), string.format('%d%%', math.floor(upd.shown * 100)))
-            centerText((upd.state == 'installing' and upd.shown >= 0.999) and 'Установка...' or 'Загрузка обновления...', GRAY)
-        elseif upd.state == 'error' then
-            centerText(upd.error or 'Ошибка обновления.', RED)
-            if imgui.Button('Повторить', vec(half, 34)) then startDownload() end
-            imgui.SameLine()
-            if grayButton('Закрыть', vec(half, 34)) then upd.window[0], upd.state = false, 'idle' end
-        end
-
+        end)
         imgui.End()
     end
 )
@@ -1500,26 +1409,27 @@ imgui.OnFrame(
 --==============================================================
 -- Запуск
 --==============================================================
--- Защита от копий: если в moonloader лежит второй lua_afk (например "lua_afk (1).lua" после
--- скачивания через браузер), две копии одновременно рулят машиной и ломают меню.
--- Оставляем самую новую, остальные выгружаем.
+-- Защита от копий: два lua_afk одновременно (например "lua_afk (1).lua") рулят машиной
+-- вдвоём и ломают меню. Самая новая копия выгружает остальные.
 local function killDuplicates()
     local me = thisScript()
-    local myName = (me.path or ''):match('[^\\/]+$') or ''
-    local found = {}
-    for _, s in ipairs(script.list()) do
-        if s ~= me and s.path ~= me.path and s.name == me.name then
+    local myFile = ((me.path or ''):match('[^\\/]+$') or ''):lower()
+    local others = {}
+    local ok, list = pcall(script.list)
+    if not ok or type(list) ~= 'table' then return true end
+    for _, s in ipairs(list) do
+        if s.path ~= me.path and (s.name == me.name or ((s.path or ''):lower():find('lua_afk', 1, true))) then
             local v = tostring(s.version or '0')
-            local otherName = (s.path or ''):match('[^\\/]+$') or ''
-            local otherWins = isNewer(v, SCRIPT_VERSION)
-                or (v == SCRIPT_VERSION and otherName:lower() == 'lua_afk.lua' and myName:lower() ~= 'lua_afk.lua')
-            if otherWins then return false end
-            table.insert(found, { s = s, file = otherName, v = v })
+            local file = ((s.path or ''):match('[^\\/]+$') or '')
+            if isNewer(v, SCRIPT_VERSION) or (v == SCRIPT_VERSION and file:lower() == 'lua_afk.lua' and myFile ~= 'lua_afk.lua') then
+                return false
+            end
+            others[#others + 1] = { s = s, file = file, v = v }
         end
     end
-    for _, d in ipairs(found) do
+    for _, d in ipairs(others) do
         log('[lua_afk] выгружена лишняя копия ' .. d.file .. ' (v' .. d.v .. ')')
-        msg('Найдена лишняя копия скрипта: ' .. d.file .. ' (v' .. d.v .. '). Она отключена - удалите этот файл из папки moonloader.')
+        msg('Лишняя копия скрипта: ' .. d.file .. ' (v' .. d.v .. ') отключена. Удалите этот файл из папки moonloader.')
         pcall(function() d.s:unload() end)
     end
     return true
@@ -1529,19 +1439,18 @@ function main()
     if not isSampLoaded() or not isSampfuncsLoaded() then return end
     while not isSampAvailable() do wait(100) end
     if not killDuplicates() then
-        log('[lua_afk] запущена более новая копия, эта (' .. tostring(thisScript().path) .. ') отключается')
+        log('[lua_afk] запущена более новая копия, эта отключается: ' .. tostring(thisScript().path))
         return
     end
 
     sampRegisterChatCommand('lafk', function() menu.window[0] = not menu.window[0] end)
     sampRegisterChatCommand('lafkupd', function() checkUpdates(true) end)
     sampRegisterChatCommand('ltruck', function()
-        cfg.bot.enabled = not cfg.bot.enabled; ui.botOn[0] = cfg.bot.enabled; saveCfg()
-        if not cfg.bot.enabled then botStop() end
+        cfg.bot.enabled = not (cfg.bot.enabled == true); ui.botOn[0] = cfg.bot.enabled; saveCfg()
         msg(cfg.bot.enabled and 'Бот дальнобойщик включён.' or 'Бот дальнобойщик выключен.')
     end)
     msg('Загружен v' .. SCRIPT_VERSION .. '. Меню: /lafk')
-    log('[lua_afk] файл: ' .. tostring(thisScript().path))
+    log('[lua_afk] v' .. SCRIPT_VERSION .. ', файл: ' .. tostring(thisScript().path))
 
     lua_thread.create(autoSpawnThread)
     lua_thread.create(botThread)
@@ -1557,6 +1466,5 @@ function main()
 end
 
 function onScriptTerminate(s, quit)
-    if s ~= thisScript() then return end
-    if not quit and bot.driving then pcall(keys, 0, false, false, false) end
+    if s == thisScript() then botRelease() end
 end
