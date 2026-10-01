@@ -1,0 +1,5 @@
+{
+  "version": "0.2.0",
+  "url": "https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/lua_afk.lua",
+  "changelog": "Добавлено автообновление с окном mimgui и прогресс-баром."
+}
