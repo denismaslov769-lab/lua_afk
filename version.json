@@ -1,5 +1,5 @@
 {
-  "version": "0.5.0",
+  "version": "0.5.1",
   "url": "https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/lua_afk.lua",
-  "changelog": "Новая вкладка Авто фар: бот дальнобойщик (едет по дорогам к чекпоинту или метке на карте). Команда /ltruck."
+  "changelog": "Исправлено автообновление (больше не берёт устаревший файл из кэша GitHub). Вкладка переименована в Авто фарм."
 }

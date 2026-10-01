@@ -4,7 +4,7 @@
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('0.5.0')
+script_version('0.5.1')
 script_description('Скрипт для Arizona RP: меню, авто спавн, автообновление')
 
 local imgui    = require('mimgui')
@@ -17,14 +17,18 @@ encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
 -- ===================== Настройки =====================
-local SCRIPT_VERSION = '0.5.0'
+local SCRIPT_VERSION = '0.5.1'
 local REPO_RAW    = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/'
 local VERSION_URL = REPO_RAW .. 'version.json'
 local SCRIPT_URL  = REPO_RAW .. 'lua_afk.lua'
+-- Через API узнаём точный последний коммит, чтобы не получать устаревший файл из кэша GitHub
+local API_COMMIT  = 'https://api.github.com/repos/denismaslov769-lab/lua_afk/commits/main'
+local RAW_BY_SHA  = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/'
 
 local TMP_DIR     = getWorkingDirectory() .. '\\config'
 local TMP_VERSION = TMP_DIR .. '\\lua_afk_version.json'
 local TMP_SCRIPT  = TMP_DIR .. '\\lua_afk_update.lua'
+local TMP_COMMIT  = TMP_DIR .. '\\lua_afk_commit.json'
 
 local TAG = '{33AAFF}[lua_afk]{FFFFFF} '
 
@@ -112,33 +116,51 @@ local function ulog(text, manual)
     if manual then msg(text) end
 end
 
+-- Скачивает url во временный файл и отдаёт содержимое в cb (nil при ошибке)
+local function fetch(url, path, cb)
+    os.remove(path)
+    downloadUrlToFile(url, path, function(id, status)
+        if status ~= dlstatus.STATUS_ENDDOWNLOADDATA then return end
+        local data = readFile(path)
+        os.remove(path)
+        lua_thread.create(function() cb(data ~= '' and data or nil) end)
+    end)
+end
+
 local function checkUpdates(manual)
     if not doesDirectoryExist(TMP_DIR) then createDirectory(TMP_DIR) end
-    os.remove(TMP_VERSION)
     ulog('Проверка обновлений...', manual)
-    downloadUrlToFile(VERSION_URL .. '?t=' .. os.time(), TMP_VERSION, function(id, status)
-        if status ~= dlstatus.STATUS_ENDDOWNLOADDATA then return end
-        local data = readFile(TMP_VERSION)
-        os.remove(TMP_VERSION)
-        if not data or data == '' then
-            ulog('Ошибка: version.json не скачался (нет доступа к GitHub?).', manual)
-            return
+
+    fetch(API_COMMIT .. '?t=' .. os.time(), TMP_COMMIT, function(cdata)
+        local base = REPO_RAW
+        local ok, commit = pcall(decodeJson, cdata or '')
+        if ok and type(commit) == 'table' and type(commit.sha) == 'string' then
+            base = RAW_BY_SHA .. commit.sha .. '/'
+        else
+            ulog('GitHub API не ответил, проверяю напрямую.', manual)
         end
-        local ok, info = pcall(decodeJson, data)
-        if not ok or type(info) ~= 'table' or not info.version then
-            ulog('Ошибка: не удалось прочитать version.json.', manual)
-            return
-        end
-        ulog('На GitHub версия ' .. tostring(info.version) .. ', у вас ' .. SCRIPT_VERSION .. '.', manual)
-        if isNewer(info.version, SCRIPT_VERSION) then
-            upd.latest    = tostring(info.version)
-            upd.changelog = info.changelog
-            upd.url       = info.url or SCRIPT_URL
-            upd.state     = 'prompt'
-            upd.window[0] = true
-        elseif manual then
-            msg('У вас последняя версия.')
-        end
+
+        fetch(base .. 'version.json?t=' .. os.time(), TMP_VERSION, function(data)
+            if not data then
+                ulog('Ошибка: version.json не скачался (нет доступа к GitHub?).', manual)
+                return
+            end
+            local ok2, info = pcall(decodeJson, data)
+            if not ok2 or type(info) ~= 'table' or not info.version then
+                ulog('Ошибка: не удалось прочитать version.json.', manual)
+                return
+            end
+            ulog('На GitHub версия ' .. tostring(info.version) .. ', у вас ' .. SCRIPT_VERSION .. '.', manual)
+            if isNewer(info.version, SCRIPT_VERSION) then
+                upd.latest    = tostring(info.version)
+                upd.changelog = info.changelog
+                upd.url       = base .. 'lua_afk.lua'
+                upd.state     = 'prompt'
+                upd.window[0] = true
+            elseif manual then
+                msg('У вас последняя версия.')
+            end
+        end)
     end)
 end
 
@@ -889,7 +911,7 @@ end
 
 local TABS = {
     { name = 'Авто спавн', icon = iconPerson, draw = drawSpawnTab },
-    { name = 'Авто фар',   icon = iconTruck,  draw = drawFarmTab  },
+    { name = 'Авто фарм',  icon = iconTruck,  draw = drawFarmTab  },
     { name = 'Оформление', icon = iconPalette, draw = drawThemeTab },
     { name = 'Информация', icon = iconInfo,  draw = drawInfoTab  },
 }
