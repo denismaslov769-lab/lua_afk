@@ -4,7 +4,7 @@
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('0.6.3')
+script_version('0.6.4')
 script_description('Скрипт для Arizona RP: меню, авто спавн, автообновление')
 
 local imgui    = require('mimgui')
@@ -18,7 +18,7 @@ encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
 -- ===================== Настройки =====================
-local SCRIPT_VERSION = '0.6.3'
+local SCRIPT_VERSION = '0.6.4'
 local REPO_RAW    = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/'
 local VERSION_URL = REPO_RAW .. 'version.json'
 local SCRIPT_URL  = REPO_RAW .. 'lua_afk.lua'
@@ -50,6 +50,9 @@ local cfg = inicfg.load({
         bg         = '#12141C', -- цвет фона окна
         childAlpha = 0.80,      -- прозрачность панелей
         rounding   = 12,        -- скругление
+    },
+    update = {
+        auto = true,      -- автоматическая проверка обновлений
     },
     bot = {
         enabled  = false,
@@ -158,6 +161,7 @@ end
 -- manual   - ручная проверка (/lafkupd): подробные сообщения
 -- periodic - фоновая проверка: не показывать окно повторно, если эту версию уже отменили
 local function checkUpdates(manual, periodic)
+    if not manual and not cfg.update.auto then return end
     if upd.state ~= 'idle' and upd.state ~= 'error' then return end
     if not doesDirectoryExist(TMP_DIR) then createDirectory(TMP_DIR) end
     ulog('Проверка обновлений...', manual)
@@ -190,8 +194,13 @@ local function checkUpdates(manual, periodic)
                 ulog('Ошибка: не удалось скачать version.json ни с одного адреса.', true)
                 return
             end
-            local ok2, info = pcall(decodeJson, data)
-            if not ok2 or type(info) ~= 'table' or not info.version then
+            -- Без decodeJson: его C++ исключение на плохих данных портит состояние Lua и роняет игру позже
+            local info = {
+                version   = data:match('"version"%s*:%s*"([^"]+)"'),
+                changelog = data:match('"changelog"%s*:%s*"(.-)"%s*[,}]'),
+            }
+            if info.changelog then info.changelog = info.changelog:gsub('\\n', '\n'):gsub('\\"', '"') end
+            if not info.version then
                 ulog('Ошибка: не удалось прочитать version.json.', true)
                 return
             end
@@ -841,11 +850,15 @@ local function drawInfoTab()
     imgui.Text('Автор:');   imgui.SameLine(110); imgui.TextColored(COLOR_GRAY, 'denismaslov769-lab')
 
     section('Обновления')
+    menu.autoUpd = menu.autoUpd or imgui.new.bool(cfg.update.auto)
+    if toggle('##auto_upd', 'Автоматически проверять обновления', menu.autoUpd) then
+        cfg.update.auto = menu.autoUpd[0]; saveCfg()
+    end
     if imgui.Button('Проверить обновления', vec(-1, 34)) then checkUpdates(true) end
 
     section('Команды')
     imgui.Text('/lafk');    imgui.SameLine(110); imgui.TextDisabled('открыть / закрыть меню')
-    imgui.Text('/lafkupd'); imgui.SameLine(110); imgui.TextDisabled('проверить обновления')
+    imgui.Text('/lafkupd'); imgui.SameLine(110); imgui.TextDisabled('проверить обновления (on / off - авто)')
     imgui.Text('/ltruck');  imgui.SameLine(110); imgui.TextDisabled('вкл / выкл бота дальнобойщика')
 end
 
@@ -1154,7 +1167,15 @@ function main()
     while not isSampAvailable() do wait(100) end
 
     sampRegisterChatCommand('lafk', cmdMenu)
-    sampRegisterChatCommand('lafkupd', function() checkUpdates(true) end)
+    sampRegisterChatCommand('lafkupd', function(arg)
+        arg = tostring(arg or ''):lower()
+        if arg == 'off' or arg == 'on' then
+            cfg.update.auto = arg == 'on'; saveCfg()
+            msg(cfg.update.auto and 'Автообновление включено.' or 'Автообновление выключено (ручная проверка: /lafkupd).')
+        else
+            checkUpdates(true)
+        end
+    end)
     msg('Загружен v' .. SCRIPT_VERSION .. '. Меню: /lafk')
 
     lua_thread.create(autoSpawnThread)

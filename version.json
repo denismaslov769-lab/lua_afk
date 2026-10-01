@@ -1,5 +1,5 @@
 {
-  "version": "0.6.3",
+  "version": "0.6.4",
   "url": "https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/lua_afk.lua",
-  "changelog": "Автообновление больше не получает устаревшую версию. Простой режим меню: /lafk safe."
+  "changelog": "Исправлен краш игры (ошибка разбора ответа GitHub). Автообновление можно выключить: /lafkupd off (включить: /lafkupd on) или во вкладке Информация."
 }
