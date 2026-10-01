@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Бот больше не сдаётся: если не может приблизиться к метке, пробует другие пути (напрямую вне дорог, отъезд и новый маршрут). Метка вдали от дороги - доезжает до неё по бездорожью. Развязки и развилки: бот едет по самой линии маршрута (не срезает через отбойник), не путает эстакады, быстрее замечает, что ушёл не в ту ветку, и заранее сбрасывает скорость перед изгибами. Сцепка: мало места перед прицепом - бот подъезжает ближе и сдаёт с короткого расстояния, не крутится бесконечно (останавливается с подсказкой). Новый виджет бота во вкладке Авто фарм (дорога, скорость, расстояние, прицеп, прогресс, кнопка запуска). Частицы Arizona и Hearts. ПКМ - Убрать фон у своих частиц. Сцепка: прицеп далеко или за забором - бот едет к нему в объезд и быстрее, без качелей вперёд-назад. Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
+-- @changelog: Гифки по ссылке или коду встраивания Tenor/Giphy прямо в меню (фон и частицы). Бот больше не сдаётся: если не может приблизиться к метке, пробует другие пути (напрямую вне дорог, отъезд и новый маршрут). Метка вдали от дороги - доезжает до неё по бездорожью. Развязки и развилки: бот едет по самой линии маршрута (не срезает через отбойник), не путает эстакады, быстрее замечает, что ушёл не в ту ветку, и заранее сбрасывает скорость перед изгибами. Сцепка: мало места перед прицепом - бот подъезжает ближе и сдаёт с короткого расстояния, не крутится бесконечно (останавливается с подсказкой). Новый виджет бота во вкладке Авто фарм (дорога, скорость, расстояние, прицеп, прогресс, кнопка запуска). Частицы Arizona и Hearts. ПКМ - Убрать фон у своих частиц. Сцепка: прицеп далеко или за забором - бот едет к нему в объезд и быстрее, без качелей вперёд-назад. Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.4.7')
+script_version('2.4.8')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.4.7'
+local SCRIPT_VERSION = '2.4.8'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -2403,6 +2403,7 @@ local ui = {
     bgFps      = imgui.new.int(num(cfg.bgimg.fps, 20)),
     bgQuality  = imgui.new.int(num(cfg.bgimg.quality, 1)),
     bgFlip     = imgui.new.bool(cfg.bgimg.flip == true),
+    webUrl     = imgui.new.char[4096](),
 
     pOn        = imgui.new.bool(cfg.particles.enabled ~= false),
     pMode      = imgui.new.int(num(cfg.particles.mode, 0)),
@@ -3250,6 +3251,93 @@ local function drawThemeSettings()
     if grayButton('Сбросить оформление', vec(-1, 34)) then resetTheme() end
 end
 
+-- Гифка по ссылке или коду встраивания (Tenor, Giphy, прямая ссылка на файл).
+-- Качаем через общий поток загрузок; у Tenor/страниц сначала страницу, из неё -
+-- прямую ссылку на gif (og:image), потом сам файл в папку фонов или частиц.
+local web = { busy = false }
+function web.say(kind, text, col) web.kind, web.status, web.col = kind, text, col or DIM end
+function web.parse(text)
+    text = tostring(text or ''):gsub('\\u002F', '/'):gsub('&amp;', '&')
+    local direct = text:match('(https?://[^%s"\'<>]-%.gif)[%s"\'<>?]') or text:match('(https?://[^%s"\'<>]-%.gif)$')
+    if direct then return direct, nil end
+    for _, ext in ipairs({ 'webp', 'png', 'jpe?g', 'mp4' }) do
+        local u = text:match('(https?://[^%s"\'<>]-%.' .. ext .. ')[%s"\'<>?]') or text:match('(https?://[^%s"\'<>]-%.' .. ext .. ')$')
+        if u and not u:find('tenor%.com/view') then return u, nil end
+    end
+    local id = text:match('data%-postid="(%d+)"') or text:match('tenor%.com/[^%s"\'<>]-%-(%d+)') or text:match('tenor%.com/embed/(%d+)')
+    if id then return nil, 'https://tenor.com/view/gif-' .. id, 'tenor_' .. id end
+    local gid = text:match('giphy%.com/gifs/[^%s"\'<>]-%-?(%w+)$') or text:match('giphy%.com/gifs/[^%s"\'<>]-%-(%w+)[%s"\'<>/?]')
+        or text:match('giphy%.com/embed/(%w+)')
+    if gid then return 'https://i.giphy.com/media/' .. gid .. '/giphy.gif', nil, 'giphy_' .. gid end
+    local page = text:match('(https?://[^%s"\'<>]+)')
+    if page then return nil, page end
+end
+function web.fileName(url, hint)
+    local ext = (url:match('%.(%w+)$') or url:match('%.(%w+)%?') or 'gif'):lower()
+    local base = hint or (url:match('/([^/%?]+)%.%w+$') or 'web')
+    base = base:gsub('[^%w%-_]', '_'):sub(1, 40)
+    return base .. '.' .. ext
+end
+function web.fetchFile(kind, url, hint)
+    local dir = (kind == 'pt') and DIRS.pt or DIRS.bg
+    local name = web.fileName(url, hint)
+    web.say(kind, 'Скачиваю ' .. name .. '...', readable(YELLOW))
+    download(url, DIRS.base .. '\\web_dl.tmp', nil, function(data)
+        if not data or #data < 64 or data:sub(1, 1) == '<' then
+            web.busy = false
+            web.say(kind, 'Не удалось скачать файл.', readable(RED)) return
+        end
+        local f = io.open(dir .. '\\' .. name, 'wb')
+        if not f then web.busy = false web.say(kind, 'Не удалось сохранить файл.', readable(RED)) return end
+        f:write(data); f:close()
+        web.busy, web.done = false, { kind = kind, name = name }
+        web.say(kind, string.format('Готово: %s (%d КБ)', name, math.floor(#data / 1024)), readable(GREEN))
+    end)
+end
+function web.start(text, kind)
+    local url, page, hint = web.parse(text)
+    if not url and not page then web.say(kind, 'Не нашёл ссылку. Вставьте код встраивания Tenor или ссылку на гифку.', readable(RED)) return end
+    web.busy = true
+    if url then web.fetchFile(kind, url, hint) return end
+    web.say(kind, 'Ищу гифку на странице...', readable(YELLOW))
+    download(page, DIRS.base .. '\\web_page.tmp', nil, function(html)
+        html = tostring(html or ''):gsub('\\u002F', '/')
+        local g = html:match('property="og:image" content="([^"]+%.gif)"') or html:match('content="([^"]+%.gif)" property="og:image"')
+            or html:match('"contentUrl":"(https://[^"]+%.gif)"') or html:match('(https://media%d?%.tenor%.com/[^"\'%s]+%.gif)')
+            or html:match('property="og:image" content="([^"]+)"')
+        if not g then web.busy = false web.say(kind, 'На странице не нашлось гифки.', readable(RED)) return end
+        web.fetchFile(kind, g, hint)
+    end)
+end
+function web.draw(kind)
+    imgui.Spacing()
+    imgui.TextDisabled('Гифка по ссылке или коду встраивания (Tenor, Giphy, прямая ссылка):')
+    imgui.PushItemWidth(-110)
+    imgui.InputText('##web_' .. kind, ui.webUrl, ffi.sizeof(ui.webUrl))
+    imgui.PopItemWidth()
+    imgui.SameLine()
+    if imgui.Button((web.busy and 'Качаю...' or 'Добавить') .. '##webdl_' .. kind, vec(-1, 0)) and not web.busy then
+        web.start(ffi.string(ui.webUrl), kind)
+    end
+    if web.kind == kind and web.status then
+        imgui.PushTextWrapPos(0); imgui.TextColored(web.col, web.status); imgui.PopTextWrapPos()
+    end
+    -- скачалось - сразу ставим (в потоке меню, а не в потоке загрузки)
+    local d = web.done
+    if d and d.kind == kind then
+        web.done = nil
+        rescan(true)
+        ui.webUrl[0] = 0
+        if kind == 'bg' then
+            cfg.bgimg.file, cfg.bgimg.enabled, ui.bgOn[0] = d.name, true, true
+            saveCfg(); bgReload()
+        else
+            cfg.particles.mode, ui.pMode[0] = 1, 1
+            if not ptSelected()[d.name] then ptToggle(d.name) else saveCfg(); ptReload() end
+        end
+    end
+end
+
 local function drawBgSettings()
     rescan()
     section('Фон меню')
@@ -3284,6 +3372,7 @@ local function drawBgSettings()
     hint('Правая кнопка мыши по файлу - меню: поставить, убрать фон, удалить.')
     deleteConfirm('bg')
     folderButtons('bg', DIRS.bg)
+    web.draw('bg')
     mediaStatus(bgState.media)
 
     section('Подгонка')
@@ -3356,6 +3445,7 @@ local function drawParticleSettings()
         imgui.EndChild()
         deleteConfirm('pt')
         folderButtons('pt', DIRS.pt)
+        web.draw('pt')
         for _, e in ipairs(ptState.list) do
             if e.media.err then imgui.TextColored(readable(RED), u8(e.name) .. ': ' .. tostring(e.media.err)) end
         end
