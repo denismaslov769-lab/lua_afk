@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Бот: светофоры для ИИ всегда зелёные, нет кружения у метки, точнее маршрут.
+-- @changelog: Бот дальнобойщик на собственном автопилоте: сам рулит по дорогам, не видит светофоров, объезжает и тормозит перед препятствиями.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('1.1.0')
+script_version('1.2.0')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '1.1.0'
+local SCRIPT_VERSION = '1.2.0'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/lua_afk.lua'
 local TAG = '{33AAFF}[lua_afk]{FFFFFF} '
 
@@ -581,54 +581,14 @@ end
 --==============================================================
 -- Бот дальнобойщик (для личного сервера, на Arizona RP отключён)
 --==============================================================
-local bot = { status = 'Выключен', driving = false, cp = nil, tx = nil, ty = nil,
-              lastTask = 0, stuckSince = nil, pauseUntil = 0, arrived = false,
-              best = nil, bestTime = 0, gaveUp = false }
-
---------------------------------------------------------------
--- Светофоры. ИИ водителя GTA спрашивает у игры цвет светофора через
--- CTrafficLights::LightForCars1 / LightForCars2. Пока бот включён, эти функции
--- подменяются на "всегда зелёный" (mov eax, 0; ret), при выключении - восстанавливаются.
--- Перед патчем адреса проверяются (GTA SA 1.0 US), чтобы не сломать игру на другой версии.
---------------------------------------------------------------
-local LIGHT_FUNCS = { 0x49D610, 0x49D670 }
-local TIMER_MS    = 0x00B7CB84 -- CTimer::m_snTimeInMilliseconds
-local lights = { patched = false, orig = {}, ok = nil }
-
-local function looksLikeLightFunc(a)
-    local pad = readMemory(a - 1, 1, true)
-    if pad ~= 0x90 and pad ~= 0xCC then return false end
-    for i = 0, 48 do
-        if readMemory(a + i, 4, true) == TIMER_MS then return true end
-    end
-    return false
-end
-
-local function lightsPatch(on)
-    if on == lights.patched then return end
-    if on then
-        if lights.ok == nil then
-            lights.ok = true
-            for _, a in ipairs(LIGHT_FUNCS) do
-                if not looksLikeLightFunc(a) then lights.ok = false end
-            end
-            log(lights.ok and '[bot] светофоры: патч доступен' or '[bot] светофоры: функции не найдены, патч пропущен')
-        end
-        if not lights.ok then return end
-        for _, a in ipairs(LIGHT_FUNCS) do
-            lights.orig[a] = { readMemory(a, 4, true), readMemory(a + 4, 2, true) }
-            writeMemory(a, 4, 0x000000B8, true)  -- B8 00 00 00
-            writeMemory(a + 4, 2, 0xC300, true)  -- 00 C3  => mov eax, 0 ; ret
-        end
-    else
-        for a, o in pairs(lights.orig) do
-            writeMemory(a, 4, o[1], true)
-            writeMemory(a + 4, 2, o[2], true)
-        end
-        lights.orig = {}
-    end
-    lights.patched = on
-end
+local bot = {
+    status = 'Выключен', driving = false, cp = nil,
+    wx = nil, wy = nil, nextPlan = 0,             -- текущая точка маршрута
+    tx = nil, ty = nil,                           -- цель, к которой едем
+    best = nil, bestTime = 0, gaveUp = false,     -- защита от кружения
+    pauseUntil = 0, arrived = false,
+    stuckSince = nil, reverseUntil = 0, reverseSteer = 0,
+}
 
 if hasSampev then
     function sampev.onSetCheckpoint(pos)             bot.cp = { pos.x, pos.y, pos.z } end
@@ -657,32 +617,147 @@ local function botTarget()
     end
 end
 
--- 2 = объезжать машины, 4 = тормозить перед машинами. Оба стиля игнорируют светофоры.
-local function botStyle() return tonumber(cfg.bot.style) == 1 and 4 or 2 end
+--------------------------------------------------------------
+-- Собственный автопилот. ИИ GTA не используется вообще, поэтому
+-- светофоров для бота не существует. Скрипт сам жмёт газ / тормоз / руль.
+--------------------------------------------------------------
+local KEY_STEER, KEY_GAS, KEY_BRAKE, KEY_HANDBRAKE = 0, 16, 14, 6
+
+local function keys(steer, gas, brake, handbrake)
+    setGameKeyState(KEY_STEER, math.floor(math.max(-128, math.min(128, steer * 128))))
+    setGameKeyState(KEY_GAS, gas and 255 or 0)
+    setGameKeyState(KEY_BRAKE, brake and 255 or 0)
+    setGameKeyState(KEY_HANDBRAKE, handbrake and 255 or 0)
+end
 
 local function botStop()
     if bot.driving then
-        clearCharTasks(PLAYER_PED)
-        bot.driving = false
+        keys(0, false, false, false)
+        bot.driving, bot.wx, bot.wy = false, nil, nil
     end
 end
 
--- Задача водителя может сбросить стиль, поэтому он выставляется заново каждые 100 мс
-local function botEnforce(car)
-    setCarDrivingStyle(car, botStyle())
-    setCarCruiseSpeed(car, tonumber(cfg.bot.speed) or 25)
+-- Векторы машины: вперёд (fx, fy) и вправо (rx, ry)
+local function carBasis(car)
+    local h = math.rad(getCarHeading(car))
+    return -math.sin(h), math.cos(h), math.cos(h), math.sin(h)
 end
 
-local function botDrive(car, x, y, z)
-    taskCarDriveToCoord(PLAYER_PED, car, x, y, z, tonumber(cfg.bot.speed) or 25, 0, 0, botStyle())
-    botEnforce(car)
-    bot.driving, bot.lastTask, bot.tx, bot.ty = true, os.clock(), x, y
+-- Точка в координатах машины: lx > 0 - справа, ly > 0 - впереди
+local function toLocal(car, x, y)
+    local cx, cy = getCarCoordinates(car)
+    local fx, fy, rx, ry = carBasis(car)
+    local dx, dy = x - cx, y - cy
+    return dx * rx + dy * ry, dx * fx + dy * fy
+end
+
+-- Прямая видимость между точками (здания и объекты), без учёта машин
+local function clearLine(x1, y1, z1, x2, y2, z2)
+    local hit = processLineOfSight(x1, y1, z1, x2, y2, z2, true, false, false, true, false, false, false, false)
+    return not hit
+end
+
+-- Луч вперёд от бампера: расстояние до препятствия или nil. Подъёмы дороги не считаются.
+local function ray(car, side, len)
+    local minX, _, _, maxX, maxY = getModelDimensions(getCarModel(car))
+    local half = ((maxX or 1.2) - 0.2) * side
+    local front = (maxY or 3) + 0.3
+    local x1, y1, z1 = getOffsetFromCarInWorldCoords(car, half, front, 0.3)
+    local x2, y2, z2 = getOffsetFromCarInWorldCoords(car, half * 1.6, front + len, 0.3)
+    local hit, cp = processLineOfSight(x1, y1, z1, x2, y2, z2, true, true, true, true, false, false, false, false)
+    if not hit or not cp or not cp.pos then return nil end
+    if cp.normal and cp.normal[3] and cp.normal[3] > 0.7 then return nil end
+    return getDistanceBetweenCoords3d(x1, y1, z1, cp.pos[1], cp.pos[2], cp.pos[3])
+end
+
+-- Выбор следующей точки: дорожные узлы впереди (прямо и под углами),
+-- до которых есть прямой проезд, ближе всего к цели
+local ANGLES = { 0, 20, -20, 45, -45, 75, -75 }
+local function planWaypoint(car, tx, ty, tz)
+    local cx, cy, cz = getCarCoordinates(car)
+    local fx, fy, rx, ry = carBasis(car)
+    local R = math.max(12, math.min(30, 10 + getCarSpeed(car) * 0.8))
+    local bestScore, bx, by
+    for _, a in ipairs(ANGLES) do
+        local ar = math.rad(a)
+        local dx = fx * math.cos(ar) + rx * math.sin(ar)
+        local dy = fy * math.cos(ar) + ry * math.sin(ar)
+        local sx, sy = cx + dx * R, cy + dy * R
+        local nx, ny, nz = getClosestCarNode(sx, sy, cz)
+        if nx and (nx ~= 0 or ny ~= 0) and getDistanceBetweenCoords2d(nx, ny, sx, sy) < R * 0.6 then
+            local _, ly = toLocal(car, nx, ny)
+            if ly > 4 and clearLine(cx, cy, cz + 0.6, nx, ny, (nz or cz) + 0.6) then
+                local score = getDistanceBetweenCoords2d(nx, ny, tx, ty) + math.abs(a) * 0.35
+                if not bestScore or score < bestScore then bestScore, bx, by = score, nx, ny end
+            end
+        end
+    end
+    -- Цель рядом и к ней прямой проезд - едем прямо к ней
+    local dist = getDistanceBetweenCoords2d(cx, cy, tx, ty)
+    if dist < 45 and clearLine(cx, cy, cz + 0.6, tx, ty, tz + 0.6) then return tx, ty end
+    return bx, by
+end
+
+local function botControl(car, tx, ty, tz, dist)
+    local now = os.clock()
+    local careful = tonumber(cfg.bot.style) == 1
+    local vmax = tonumber(cfg.bot.speed) or 25
+    local speed = getCarSpeed(car)
+
+    -- Задний ход после застревания
+    if now < bot.reverseUntil then
+        keys(bot.reverseSteer, false, true, false)
+        return
+    end
+
+    if now >= bot.nextPlan or not bot.wx then
+        bot.nextPlan = now + 0.2
+        local wx, wy = planWaypoint(car, tx, ty, tz)
+        if wx then bot.wx, bot.wy = wx, wy end
+    end
+    if not bot.wx then
+        -- Дороги рядом не нашли: аккуратно катимся вперёд
+        keys(0, speed < 4, false, false)
+        return
+    end
+
+    local lx, ly = toLocal(car, bot.wx, bot.wy)
+    local ang = math.atan2(lx, ly)                       -- > 0 вправо
+    local steer = math.max(-1, math.min(1, ang / 0.5))
+
+    -- Скорость: медленнее в поворотах и у цели
+    local v = vmax * (1 - math.min(math.abs(ang) / 1.0, 0.75))
+    if careful then v = v * 0.75 end
+    v = math.min(v, (dist - (tonumber(cfg.bot.radius) or 12)) * 0.5 + 4)
+
+    -- Препятствия: три луча (лево / центр / право)
+    local len = 6 + speed * (careful and 1.6 or 1.2)
+    local l, c, r = ray(car, -1, len), ray(car, 0, len), ray(car, 1, len)
+    local nearest = math.min(l or 999, c or 999, r or 999)
+    if nearest < 999 then
+        v = math.min(v, math.max(0, (nearest - 3) * (careful and 0.4 or 0.6)))
+        if l and not r then steer = steer + 0.6 elseif r and not l then steer = steer - 0.6 end
+        steer = math.max(-1, math.min(1, steer))
+    end
+
+    local gas   = speed < v - 0.5
+    local brake = speed > v + 2
+    keys(steer, gas, brake, false)
+
+    -- Застряли: жмём газ, но не едем 2.5 секунды - сдаём назад
+    if gas and speed < 0.5 then
+        bot.stuckSince = bot.stuckSince or now
+        if now - bot.stuckSince > 2.5 then
+            bot.reverseUntil, bot.reverseSteer, bot.stuckSince = now + 1.5, -steer, nil
+        end
+    else
+        bot.stuckSince = nil
+    end
 end
 
 local function botThread()
     while true do
-        wait(100)
-        lightsPatch(cfg.bot.enabled and not isArizona())
+        wait(bot.driving and 0 or 100)
         if not cfg.bot.enabled then
             botStop(); bot.status = 'Выключен'
         elseif isArizona() then
@@ -705,40 +780,27 @@ local function botThread()
 
                     -- новая цель - сбрасываем прогресс
                     if not bot.tx or getDistanceBetweenCoords2d(bot.tx, bot.ty, x, y) > 10 then
-                        bot.best, bot.bestTime, bot.gaveUp = dist, os.clock(), false
+                        bot.tx, bot.ty = x, y
+                        bot.best, bot.bestTime, bot.gaveUp, bot.arrived = dist, os.clock(), false, false
                     end
-                    if not bot.best or dist < bot.best - 5 then bot.best, bot.bestTime = dist, os.clock() end
+                    if dist < bot.best - 5 then bot.best, bot.bestTime = dist, os.clock() end
 
                     if dist <= (tonumber(cfg.bot.radius) or 12) then
-                        botStop()
+                        if getCarSpeed(car) > 1 then keys(0, false, true, false); bot.driving = true
+                        else botStop() end
                         if not bot.arrived then msg('Бот: прибыли (' .. name .. ').') end
                         bot.arrived, bot.status = true, 'Прибыл'
                     elseif bot.gaveUp then
-                        bot.status = 'Ближе по дороге не подъехать'
-                    elseif os.clock() - bot.bestTime > 35 then
-                        -- 35 секунд не приближаемся к метке: ИИ кружит, останавливаемся
+                        botStop(); bot.status = 'Ближе по дороге не подъехать'
+                    elseif os.clock() - bot.bestTime > 45 then
                         botStop(); bot.gaveUp = true
-                        msg('Бот: ближе по дороге не подъехать, остановился. Переставьте метку ближе к дороге.')
+                        msg('Бот: 45 секунд не получается приблизиться к метке, остановился.')
                     elseif manual then
                         botStop(); bot.pauseUntil = os.clock() + 3
                         bot.status = 'Управление у вас'
                     elseif os.clock() >= bot.pauseUntil then
-                        bot.arrived = false
-                        local moved = not bot.tx or getDistanceBetweenCoords2d(bot.tx, bot.ty, x, y) > 10
-                        -- Застревание: стоим 6+ секунд. Манёвры разворота ИИ не трогаем.
-                        if getCarSpeed(car) < 0.5 then
-                            bot.stuckSince = bot.stuckSince or os.clock()
-                        else
-                            bot.stuckSince = nil
-                        end
-                        local stuck = bot.stuckSince and os.clock() - bot.stuckSince > 6
-                                      and os.clock() - bot.lastTask > 6
-                        if not bot.driving or moved or stuck then
-                            botDrive(car, x, y, z)
-                            bot.stuckSince = nil
-                        else
-                            botEnforce(car)
-                        end
+                        bot.driving = true
+                        botControl(car, x, y, z, dist)
                         bot.status = string.format('Едет: %s, %d м', name, math.floor(dist))
                     end
                 end
@@ -870,11 +932,11 @@ local function drawFarmTab()
     end
 
     section('Вождение')
-    if segmented('bot_style', ui.botStyle, { 'Объезжать машины', 'Тормозить перед машинами' }) then
-        cfg.bot.style = ui.botStyle[0]; saveCfg(); bot.tx = nil
+    if segmented('bot_style', ui.botStyle, { 'Обычный', 'Аккуратный' }) then
+        cfg.bot.style = ui.botStyle[0]; saveCfg()
     end
     if sliderInt('Скорость:', '##bot_speed', ui.botSpeed, 5, 60, '%d') then
-        cfg.bot.speed = ui.botSpeed[0]; saveCfg(); bot.tx = nil
+        cfg.bot.speed = ui.botSpeed[0]; saveCfg()
     end
     if sliderInt('Радиус прибытия:', '##bot_radius', ui.botRadius, 3, 40, '%d м') then
         cfg.bot.radius = ui.botRadius[0]; saveCfg()
@@ -882,10 +944,7 @@ local function drawFarmTab()
     if toggle('##bot_take', 'W / S забирают управление', ui.botTake) then
         cfg.bot.takeover = ui.botTake[0]; saveCfg()
     end
-    if lights.ok == false then
-        imgui.TextColored(RED, 'Светофоры отключить не удалось: нужна GTA SA 1.0 US.')
-    end
-    hint('Пока бот включён, светофоры для ИИ всегда зелёные. Если 35 секунд не удаётся приблизиться к метке, бот останавливается вместо кружения. Не работает на серверах Arizona RP.')
+    hint('Собственный автопилот: едет по дорожным узлам игры, светофоров не видит, тормозит и объезжает препятствия по лучам. Аккуратный режим медленнее и раньше тормозит. Рекомендуемая скорость 15-25. Не работает на серверах Arizona RP.')
 end
 
 ------------------------- Оформление ---------------------------
@@ -1108,6 +1167,5 @@ end
 
 function onScriptTerminate(s, quit)
     if s ~= thisScript() then return end
-    pcall(lightsPatch, false)
-    if not quit and bot.driving then clearCharTasks(PLAYER_PED) end
+    if not quit and bot.driving then pcall(keys, 0, false, false, false) end
 end
