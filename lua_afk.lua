@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Ворота: бот больше не стоит, если ворота не на дороге - последние 60 м едет к ним напрямую (с прицепом, без заднего хода), потом сигналит. /ljobinfo показывает и статус автопилота.
+-- @changelog: Красные чекпоинты рейса: близкие (до 60 м) бот проезжает напрямую, даже если они не на дороге. Если ворота закрылись перед фурой - бот снова сигналит, пока не откроются.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.22')
+script_version('2.5.23')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.22'
+local SCRIPT_VERSION = '2.5.23'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1849,10 +1849,12 @@ bot.jobApproach = function(car)
     local A = J.ap
     if not A then A = { best = d, progT = now, tries = 0 }; J.ap = A end
     if d < A.best - 0.3 then A.best, A.progT = d, now end
-    if J.phase == 'gate' then
-        -- К воротам с прицепом: без заднего хода (прицеп сложится), стоп в 7 м
+    if J.phase == 'gate' or J.phase == 'cp' then
+        -- С прицепом: без заднего хода (прицеп сложится). У ворот стоп в 7 м,
+        -- чекпоинт проезжаем насквозь - сервер сам поставит следующий.
+        local isCp = J.phase == 'cp'
         local lx, ly = toLocal(car, J.x, J.y)
-        if d <= 7 or (ly < 0 and d <= 15) or (now - A.progT > 6 and d <= 20) then
+        if not isCp and (d <= 7 or (ly < 0 and d <= 15) or (now - A.progT > 6 and d <= 20)) then
             if speed > 0.4 then keys(0, 0, 1) else keys(0, 0, 0); J.reached = true end
             bot.status = 'Работа: у ворот'
             return
@@ -1860,18 +1862,18 @@ bot.jobApproach = function(car)
         if now - A.progT > 6 then
             -- не приближаемся - отдаём управление обычному автопилоту
             J.direct, J.ap, J.noDirectUntil = nil, nil, now + 20
-            log(string.format('[job] напрямую к воротам не проехать (%.0f м) - еду автопилотом', d))
+            log(string.format('[job] напрямую к %s не проехать (%.0f м) - еду автопилотом', isCp and 'чекпоинту' or 'воротам', d))
             return
         end
         local steer = clamp(math.atan2(lx, ly) / 0.6, -1, 1)
-        local vt = clamp(d * 0.3, 2.5, 7)
+        local vt = clamp(d * 0.3, isCp and 3.5 or 2.5, 7)
         if math.abs(steer) > 0.7 then vt = math.min(vt, 3) end
         local fs = senseFront(car, 10)
         if fs.fc then vt = math.min(vt, math.max(0, (fs.fc - 3) * 0.6)) end
         local gas, brake = 0, 0
         if speed < vt then gas = 0.5 elseif speed > vt + 1 then brake = 0.6 end
         keys(steer, gas, brake)
-        bot.status = string.format('Работа: еду к воротам напрямую, %d м', math.floor(d))
+        bot.status = string.format(isCp and 'Работа: еду к чекпоинту напрямую, %d м' or 'Работа: еду к воротам напрямую, %d м', math.floor(d))
         return
     end
     if d <= 1.0 or (A.tries >= 4 and d <= 4) then
@@ -2174,6 +2176,36 @@ bot.jobTick = function()
         if bot.cp then
             J.lastCp, J.hadCp = now, true
             J.status = nil
+            local px, py = getCharCoordinates(PLAYER_PED)
+            local cpx, cpy, cpz = bot.cp[1], bot.cp[2], bot.cp[3]
+            local d = getDistanceBetweenCoords2d(px, py, cpx, cpy)
+            -- новый чекпоинт - заново решаем, как к нему ехать
+            if not J.cpx or getDistanceBetweenCoords2d(J.cpx, J.cpy, cpx, cpy) > 3 then
+                J.cpx, J.cpy, J.direct, J.ap, J.noDirectUntil = cpx, cpy, nil, nil, nil
+                log(string.format('[job] чекпоинт рейса: %.0f м', d))
+            end
+            J.x, J.y, J.z = cpx, cpy, cpz
+            -- близкий чекпоинт (часто прямо за воротами, не на дороге) - напрямую
+            if d <= 60 and not J.direct and now > (J.noDirectUntil or 0) then
+                J.direct, J.ap = true, nil
+                bot.tx, bot.route, bot.arrived = nil, nil, false
+            elseif J.direct and d > 80 then
+                J.direct, J.ap = nil, nil
+            end
+            -- Ворота закрылись перед фурой: стоим у ворот, впереди преграда - сигналим ещё раз
+            local gx, gy = num(cfg.bot.jobGx, 0), num(cfg.bot.jobGy, 0)
+            if (gx ~= 0 or gy ~= 0) and getDistanceBetweenCoords2d(px, py, gx, gy) < 35 then
+                local fs = senseFront(car, 10)
+                if getCarSpeed(car) < 0.6 and fs.fc and fs.fc < 8 then J.blockT = J.blockT or now else J.blockT = nil end
+                if J.blockT and now - J.blockT > 1.5 and now > (J.nextHonk or 0) then
+                    J.nextHonk, J.blockT = now + 6, nil
+                    J.honks = (J.honks or 0) + 1
+                    log('[job] ворота закрыты - сигналю ещё раз')
+                    return go('honk', 'Работа: ворота закрыты - сигналю.')
+                end
+            else
+                J.blockT = nil
+            end
         else
             J.status = 'Работа: жду чекпоинт'
             if now - (J.lastCp or J.t) > 20 then
@@ -2624,7 +2656,7 @@ local function botThread()
                 botRelease(); bot.status = 'Сядьте за руль'
             else
                 local x, y, z, name = botTarget()
-                if bot.job and (bot.job.phase == 'label' or bot.job.phase == 'gate') and bot.job.direct and bot.job.x then
+                if bot.job and (bot.job.phase == 'label' or bot.job.phase == 'gate' or (bot.job.phase == 'cp' and bot.cp)) and bot.job.direct and bot.job.x then
                     bot.jobApproach(car)
                 elseif not x then
                     botRelease(); bot.status = (bot.job and bot.job.status) or 'Нет метки'; bot.arrived = false
@@ -4841,6 +4873,8 @@ function main()
             tostring(J.hooked), tostring(hitch.active),
             (gx ~= 0 or gy ~= 0) and string.format('%.0f м', getDistanceBetweenCoords2d(px, py, gx, gy)) or 'неизвестны',
             J.x and string.format('%.0f м', getDistanceBetweenCoords2d(px, py, J.x, J.y)) or 'нет'))
+        msg(string.format('Чекпоинт: %s | SAMP.Lua: %s', bot.cp and string.format('%.0f м', getDistanceBetweenCoords2d(px, py, bot.cp[1], bot.cp[2])) or 'нет',
+            hasSampev and 'есть' or 'НЕТ - красные чекпоинты не видны'))
         if trailer.handle and doesVehicleExist(trailer.handle) and isCharInAnyCar(PLAYER_PED) then
             local car = storeCarCharIsInNoSave(PLAYER_PED)
             local cx, cy, cz = getCarCoordinates(car)
