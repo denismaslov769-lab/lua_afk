@@ -4,7 +4,7 @@
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('0.6.0')
+script_version('0.6.1')
 script_description('Скрипт для Arizona RP: меню, авто спавн, автообновление')
 
 local imgui    = require('mimgui')
@@ -18,7 +18,7 @@ encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
 -- ===================== Настройки =====================
-local SCRIPT_VERSION = '0.6.0'
+local SCRIPT_VERSION = '0.6.1'
 local REPO_RAW    = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/'
 local VERSION_URL = REPO_RAW .. 'version.json'
 local SCRIPT_URL  = REPO_RAW .. 'lua_afk.lua'
@@ -118,13 +118,29 @@ local function ulog(text, manual)
 end
 
 -- Скачивает url во временный файл и отдаёт содержимое в cb (nil при ошибке)
+-- Загрузки идут строго по одной: следующая начинается только после того,
+-- как предыдущая полностью завершилась (иначе MoonLoader: "device or resource busy")
 local function fetch(url, path, cb)
-    os.remove(path)
-    downloadUrlToFile(url, path, function(id, status)
-        if status ~= dlstatus.STATUS_ENDDOWNLOADDATA then return end
-        local data = readFile(path)
+    lua_thread.create(function()
         os.remove(path)
-        lua_thread.create(function() cb(data ~= '' and data or nil) end)
+        local done, result, started = false, nil, false
+        for attempt = 1, 10 do
+            started = pcall(downloadUrlToFile, url, path, function(id, status)
+                if status == dlstatus.STATUS_ENDDOWNLOADDATA then
+                    result = readFile(path)
+                    os.remove(path)
+                    done = true
+                end
+            end)
+            if started then break end
+            wait(500) -- загрузчик занят, ждём и пробуем снова
+        end
+        if started then
+            local t = os.time()
+            while not done and os.time() - t < 20 do wait(50) end
+            wait(200) -- даём загрузчику освободиться
+        end
+        cb(result ~= '' and result or nil)
     end)
 end
 
@@ -193,7 +209,7 @@ end
 local function startDownload()
     upd.state, upd.progress, upd.shown, upd.error, upd.newCode = 'downloading', 0.0, 0.0, nil, nil
     os.remove(TMP_SCRIPT)
-    downloadUrlToFile(upd.url .. '?t=' .. os.time(), TMP_SCRIPT, function(id, status, p1, p2)
+    local started = pcall(downloadUrlToFile, upd.url .. '?t=' .. os.time(), TMP_SCRIPT, function(id, status, p1, p2)
         if status == dlstatus.STATUS_DOWNLOADINGDATA then
             if p2 and p2 > 0 then upd.progress = math.min(p1 / p2, 0.99) end
         elseif status == dlstatus.STATUS_ENDDOWNLOADDATA then
@@ -210,6 +226,10 @@ local function startDownload()
             end
         end
     end)
+    if not started then
+        upd.state = 'error'
+        upd.error = 'Загрузчик занят, нажмите Повторить.'
+    end
 end
 
 -- Записывает новую версию поверх текущего файла и перезапускает скрипт
