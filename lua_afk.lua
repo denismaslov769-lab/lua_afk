@@ -4,7 +4,7 @@
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('0.6.2')
+script_version('0.6.3')
 script_description('Скрипт для Arizona RP: меню, авто спавн, автообновление')
 
 local imgui    = require('mimgui')
@@ -18,13 +18,14 @@ encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
 -- ===================== Настройки =====================
-local SCRIPT_VERSION = '0.6.2'
+local SCRIPT_VERSION = '0.6.3'
 local REPO_RAW    = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/main/'
 local VERSION_URL = REPO_RAW .. 'version.json'
 local SCRIPT_URL  = REPO_RAW .. 'lua_afk.lua'
 -- Через API узнаём точный последний коммит, чтобы не получать устаревший файл из кэша GitHub
 local API_COMMIT  = 'https://api.github.com/repos/denismaslov769-lab/lua_afk/commits/main'
 local RAW_BY_SHA  = 'https://raw.githubusercontent.com/denismaslov769-lab/lua_afk/'
+local ATOM_URL    = 'https://github.com/denismaslov769-lab/lua_afk/commits/main.atom'
 
 local TMP_DIR     = getWorkingDirectory() .. '\\config'
 local TMP_VERSION = TMP_DIR .. '\\lua_afk_version.json'
@@ -32,6 +33,7 @@ local TMP_SCRIPT  = TMP_DIR .. '\\lua_afk_update.lua'
 local TMP_COMMIT  = TMP_DIR .. '\\lua_afk_commit.json'
 
 local TAG = '{33AAFF}[lua_afk]{FFFFFF} '
+local SAFE = false -- простой режим меню (/lafk safe): без частиц и нарисованных виджетов
 
 -- ===================== Конфиг (moonloader/config/lua_afk.ini) =====================
 local INI = 'lua_afk.ini'
@@ -161,13 +163,23 @@ local function checkUpdates(manual, periodic)
     ulog('Проверка обновлений...', manual)
 
     fetch(API_COMMIT .. '?t=' .. os.time(), TMP_COMMIT, function(cdata)
+        local sha
+        if cdata then sha = cdata:match('"sha"%s*:%s*"(%x+)"') end
+        if not sha then
+            -- API не ответил: берём последний коммит из ленты github.com (она не кэшируется как raw)
+            ulog('GitHub API не ответил, пробую ленту коммитов.', manual)
+            local atom
+            local doneAtom = false
+            fetch(ATOM_URL .. '?t=' .. os.time(), TMP_COMMIT, function(d) atom = d; doneAtom = true end)
+            while not doneAtom do wait(50) end
+            if atom then sha = atom:match('Commit/(%x+)') end
+        end
         local urls = {}
-        local ok, commit = pcall(decodeJson, cdata or '')
-        if ok and type(commit) == 'table' and type(commit.sha) == 'string' then
-            urls[#urls + 1] = RAW_BY_SHA .. commit.sha .. '/'
-            urls[#urls + 1] = 'https://cdn.jsdelivr.net/gh/denismaslov769-lab/lua_afk@' .. commit.sha .. '/'
+        if sha then
+            urls[#urls + 1] = RAW_BY_SHA .. sha .. '/'
+            urls[#urls + 1] = 'https://cdn.jsdelivr.net/gh/denismaslov769-lab/lua_afk@' .. sha .. '/'
         else
-            ulog('GitHub API не ответил, пробую другие адреса.', manual)
+            ulog('Не удалось узнать последний коммит, версия может быть устаревшей.', manual)
         end
         urls[#urls + 1] = REPO_RAW
 
@@ -438,6 +450,10 @@ local anim = {}
 
 -- Переключатель (toggle switch) с анимацией
 local function toggle(id, label, ptr)
+    if SAFE then
+        local c = imgui.Checkbox(label .. id, ptr)
+        return c
+    end
     local dl = imgui.GetWindowDrawList()
     local p  = imgui.GetCursorScreenPos()
     local h  = imgui.GetFrameHeight()
@@ -545,6 +561,9 @@ end
 
 -- Кнопка-вкладка в боковой панели
 local function sidebarButton(id, name, icon, active)
+    if SAFE then
+        return imgui.Button((active and '> ' or '') .. name .. id, vec(-1, 36))
+    end
     local dl = imgui.GetWindowDrawList()
     local p  = imgui.GetCursorScreenPos()
     local w  = imgui.GetContentRegionAvail().x
@@ -764,20 +783,24 @@ local bui = {
 local function drawFarmTab()
     section('Бот дальнобойщик')
 
-    -- Карточка с нарисованной фурой и статусом
-    local dl = imgui.GetWindowDrawList()
-    local p  = imgui.GetCursorScreenPos()
-    local w  = imgui.GetContentRegionAvail().x
-    local h  = 92
-    dl:AddRectFilled(p, vec(p.x + w, p.y + h), U32(V4(ACCENT.x, ACCENT.y, ACCENT.z, 0.10)), 10)
-    dl:AddLine(vec(p.x + 14, p.y + h - 16), vec(p.x + 150, p.y + h - 16), U32(V4(1, 1, 1, 0.10)), 2) -- дорога
-    local sway = cfg.bot.enabled and bot.driving and math.sin(imgui.GetTime() * 12) * 0.6 or 0
-    drawTruck(dl, p.x + 14, p.y + 14 + sway, 2.3, U32(V4(0.85, 0.87, 0.92, 1)), U32(ACCENT))
-    local tx = p.x + 170
-    dl:AddText(vec(tx, p.y + 22), U32(V4(1, 1, 1, 1)), 'Статус:')
-    local scol = bot.driving and COLOR_GREEN or (cfg.bot.enabled and V4(1.0, 0.8, 0.35, 1) or COLOR_GRAY)
-    dl:AddText(vec(tx, p.y + 44), U32(scol), bot.status)
-    imgui.Dummy(vec(w, h))
+    if SAFE then
+        imgui.Text('Статус: ' .. bot.status)
+    else
+        -- Карточка с нарисованной фурой и статусом
+        local dl = imgui.GetWindowDrawList()
+        local p  = imgui.GetCursorScreenPos()
+        local w  = imgui.GetContentRegionAvail().x
+        local h  = 92
+        dl:AddRectFilled(p, vec(p.x + w, p.y + h), U32(V4(ACCENT.x, ACCENT.y, ACCENT.z, 0.10)), 10)
+        dl:AddLine(vec(p.x + 14, p.y + h - 16), vec(p.x + 150, p.y + h - 16), U32(V4(1, 1, 1, 0.10)), 2) -- дорога
+        local sway = cfg.bot.enabled and bot.driving and math.sin(imgui.GetTime() * 12) * 0.6 or 0
+        drawTruck(dl, p.x + 14, p.y + 14 + sway, 2.3, U32(V4(0.85, 0.87, 0.92, 1)), U32(ACCENT))
+        local tx = p.x + 170
+        dl:AddText(vec(tx, p.y + 22), U32(V4(1, 1, 1, 1)), 'Статус:')
+        local scol = bot.driving and COLOR_GREEN or (cfg.bot.enabled and V4(1.0, 0.8, 0.35, 1) or COLOR_GRAY)
+        dl:AddText(vec(tx, p.y + 44), U32(scol), bot.status)
+        imgui.Dummy(vec(w, h))
+    end
 
     if toggle('##bot_on', 'Включить бота', bui.enabled) then
         cfg.bot.enabled = bui.enabled[0]; saveCfg()
@@ -842,6 +865,7 @@ local function newParticle(w, h, fromTop)
 end
 
 local function drawParticles(dl, pos, size)
+    if SAFE then return end
     local P = cfg.particles
     if not P.enabled then return end
     local n = math.floor(tonumber(P.count) or 0)
@@ -898,6 +922,17 @@ end
 
 -- Ряд круглых образцов цвета (пресеты темы)
 local function presetSwatches()
+    if SAFE then
+        for i, pr in ipairs(PRESETS) do
+            if i > 1 and (i - 1) % 4 ~= 0 then imgui.SameLine() end
+            if imgui.Button(pr.name .. '##preset' .. i, vec(110, 28)) then
+                cfg.theme.accent, cfg.theme.bg = pr.accent, pr.bg
+                setColor3(tui.accent, pr.accent); setColor3(tui.bg, pr.bg)
+                applyTheme(); saveCfg()
+            end
+        end
+        return
+    end
     local dl = imgui.GetWindowDrawList()
     local d = 30
     for i, pr in ipairs(PRESETS) do
@@ -1001,6 +1036,7 @@ local TABS = {
 imgui.OnFrame(
     function() return menu.window[0] end,
     function(player)
+        menu.frames = (menu.frames or 0) + 1
         local function T(s) if menu.trace then print('[menu] ' .. s) end end
         T('frame start')
         local sw, sh = getScreenResolution()
@@ -1045,6 +1081,7 @@ imgui.OnFrame(
         imgui.End()
         T('frame end')
         menu.trace = false
+        if menu.frames <= 600 and menu.frames % 30 == 0 then print('[menu] frame ' .. menu.frames .. ' ok') end
     end
 )
 
@@ -1104,7 +1141,10 @@ end
 
 -- ===================== Команды =====================
 -- /lafk - открыть/закрыть меню
-local function cmdMenu()
+local function cmdMenu(arg)
+    SAFE = tostring(arg or ''):lower():find('safe', 1, true) ~= nil
+    if SAFE then msg('Меню в простом режиме.') end
+    menu.trace, menu.frames = true, 0
     menu.window[0] = not menu.window[0]
 end
 
