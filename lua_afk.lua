@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Бот больше не мечется между дорогами: держится выбранного маршрута, не разворачивается без большой выгоды, для далёкой метки едет через промежуточные точки.
+-- @changelog: Прицеп: /pricep спавнит визуальный прицеп фуры (591), /lhitch - бот сам встаёт перед ним, выравнивается, сдаёт задом и цепляет. Кнопки во вкладке Авто фарм.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.2.1')
+script_version('2.3.0')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.2.1'
+local SCRIPT_VERSION = '2.3.0'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1055,10 +1055,205 @@ local function botControl(car, tx, ty, tz, dist)
     end
 end
 
+--==============================================================
+-- Прицеп: /pricep спавнит визуальный прицеп (виден только вам),
+-- /lhitch - бот сдаёт задом к прицепу и цепляет его.
+--==============================================================
+local TRAILER_MODEL = 591                         -- прицеп фуры (artict3)
+local TRACTORS = { [403] = true, [514] = true, [515] = true } -- Linerunner, Tanker, Roadtrain
+local trailer = { handle = nil }
+local hitch = { active = false, status = '' }
+
+local function trailerExists()
+    return trailer.handle ~= nil and doesVehicleExist(trailer.handle)
+end
+
+local function deleteTrailer()
+    if trailerExists() then pcall(deleteCar, trailer.handle) end
+    trailer.handle = nil
+end
+
+local function spawnTrailer()
+    if hitch.active then msg('Сначала дождитесь конца сцепки (/lhitch - отмена).') return end
+    deleteTrailer()
+    requestModel(TRAILER_MODEL)
+    loadAllModelsNow()
+    local t = os.clock()
+    while not hasModelLoaded(TRAILER_MODEL) and os.clock() - t < 5 do wait(50) end
+    if not hasModelLoaded(TRAILER_MODEL) then msg('Не удалось загрузить модель прицепа.') return end
+    local x, y, z, h
+    if isCharInAnyCar(PLAYER_PED) then
+        local car = storeCarCharIsInNoSave(PLAYER_PED)
+        x, y, z = getOffsetFromCarInWorldCoords(car, 0, -(geo(car).back + 13), 0.5)
+        h = getCarHeading(car)
+    else
+        x, y, z = getOffsetFromCharInWorldCoords(PLAYER_PED, 0, 10, 0.5)
+        h = getCharHeading(PLAYER_PED)
+    end
+    trailer.handle = createCar(TRAILER_MODEL, x, y, z)
+    setCarHeading(trailer.handle, h)
+    markModelAsNoLongerNeeded(TRAILER_MODEL)
+    msg('Прицеп заспавнен (виден только вам). Прицепить ботом: /lhitch, удалить: /pricep del')
+end
+
+local function hitchStop(text)
+    hitch.active = false
+    botRelease()
+    if text then msg(text) end
+end
+
+local function hitchStart()
+    if hitch.active then hitchStop('Сцепка отменена.') return end
+    if not trailerExists() then msg('Нет прицепа. Заспавните: /pricep') return end
+    if not isCharInAnyCar(PLAYER_PED) then msg('Сядьте за руль фуры.') return end
+    local car = storeCarCharIsInNoSave(PLAYER_PED)
+    if getDriverOfCar(car) ~= PLAYER_PED then msg('Сядьте за руль.') return end
+    if not TRACTORS[getCarModel(car)] then msg('Нужен тягач: Linerunner, Tanker или Roadtrain.') return end
+    if isTrailerAttachedToCab(trailer.handle, car) then msg('Прицеп уже прицеплен.') return end
+    hitch.active, hitch.phase, hitch.st, hitch.tries, hitch.start = true, 'approach', {}, 0, os.clock()
+    hitch.status = 'Сцепка: подъезд'
+    msg('Бот: еду цеплять прицеп. Отмена: /lhitch или W / S.')
+end
+
+-- Разворот на месте до нужного курса (ang - угол до курса в градусах, > 0 вправо).
+-- Вперёд с полным рулём, назад с обратным, смена при препятствии ближе метра или упоре.
+local function turnToHeading(car, st, ang, s, now, speed)
+    if math.abs(ang) < 10 then return true end
+    local dir = ang >= 0 and 1 or -1
+    if not st.phase then
+        local fg = minOf(s.fl, s.fc, s.fr)
+        st.phase, st.since = (not fg or fg > 3.5) and 'fwd' or 'back', now
+    end
+    local t = now - st.since
+    if speed > 0.5 then st.moved = now end
+    local stalled = t > 1.0 and now - (st.moved or st.since) > 0.8
+    if st.phase == 'fwd' then
+        local fg, cg = minOf(s.fl, s.fc, s.fr), (dir > 0) and s.cr or s.cl
+        if t > 0.4 and ((fg and fg < 1.0) or (cg and cg < 0.6) or stalled or t > 6) then
+            st.phase, st.since, st.moved = 'back', now, nil
+            keys(0, 0, 1)
+            return false
+        end
+        keys(dir, (speed < 3) and 0.45 or 0, 0)
+    else
+        local r = senseRear(car)
+        local rg, cg = minOf(r.bl, r.bc, r.br), (dir > 0) and r.rl or r.rr
+        if t > 0.4 and ((rg and rg < 1.0) or (cg and cg < 0.6) or stalled or t > 5) then
+            st.phase, st.since, st.moved = 'fwd', now, nil
+            keys(0, 0, 0)
+            return false
+        end
+        keys(-dir, 0, (speed < 2.5) and 0.6 or 0)
+    end
+    return false
+end
+
+local function hitchControl(car)
+    local now = os.clock()
+    if not trailerExists() then return hitchStop('Прицеп пропал, сцепка отменена.') end
+    local tr = trailer.handle
+    if isTrailerAttachedToCab(tr, car) then return hitchStop('Бот: прицеп прицеплен!') end
+    if now - hitch.start > 150 then return hitchStop('Бот: не получилось прицепиться за 2.5 минуты.') end
+
+    local speed = getCarSpeed(car)
+    local g, tg = geo(car), geo(tr)
+    -- шкворень прицепа (K) и направление прицепа (T); седло тягача (H)
+    local kx, ky = getOffsetFromCarInWorldCoords(tr, 0, tg.front - 1.4, 0)
+    local tfx, tfy = carBasis(tr)
+    local hx, hy = getOffsetFromCarInWorldCoords(car, 0, -(g.back - 1.8), 0)
+    local cx, cy = getCarCoordinates(car)
+    local fx, fy = carBasis(car)
+    local headErr = math.deg(math.acos(clamp(fx * tfx + fy * tfy, -1, 1)))
+    local dHK = getDistanceBetweenCoords2d(hx, hy, kx, ky)
+    -- положение седла относительно линии прицепа: along - сколько ещё ехать назад, e - вбок
+    local along = (hx - kx) * tfx + (hy - ky) * tfy
+    local e = (hx - kx) * tfy - (hy - ky) * tfx
+
+    -- Рядом и ровно - цепляем
+    if (dHK < 1.6 or (dHK < 3 and speed < 0.3 and hitch.phase == 'reverse')) and headErr < 25 then
+        keys(0, 0, (speed > 0.5) and 0.4 or 0)
+        if speed < 0.6 then
+            attachTrailerToCab(tr, car)
+            hitch.status = 'Сцепка: цепляю'
+        end
+        return
+    end
+
+    local s = senseFront(car, 8)
+    local reach = g.front + g.back + 10                      -- стартовая точка перед прицепом
+    local ax, ay = kx + tfx * reach, ky + tfy * reach
+
+    -- Уже стоим ровно перед прицепом - сразу задним ходом
+    if hitch.phase == 'approach' and along > 0 and along < 25 and math.abs(e) < 1.5 and headErr < 15 then
+        hitch.phase, hitch.st = 'reverse', {}
+    end
+
+    if hitch.phase == 'approach' then
+        hitch.status = 'Сцепка: подъезжаю к прицепу'
+        local da = getDistanceBetweenCoords2d(cx, cy, ax, ay)
+        local lx, ly = toLocal(car, ax, ay)
+        local ang = math.atan2(lx, ly)
+        if da < 4 or (da < 15 and math.abs(math.deg(ang)) > 100) then
+            hitch.phase, hitch.st = 'align', {}
+            return
+        end
+        local v = math.min(7, math.sqrt(2 * 4 * math.max(0, da - 2)) + 1.5)
+        if s.fc then v = math.min(v, math.sqrt(2 * 5 * math.max(0, s.fc - 2.5))) end
+        local steer = clamp(ang / 0.5, -1, 1)
+        if math.abs(math.deg(ang)) > 100 then
+            -- точка сзади: разворачиваемся к ней
+            turnToHeading(car, hitch.st, math.deg(ang), s, now, speed)
+            return
+        end
+        hitch.st.moved = hitch.st.moved or now
+        if speed > 0.5 then hitch.st.moved = now end
+        if now - hitch.st.moved > 3 then hitch.phase, hitch.st = 'align', {} return end
+        local diff = v - speed
+        keys(steer, (diff > 0.3) and clamp(diff / 5, 0.25, 0.8) or 0, (diff < -2) and 0.5 or 0)
+        return
+    end
+
+    if hitch.phase == 'align' then
+        hitch.status = 'Сцепка: выравниваюсь'
+        local lx, ly = toLocal(car, cx + tfx * 60, cy + tfy * 60)
+        if turnToHeading(car, hitch.st, math.deg(math.atan2(lx, ly)), s, now, speed) then
+            keys(0, 0, (speed > 0.5) and 0.6 or 0)
+            if speed < 0.5 then hitch.phase, hitch.st = 'reverse', {} end
+        end
+        return
+    end
+
+    -- Задний ход по линии прицепа (чистое преследование точки на линии)
+    hitch.status = string.format('Сцепка: сдаю назад, %.1f м', dHK)
+    if along < -1.5 or (along > 4 and (math.abs(e) > 2.5 or headErr > 30)) then
+        hitch.tries = hitch.tries + 1
+        if hitch.tries > 4 then return hitchStop('Бот: не получилось ровно подъехать к прицепу.') end
+        hitch.phase, hitch.st = 'approach', {}
+        return
+    end
+    local L = clamp(along * 0.5, 2.5, 6)
+    local px, py = kx + tfx * math.max(0, along - L), ky + tfy * math.max(0, along - L)
+    local lx, ly = toLocal(car, px, py)
+    local steer = clamp(math.atan2(lx, -ly) / 0.35, -1, 1)   -- задний ход: руль вправо - зад уходит вправо
+    local v = (dHK > 6) and 2.0 or 1.0
+    keys(steer, 0, (speed < v) and 0.5 or 0)
+end
+
 local function botThread()
     while true do
-        wait(bot.active and 0 or 100)
-        if cfg.bot.enabled ~= true then
+        wait((bot.active or hitch.active) and 0 or 100)
+        if hitch.active then
+            -- Сцепка с прицепом (работает и при выключенном боте)
+            local typing = sampIsChatInputActive() or sampIsDialogActive() or isSampfuncsConsoleActive()
+            if not isCharInAnyCar(PLAYER_PED) or getDriverOfCar(storeCarCharIsInNoSave(PLAYER_PED)) ~= PLAYER_PED then
+                hitchStop('Сцепка отменена: вы вышли из-за руля.')
+            elseif not typing and (isKeyDown(0x57) or isKeyDown(0x53)) then
+                hitchStop('Сцепка отменена: управление у вас.')
+            else
+                hitchControl(storeCarCharIsInNoSave(PLAYER_PED))
+                bot.status = hitch.status
+            end
+        elseif cfg.bot.enabled ~= true then
             botRelease(); bot.status = 'Выключен'
         elseif isArizona() then
             botRelease(); bot.status = 'Недоступно на Arizona RP'
@@ -1491,6 +1686,18 @@ local function drawFarmTab()
     end
     if not gps.ok then hint('Маршрут по дорогам GTA недоступен в этой версии игры, используется обычный способ.') end
 
+    section('Прицеп')
+    local bw = (imgui.GetContentRegionAvail().x - imgui.GetStyle().ItemSpacing.x * 2) / 3
+    if imgui.Button('Заспавнить##tr_spawn', vec(bw, 30)) then lua_thread.create(spawnTrailer) end
+    imgui.SameLine()
+    if imgui.Button((hitch.active and 'Отмена' or 'Прицепить') .. '##tr_hitch', vec(bw, 30)) then hitchStart() end
+    imgui.SameLine()
+    if grayButton('Удалить##tr_del', vec(bw, 30)) then
+        if hitch.active then hitchStop() end
+        deleteTrailer()
+    end
+    hint('Визуальный прицеп 591 (виден только вам). Бот на тягаче (Linerunner, Tanker, Roadtrain) встаёт перед прицепом, выравнивается и сдаёт задом до сцепки. Команды: /pricep, /pricep del, /lhitch.')
+
     section('Полоса')
     if toggle('##bot_lane', 'Держаться своей полосы', ui.botLane) then
         cfg.bot.lane = ui.botLane[0]; saveCfg()
@@ -1584,6 +1791,8 @@ local function drawInfoTab()
     imgui.Text('/lafk');    imgui.SameLine(110); imgui.TextDisabled('открыть / закрыть меню')
     imgui.Text('/lafkupd'); imgui.SameLine(110); imgui.TextDisabled('проверить обновления')
     imgui.Text('/ltruck');  imgui.SameLine(110); imgui.TextDisabled('вкл / выкл бота дальнобойщика')
+    imgui.Text('/pricep');  imgui.SameLine(110); imgui.TextDisabled('заспавнить прицеп (del - удалить)')
+    imgui.Text('/lhitch');  imgui.SameLine(110); imgui.TextDisabled('бот цепляет прицеп / отмена')
 end
 
 local TABS = {
@@ -1734,6 +1943,15 @@ function main()
 
     sampRegisterChatCommand('lafk', function() menu.window[0] = not menu.window[0] end)
     sampRegisterChatCommand('lafkupd', function() checkUpdates(true) end)
+    sampRegisterChatCommand('pricep', function(arg)
+        if tostring(arg):lower():find('del', 1, true) then
+            if hitch.active then hitchStop() end
+            deleteTrailer(); msg('Прицеп удалён.')
+        else
+            lua_thread.create(spawnTrailer)
+        end
+    end)
+    sampRegisterChatCommand('lhitch', hitchStart)
     sampRegisterChatCommand('ltruck', function()
         cfg.bot.enabled = not (cfg.bot.enabled == true); ui.botOn[0] = cfg.bot.enabled; saveCfg()
         msg(cfg.bot.enabled and 'Бот дальнобойщик включён.' or 'Бот дальнобойщик выключен.')
@@ -1770,5 +1988,8 @@ function main()
 end
 
 function onScriptTerminate(s, quit)
-    if s == thisScript() then botRelease() end
+    if s == thisScript() then
+        botRelease()
+        pcall(deleteTrailer)
+    end
 end
