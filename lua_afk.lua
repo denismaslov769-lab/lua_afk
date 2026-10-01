@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Сцепка с дальней дистанции: плавное замедление задним ходом к прицепу и нормальное торможение (раньше пролетал прицеп на ~10 м). При промахе - короткая поправка вперёд вместо полного захода.
+-- @changelog: Сцепка: новый подъезд - бот плавно выходит на линию прицепа и встаёт перед ним ровно, без разворотов на месте (раньше издалека/сбоку дёргался вперёд-назад). Исправлен газ вперёд при переходе на задний ход на скорости.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.3.7')
+script_version('2.3.8')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.3.7'
+local SCRIPT_VERSION = '2.3.8'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1201,40 +1201,61 @@ local function hitchControl(car)
     -- выведет седло на линию прицепа (конус ~20 градусов от линии).
     local eTol = 2 + math.max(0, along) * 0.35
 
-    -- Стоим примерно перед прицепом и смотрим в ту же сторону - сразу задним ходом,
-    -- без подъезда вперёд, даже если до прицепа далеко
-    if (hitch.phase == 'approach' or hitch.phase == 'align') and along > 0 and along < 120
-        and math.abs(e) < eTol and headErr < 30 then
+    -- Стоим перед прицепом и смотрим в ту же сторону - сразу задним ходом,
+    -- даже если до прицепа далеко (нужен хоть какой-то разгон для выравнивания)
+    if (hitch.phase == 'approach' or hitch.phase == 'align') and along < 120
+        and ((along > 8 and math.abs(e) < eTol and headErr < 30)
+          or (along > 0 and math.abs(e) < 1 and headErr < 10)) then
         hitch.phase, hitch.st = 'reverse', {}
+        log(string.format('[hitch] на линии, сдаю назад: вдоль %.1f, вбок %.2f, курс %.0f', along, e, headErr))
     end
 
+    -- Подъезд: едем вперёд по кривой на линию прицепа (луч от шкворня по ходу прицепа)
+    -- и дальше вдоль неё - так фура сама встаёт перед прицепом ровно и в ту же сторону.
+    -- Без разворотов на месте, пока это возможно.
     if hitch.phase == 'approach' then
         hitch.status = 'Сцепка: подъезжаю к прицепу'
-        local da = getDistanceBetweenCoords2d(cx, cy, ax, ay)
-        local lx, ly = toLocal(car, ax, ay)
-        local ang = math.atan2(lx, ly)
-        local angD = math.abs(math.deg(ang))
-        -- ближайшее расстояние до точки: если начали удаляться - значит кружим, хватит
-        hitch.st.best = math.min(hitch.st.best or da, da)
-        if da < 6 or (da < 15 and angD > 60) or (da < 25 and da > hitch.st.best + 3) then
-            hitch.phase, hitch.st = 'align', {}
+        local st = hitch.st
+        -- выбирались из упора - 2 с прямо назад
+        if st.recover then
+            if now < st.recover then keys(0, 0, 0.8) return end
+            st.recover, st.moved = nil, now
+        end
+        local proj = (cx - kx) * tfx + (cy - ky) * tfy       -- центр фуры вдоль линии прицепа
+        local lat = (cx - kx) * tfy - (cy - ky) * tfx        -- и вбок от неё (> 0 - справа)
+        local nx, ny = tfy, -tfx                             -- нормаль вправо от линии
+        local tx, ty
+        if math.abs(lat) < 8 and proj < reach * 0.5 then
+            -- рядом с прицепом или за ним - сначала уходим вбок, чтобы не въехать в прицеп
+            local sgn = (lat >= 0) and 1 or -1
+            local p = clamp(proj + 10, 0, reach)
+            tx, ty = kx + tfx * p + nx * sgn * 10, ky + tfy * p + ny * sgn * 10
+        else
+            -- точка на линии впереди (не ближе reach к шкворню), упреждение 12 м
+            local p = math.max(proj + 12, reach)
+            tx, ty = kx + tfx * p, ky + tfy * p
+        end
+        local lx, ly = toLocal(car, tx, ty)
+        local angD = math.deg(math.atan2(lx, ly))
+        if math.abs(angD) > 100 then
+            -- точка сзади (смотрим не туда) - разворот, пока не повернёмся к ней
+            turnToHeading(car, st, angD, s, now, speed)
             return
         end
-        local v = math.min(8, math.sqrt(2 * 4 * math.max(0, da - 2)) + 1.5)
-        -- точка сбоку - медленнее, чтобы радиус поворота был меньше
-        if angD > 25 then v = math.min(v, 3) end
+        st.phase = nil                                       -- сброс разворота
+        st.moved = st.moved or now
+        if speed > 0.5 then st.moved = now end
+        if now - st.moved > 3 then st.recover = now + 2 return end
+        local v = 6
+        if math.abs(angD) > 25 then v = 3 end                -- крутой поворот - медленно
         if s.fc then v = math.min(v, math.sqrt(2 * 5 * math.max(0, s.fc - 2.5))) end
-        local steer = clamp(ang / 0.5, -1, 1)
-        if math.abs(math.deg(ang)) > 100 then
-            -- точка сзади: разворачиваемся к ней
-            turnToHeading(car, hitch.st, math.deg(ang), s, now, speed)
-            return
-        end
-        hitch.st.moved = hitch.st.moved or now
-        if speed > 0.5 then hitch.st.moved = now end
-        if now - hitch.st.moved > 3 then hitch.phase, hitch.st = 'align', {} return end
+        local steer = clamp(angD / 28, -1, 1)
         local diff = v - speed
         keys(steer, (diff > 0.3) and clamp(diff / 5, 0.25, 0.8) or 0, (diff < -2) and 0.5 or 0)
+        if now - (hitch.logT or 0) > 1 then
+            hitch.logT = now
+            log(string.format('[hitch] подъезд: вдоль %.1f, вбок %.1f, курс %.0f, к точке %.0f', proj, lat, headErr, angD))
+        end
         return
     end
 
@@ -1276,6 +1297,8 @@ local function hitchControl(car)
     -- прицепа на расстоянии L перед шкворнем по ходу. Руль: при заднем ходе вправо -
     -- зад уходит вправо. Плюс поправка на курс, чтобы подъехать ровно, а не под углом.
     hitch.status = string.format('Сцепка: сдаю назад, %.1f м', dHK)
+    -- ещё катимся вперёд (после подъезда) - сначала тормозим, иначе ниже газ разгонит вперёд
+    if vf > 0.5 then keys(0, 0, 1) return end
     if speed > 0.4 then hitch.st.moved = now end
     hitch.st.moved = hitch.st.moved or now
     -- проехали шкворень, но стоим почти на линии - короткая поправка вперёд
