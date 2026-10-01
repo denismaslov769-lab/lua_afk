@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Проверка сцепки по расстоянию: прицеп считается прицепленным, если между фурой и прицепом от 10,49 до 12 м и он стоит ровно сзади. Исправлено: после сцепки бот едет к воротам.
+-- @changelog: Ворота: бот запоминает надпись «Посигнальте» в любой момент, когда она рядом; точку ворот можно задать вручную командой /lgate. Новая команда /ljobinfo показывает, на каком этапе работа и почему бот стоит.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.20')
+script_version('2.5.21')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.20'
+local SCRIPT_VERSION = '2.5.21'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1650,7 +1650,7 @@ end
 
 local function hitchStart(force)
     if hitch.active then
-        if force then return end                         -- работа: сцепка уже идёт - не отменяем
+        if force == true then return end                 -- работа: сцепка уже идёт - не отменяем
         hitchStop('Сцепка отменена.') return
     end
     if not trailerExists() then msg('Нет прицепа. Заспавните: /pricep') return end
@@ -1708,7 +1708,7 @@ bot.isHooked = function(v, car)
     -- курс прицепа почти как у фуры
     local fx, fy = carBasis(car)
     local tfx, tfy = carBasis(v)
-    return fx * tfx + fy * tfy > 0.8
+    return fx * tfx + fy * tfy > 0.5
 end
 
 -- Прицеп, уже прицепленный к нашей фуре
@@ -1922,6 +1922,12 @@ bot.jobTick = function()
     end
     local hooked = bot.hookedTrailer(car)
     if hooked and not (trailer.handle == hooked) then trailer.handle, trailer.server = hooked, true end
+    J.hooked = hooked and true or false
+    -- Надпись ворот видна только вблизи: запоминаем её всякий раз, когда проезжаем рядом
+    if not J.gateScan or now > J.gateScan then
+        J.gateScan = now + 2
+        if bot.findLabel('посигнальте') then bot.labelPos('посигнальте', 'G') end
+    end
 
     -- Сервер ответил «Вы уже взяли груз» - сразу к сцепке с уже выданным прицепом
     if bot.cargoTaken and now - bot.cargoTaken > 20 then bot.cargoTaken = nil end
@@ -2104,11 +2110,12 @@ bot.jobTick = function()
             J.scan = now + 1
             local x, y, z, d, cached = bot.labelPos('посигнальте', 'G')
             J.x, J.y, J.z, J.r, J.name = x, y, z, 9, 'ворота'
-            J.status = x and string.format('Работа: еду к воротам%s, %d м', cached and ' (запомненная точка)' or '', math.floor(d)) or 'Работа: не вижу ворота «Посигнальте»'
+            J.status = x and string.format('Работа: еду к воротам%s, %d м', cached and ' (запомненная точка)' or '', math.floor(d)) or 'Работа: не знаю, где ворота - проедьте мимо надписи «Посигнальте» или встаньте у ворот и введите /lgate'
             if not x and bot.cp then return go('cp', 'Работа: еду по чекпоинтам.') end
             -- ворота ни разу не видели и чекпоинта нет - сигналим на месте, дальше ждём чекпоинт
             if not x and now - J.t > 6 then
                 log('[job] ворота «Посигнальте» не найдены - сигналю на месте')
+                msg('Работа: не знаю, где ворота. Проедьте мимо надписи «Посигнальте» или встаньте у ворот и введите /lgate.')
                 return go('honk', 'Работа: не вижу ворота - сигналю на месте и жду чекпоинт.')
             end
         end
@@ -4775,7 +4782,37 @@ function main()
             lua_thread.create(spawnTrailer)
         end
     end)
-    sampRegisterChatCommand('lhitch', hitchStart)
+    sampRegisterChatCommand('lhitch', function() hitchStart() end)
+    sampRegisterChatCommand('lgate', function()
+        local x, y, z = getCharCoordinates(PLAYER_PED)
+        cfg.bot.jobGx, cfg.bot.jobGy, cfg.bot.jobGz = x, y, z
+        saveCfg()
+        if bot.job and bot.job.phase == 'gate' then bot.job.scan = nil end
+        msg(string.format('Точка ворот сохранена: %.0f, %.0f. Бот будет ехать сюда после сцепки.', x, y))
+    end)
+    sampRegisterChatCommand('ljobinfo', function()
+        local J = bot.job
+        if not J then
+            msg(string.format('Работа не идёт. /ljob: %s, бот: %s, в фуре: %s, метка: %s, чекпоинт: %s',
+                tostring(cfg.bot.job == true), tostring(cfg.bot.enabled == true), tostring(isCharInAnyCar(PLAYER_PED)),
+                tostring(getTargetBlipCoordinates() and true or false), tostring(bot.cp and true or false)))
+            return
+        end
+        msg(string.format('Этап: %s | %s', tostring(J.phase), tostring(J.status or bot.status)))
+        local gx, gy = num(cfg.bot.jobGx, 0), num(cfg.bot.jobGy, 0)
+        local px, py, pz = getCharCoordinates(PLAYER_PED)
+        msg(string.format('Прицеплен: %s | сцепка идёт: %s | ворота: %s | цель: %s',
+            tostring(J.hooked), tostring(hitch.active),
+            (gx ~= 0 or gy ~= 0) and string.format('%.0f м', getDistanceBetweenCoords2d(px, py, gx, gy)) or 'неизвестны',
+            J.x and string.format('%.0f м', getDistanceBetweenCoords2d(px, py, J.x, J.y)) or 'нет'))
+        if trailer.handle and doesVehicleExist(trailer.handle) and isCharInAnyCar(PLAYER_PED) then
+            local car = storeCarCharIsInNoSave(PLAYER_PED)
+            local cx, cy, cz = getCarCoordinates(car)
+            local x, y, z = getCarCoordinates(trailer.handle)
+            msg(string.format('До прицепа: %.2f м, флаг игры: %s', getDistanceBetweenCoords3d(cx, cy, cz, x, y, z),
+                tostring(isTrailerAttachedToCab(trailer.handle, car))))
+        end
+    end)
     sampRegisterChatCommand('ltruck', function()
         cfg.bot.enabled = not (cfg.bot.enabled == true); ui.botOn[0] = cfg.bot.enabled; saveCfg()
         msg(cfg.bot.enabled and 'Бот дальнобойщик включён.' or 'Бот дальнобойщик выключен.')
