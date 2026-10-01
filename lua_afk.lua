@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Исправлено ложное прибытие к точке груза: бот сбрасывает старое состояние маршрута и нажимает H только когда реально находится рядом с надписью.
+-- @changelog: Бот снова едет к надписи «Получить загруженный прицеп»: последние метры подъезжает напрямую, затем пауза 0,3 с, H и пункт 1 в меню. Своё меню скрипта больше не принимается за CEF.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.12')
+script_version('2.5.13')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.12'
+local SCRIPT_VERSION = '2.5.13'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1730,6 +1730,55 @@ local function pressCefKey(vk, scan)
     end)
     return true
 end
+-- Открыто ли меню сервера (диалог или CEF с курсором). Курсор от своего меню скрипта не считаем.
+bot.ownMenuOpen = bot.ownMenuOpen or function() return false end
+bot.cefMenuOpen = function()
+    if sampIsDialogActive() then return true end
+    if not sampIsCursorActive() then return false end
+    local ok, own = pcall(bot.ownMenuOpen)
+    return not (ok and own)
+end
+
+-- Последние метры до надписи: напрямую, без дорог (точка выдачи обычно стоит вне дороги)
+bot.jobApproach = function(car)
+    local J = bot.job
+    local now = os.clock()
+    local cx, cy = getCarCoordinates(car)
+    local d = getDistanceBetweenCoords2d(cx, cy, J.x, J.y)
+    local speed = getCarSpeed(car)
+    local A = J.ap
+    if not A then A = { best = d, progT = now, tries = 0 }; J.ap = A end
+    if d < A.best - 1 then A.best, A.progT = d, now end
+    if d <= 4 or (A.tries >= 3 and d <= 12) then
+        if speed > 0.4 then keys(0, 0, 1) else keys(0, 0, 0); J.reached = true end
+        bot.status = 'Работа: останавливаюсь у надписи'
+        return
+    end
+    if A.back then
+        if now < A.back.till then
+            keys(A.back.steer, 0, (speed < 3) and 0.6 or 0)
+            bot.status = 'Работа: сдаю назад и пробую подъехать снова'
+            return
+        end
+        A.back, A.progT, A.best = nil, now, d
+    end
+    if now - A.progT > 3 then
+        A.tries = A.tries + 1
+        local lx = toLocal(car, J.x, J.y)
+        A.back = { till = now + 1.6, steer = lx > 0 and -1 or 1 }
+        log(string.format('[job] не могу подъехать к надписи (%.1f м), отъезжаю, попытка %d', d, A.tries))
+        return
+    end
+    local lx, ly = toLocal(car, J.x, J.y)
+    local steer = clamp(math.atan2(lx, ly) / 0.5, -1, 1)
+    local vt = clamp(d * 0.35, 2, 7)
+    if math.abs(steer) > 0.8 then vt = math.min(vt, 3) end
+    local gas, brake = 0, 0
+    if speed < vt then gas = 0.55 elseif speed > vt + 1.5 then brake = 0.6 end
+    keys(steer, gas, brake)
+    bot.status = string.format('Работа: подъезжаю к надписи, %d м', math.floor(d))
+end
+
 local function pressCefEnter() return pressCefKey(0x0D, 0x1C) end
 local function pressJobAction() return pressCefKey(0x48, 0x23) end -- английская H
 
@@ -1768,20 +1817,36 @@ bot.jobTick = function()
             local x, y, z, d, cached = bot.labelPos('получить загруженный прицеп', 'L')
             -- издалека (по запомненной точке) - ко входу на базу, рядом - точно к надписи
             if J.x and x and getDistanceBetweenCoords2d(J.x, J.y, x, y) < 3 then x, y, z = J.x, J.y, J.z end
-            J.x, J.y, J.z, J.r, J.name, J.labelDist = x, y, z, 3.5, 'база дальнобойщика', d
+            J.x, J.y, J.z, J.r, J.name, J.labelDist, J.live = x, y, z, 3.5, 'база дальнобойщика', d, x and not cached
+            if J.live and d <= 45 and not J.direct then
+                J.direct, J.ap, J.reached = true, nil, nil
+                bot.tx, bot.route, bot.arrived = nil, nil, false
+                log(string.format('[job] вижу надпись в %.0f м - подъезжаю напрямую', d))
+            elseif J.direct and (not J.live or d > 60) then
+                J.direct, J.ap, J.reached = nil, nil, nil
+            end
             J.status = x and string.format('Работа: еду на базу%s, %d м', cached and ' (запомненная точка)' or '', math.floor(d))
                 or 'Работа: не знаю, где база - подъедьте один раз к надписи «Получить загруженный прицеп», бот запомнит'
+            if J.direct then J.status = string.format('Работа: подъезжаю к надписи, %d м', math.floor(d)) end
         end
         -- После перезапуска скрипта CEF мог уже остаться открытым. Считаем это
         -- подтверждением прибытия, иначе бот пытается ехать с перехваченным CEF вводом.
-        if J.x and J.labelDist and J.labelDist <= 6 and (sampIsDialogActive() or sampIsCursorActive()) then
+        if J.x and J.labelDist and J.labelDist <= 6 and bot.cefMenuOpen() then
             go('take', 'Работа: меню груза уже открыто, выбираю первый пункт.')
             J.known, J.cursorT = bot.trailerSnapshot(), now
             return
         end
         -- Одного bot.arrived недостаточно: флаг мог относиться к прошлой цели.
         -- Переходим к H только после проверки текущего расстояния до живой надписи.
-        if bot.arrived and J.x and J.labelDist and J.labelDist <= 6 then
+        if J.direct and J.reached then
+            local ax, ay, az = J.x, J.y, J.z
+            J.direct = nil
+            go('open', 'Работа: приехал. Через 0,3 секунды нажму H и открою выбор груза.')
+            J.known, J.actionTries = bot.trailerSnapshot(), 0
+            J.openX, J.openY, J.openZ = ax, ay, az
+        elseif J.direct then
+            -- едем сами в bot.jobApproach
+        elseif bot.arrived and J.x and J.labelDist and J.labelDist <= 6 then
             local _, _, _, _, cached = bot.labelPos('получить загруженный прицеп', 'L')
             if cached then
                 -- приехали к запомненной точке, а надписи нет - она могла сдвинуться, ищем ещё
@@ -1802,13 +1867,13 @@ bot.jobTick = function()
         if J.openX then
             local px, py, pz = getCharCoordinates(PLAYER_PED)
             local d = getDistanceBetweenCoords3d(px, py, pz, J.openX, J.openY, J.openZ)
-            if d > 8 then
+            if d > 14 then
                 go('label', 'Работа: машина не у точки груза, подъезжаю ближе.')
                 J.known = nil
                 return
             end
         end
-        local menu = sampIsDialogActive() or sampIsCursorActive()
+        local menu = bot.cefMenuOpen()
         if menu then
             go('take', 'Работа: меню груза открыто, выбираю первый пункт.')
             J.cursorT, J.menuSeen, J.pickTries = now, now, 0
@@ -1840,7 +1905,7 @@ bot.jobTick = function()
         -- Окно выбора груза (CEF): первый пункт выделен по умолчанию.
         -- Автоматически подтверждаем его Enter; если CEF не принял импульс,
         -- повторяем ещё два раза с паузой.
-        local menu = sampIsDialogActive() or sampIsCursorActive()
+        local menu = bot.cefMenuOpen()
         if menu then
             J.cursorT = now
             J.menuSeen = J.menuSeen or now
@@ -2279,7 +2344,9 @@ local function botThread()
                 botRelease(); bot.status = 'Сядьте за руль'
             else
                 local x, y, z, name = botTarget()
-                if not x then
+                if bot.job and bot.job.phase == 'label' and bot.job.direct and bot.job.x then
+                    bot.jobApproach(car)
+                elseif not x then
                     botRelease(); bot.status = (bot.job and bot.job.status) or 'Нет метки'; bot.arrived = false
                 else
                     local px, py = getCharCoordinates(PLAYER_PED)
@@ -3151,6 +3218,7 @@ end
 end -- загрузчик
 
 local menu = { window = imgui.new.bool(false), tab = 1, frames = 0, err = nil }
+bot.ownMenuOpen = function() return menu.window[0] == true end
 
 local function f3(hex) local r, g, b = hexToRGB(hex) return imgui.new.float[3](r, g, b) end
 local function setF3(arr, hex) local r, g, b = hexToRGB(hex) arr[0], arr[1], arr[2] = r, g, b end
