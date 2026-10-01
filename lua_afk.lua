@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Бот больше не сбрасывает скорость перед чекпоинтом рейса: проезжает его на ходу, без торможения.
+-- @changelog: Бот больше не разворачивается на месте по дороге к метке: маршрут строится только вперёд, а пока он перестраивается, бот едет прямо по дороге, а не сворачивает «в сторону метки». Препятствия видны и на высоте кабины, с прицепом бот тормозит раньше.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.24')
+script_version('2.5.25')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.24'
+local SCRIPT_VERSION = '2.5.25'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -445,9 +445,9 @@ end
 
 -- Луч в координатах машины (x вправо, y вперёд) на высоте +0.3. Расстояние до препятствия или nil.
 -- Почти горизонтальные поверхности (подъём дороги) препятствием не считаются.
-local function cast(car, ax, ay, bx, by, cars)
-    local x1, y1, z1 = getOffsetFromCarInWorldCoords(car, ax, ay, 0.3)
-    local x2, y2, z2 = getOffsetFromCarInWorldCoords(car, bx, by, 0.3)
+local function cast(car, ax, ay, bx, by, cars, hz)
+    local x1, y1, z1 = getOffsetFromCarInWorldCoords(car, ax, ay, hz or 0.3)
+    local x2, y2, z2 = getOffsetFromCarInWorldCoords(car, bx, by, hz or 0.3)
     local hit, cp = los(x1, y1, z1, x2, y2, z2, cars)
     if not hit or not cp or not cp.pos then return nil end
     if cp.normal and cp.normal[3] and cp.normal[3] > 0.7 then return nil end
@@ -464,6 +464,11 @@ local function senseFront(car, len)
         fc = cast(car, 0, f, 0, f + len, true),
         fr = cast(car, h, f, h * 1.15, f + len, true),
     }
+    -- Второй ряд лучей на высоте кабины: шлагбаумы, навесы, объекты сервера,
+    -- которые нижний луч проходит под ними или между опорами
+    s.fl = minOf(s.fl, cast(car, -h, f, -h * 1.15, f + len, false, 1.6))
+    s.fc = minOf(s.fc, cast(car, 0, f, 0, f + len, false, 1.6))
+    s.fr = minOf(s.fr, cast(car, h, f, h * 1.15, f + len, false, 1.6))
     for _, sd in ipairs({ -1, 1 }) do
         local ox, oy = sd * (g.half + 0.15), g.front - 0.3
         local best
@@ -1288,14 +1293,17 @@ local function maneuver(car, tx, ty, dist, s, now, speed, routed)
     if not m then
         if now < bot.manCooldown then return false end
         local frontGap = minOf(s.fl, s.fc, s.fr)
-        local behind  = a > 110 and dist < 400 and speed < 12
-        local side    = a > 65 and dist < 60 and speed < 6
+        -- Разворот на месте по дороге к метке отключён (бот кружился). Метка сзади -
+        -- маршрут по дорогам сам выведет через перекрёсток. Манёвр только когда
+        -- фура упёрлась носом и иначе не выбраться.
+        local behind  = false
+        local side    = false
         if side then
             -- сбоку разворачиваемся носом к метке, только если к ней правда можно проехать напрямую
             local cx, cy, cz = getCarCoordinates(car)
             side = clearLine(cx, cy, cz + 0.6, tx, ty, cz + 0.6)
         end
-        local blocked = frontGap and frontGap < 4 and a > 30 and speed < 2 and dist < 100
+        local blocked = frontGap and frontGap < 2.5 and a > 30 and speed < 1 and dist < 100
         if not (behind or side or blocked) then return false end
         local dir = ang >= 0 and 1 or -1
         local cornerGap = (dir > 0) and s.cr or s.cl
@@ -1316,7 +1324,7 @@ local function maneuver(car, tx, ty, dist, s, now, speed, routed)
         a = math.abs(ang)
     end
 
-    if a < 25 or now - m.start > 45 or m.n > 16 then
+    if a < 25 or now - m.start > 15 or m.n > 4 then
         bot.man = nil
         bot.manCooldown = now + ((a < 25) and 3 or 8)
         bot.wx, bot.nextPlan = nil, 0
@@ -1382,6 +1390,10 @@ local function botControl(car, tx, ty, tz, dist)
     local decel = careful and 5 or 7      -- комфортное замедление
     local aLat  = careful and 6 or 8      -- боковое ускорение в повороте
     local stopGap = careful and 5 or 3.5  -- сколько оставлять до препятствия
+    -- С прицепом фура тормозит хуже и шире входит в повороты
+    if bot.job and bot.job.hooked then
+        decel, aLat, stopGap = decel * 0.65, aLat * 0.75, stopGap + 2.5
+    end
 
     -- 0. Защита от кругов: считаем, на сколько градусов повернулась машина.
     -- Если за 30 с набрали больше 1.25 оборота и к метке не приблизились - это
@@ -1396,8 +1408,8 @@ local function botControl(car, tx, ty, tz, dist)
         local dh = ((h - C.h + 540) % 360) - 180
         C.h = h
         if speed > 0.5 then C.acc = C.acc + dh end
-        if now - C.t > 30 or dist < C.d - 30 then C.acc, C.t, C.d = 0, now, dist end
-        if math.abs(C.acc) > 450 then
+        if now - C.t > 20 or dist < C.d - 30 then C.acc, C.t, C.d = 0, now, dist end
+        if math.abs(C.acc) > 300 then
             C.n = (C.n or 0) + 1
             log(string.format('[bot] кружусь на месте (%.0f град за %.0f с), до метки %.0f м - перестраиваю маршрут, раз %d',
                 C.acc, now - C.t, dist, C.n))
@@ -1405,7 +1417,7 @@ local function botControl(car, tx, ty, tz, dist)
             bot.man, bot.manCooldown = nil, now + 12
             bot.route, bot.wx, bot.commit, bot.turnAt, bot.routeFail, bot.vt = nil, nil, nil, nil, nil, nil
             bot.nextPlan, bot.stuckSince = 0, nil
-            bot.allowBehind = (C.n % 2 == 1) and (now + 40) or nil
+            bot.allowBehind = nil
             local r = senseRear(car)
             local rg = minOf(r.bl, r.bc, r.br)
             if not rg or rg > 2 then
@@ -1454,6 +1466,7 @@ local function botControl(car, tx, ty, tz, dist)
     end
 
     if rwx then
+        bot.noRouteSince = nil
         bot.commit, bot.turnAt = nil, nil
         if not (bot.route and bot.route.own) then             -- свой маршрут уже со сдвигом в правую полосу
             local cx, cy, cz = getCarCoordinates(car)
@@ -1490,7 +1503,17 @@ local function botControl(car, tx, ty, tz, dist)
     end
     if not rwx and not bot.commit and (now >= bot.nextPlan or not bot.wx) then
         bot.nextPlan = now + 0.25
-        local wx, wy, direct = planWaypoint(car, tx, ty, tz)
+        -- Маршрут по дорогам есть, но сейчас перестраивается: не сворачиваем «в сторону
+        -- метки» (так бот путал повороты), а едем прямо по дороге, пока маршрут не готов.
+        local ptx, pty, ptz = tx, ty, tz
+        bot.noRouteSince = bot.noRouteSince or now
+        -- маршрута нет дольше 6 с - значит, не строится вовсе: тогда уже к метке
+        if cfg.bot.gps ~= false and (gps.ok or roadmap.state == 'ok') and dist > 60 and now - bot.noRouteSince < 6 then
+            local cx0, cy0, cz0 = getCarCoordinates(car)
+            local fx0, fy0 = carBasis(car)
+            ptx, pty, ptz = cx0 + fx0 * 300, cy0 + fy0 * 300, cz0
+        end
+        local wx, wy, direct = planWaypoint(car, ptx, pty, ptz)
         if not wx then
             local cx, cy, cz = getCarCoordinates(car)
             local nx, ny, nz = getClosestCarNode(cx, cy, cz)
@@ -2720,7 +2743,7 @@ local function botThread()
                             bot.progT, bot.best, bot.altUntil = now, dist, now + 5
                             bot.route, bot.wx, bot.commit, bot.turnAt, bot.man, bot.routeFail = nil, nil, nil, nil, nil, nil
                             bot.nextPlan, bot.manCooldown, bot.stuckSince = 0, 0, nil
-                            bot.allowBehind = (bot.tries % 2 == 1) and (now + 40) or nil
+                            bot.allowBehind = nil
                             local r = senseRear(car)
                             local rg = minOf(r.bl, r.bc, r.br)
                             if not rg or rg > 2 then
