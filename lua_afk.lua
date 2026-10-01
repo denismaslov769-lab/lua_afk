@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
+-- @changelog: Новый рисованный грузовик во вкладке Авто фарм (крутятся колёса, дым, фара, цвета под тему). Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.4.2')
+script_version('2.4.3')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.4.2'
+local SCRIPT_VERSION = '2.4.3'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -2288,17 +2288,79 @@ local function grayButton(label, size)
 end
 
 -- Иконки (рисуются линиями) ------------------------------------------------
-local function drawTruck(dl, x, y, s, body, cab)
-    local function R(a, b, c2, d, col, r) dl:AddRectFilled(vec(x + a * s, y + b * s), vec(x + c2 * s, y + d * s), col, r or 0) end
-    R(0, 4, 38, 26, body, 3 * s)          -- кузов
-    R(40, 10, 56, 26, cab, 3 * s)         -- кабина
-    R(44, 13, 53, 19, U32(V4(0.6, 0.8, 1, 0.9)), 1.5 * s) -- окно
-    for _, wx in ipairs({ 9, 30, 48 }) do
-        dl:AddCircleFilled(vec(x + wx * s, y + 28 * s), 4.5 * s, U32(V4(0.1, 0.1, 0.12, 1)), 16)
-        dl:AddCircleFilled(vec(x + wx * s, y + 28 * s), 2 * s, U32(V4(0.6, 0.6, 0.65, 1)), 12)
+-- Тягач с полуприцепом (рисуется фигурами, цвета подстраиваются под тему).
+-- moving - бот едет: крутятся колёса, идёт дым из трубы, горит фара.
+local function drawTruck(dl, x, y, s, moving)
+    local function P(a, b) return vec(x + a * s, y + b * s) end
+    local function R(a, b, c2, d, col, r) dl:AddRectFilled(P(a, b), P(c2, d), col, (r or 0) * s) end
+    local time = imgui.GetTime()
+    local body  = U32(LIGHT and V4(1, 1, 1, 1) or V4(0.88, 0.90, 0.95, 1))
+    local edge  = U32(mixV(BGV, TEXT, LIGHT and 0.45 or 0.25))
+    local dark  = U32(V4(0.13, 0.14, 0.17, 1))
+    local metal = U32(V4(0.62, 0.65, 0.70, 1))
+    local cab   = U32(ACCENT)
+    local cabDk = U32(mixV(ACCENT, V4(0, 0, 0, 1), 0.35))
+    local glass = U32(V4(0.62, 0.82, 1, 0.95))
+
+    -- тень
+    R(1, 31.2, 57, 32.6, U32(V4(0, 0, 0, LIGHT and 0.12 or 0.25)), 1)
+    -- рама
+    R(2, 23.5, 56, 26.5, dark, 1)
+    -- полуприцеп: кузов с полосой в цвет темы
+    R(0, 2, 37, 24, edge, 2.2)                               -- контур
+    R(0.5, 2.5, 36.5, 23.5, body, 1.9)
+    R(0.6, 15, 36.4, 17.6, cab)
+    for i = 1, 5 do dl:AddLine(P(i * 6.2, 3.5), P(i * 6.2, 14), edge, math.max(1, s * 0.35)) end
+    -- сцепка
+    R(37, 21.5, 41, 24, dark)
+    -- выхлопная труба и дым
+    R(40.6, 1.5, 42.2, 9, metal, 0.6)
+    if moving then
+        for i = 0, 2 do
+            local k = (time * 0.9 + i / 3) % 1
+            dl:AddCircleFilled(P(41.4 - k * 6, 1 - k * 6), (1.2 + k * 2.6) * s,
+                U32(mixV(BGV, TEXT, 0.35, 0.45 * (1 - k))), 16)
+        end
+    end
+    -- кабина: задняя часть, скошенный капот, крыша-обтекатель
+    R(40, 8, 51.5, 26, cab, 1.5)
+    dl:AddQuadFilled(P(51, 8), P(53.5, 8), P(57, 15.5), P(51, 15.5), cab)
+    R(51, 15, 57, 26, cab, 1.2)
+    dl:AddQuadFilled(P(41, 8), P(49, 8), P(48, 4.6), P(42.5, 4.6), cabDk)
+    -- окно и дверь
+    dl:AddQuadFilled(P(46, 10), P(52.6, 10), P(55.6, 15), P(46, 15), glass)
+    dl:AddLine(P(45, 10), P(45, 24.5), cabDk, math.max(1, s * 0.45))
+    R(46.2, 17.2, 48.4, 18.2, cabDk, 0.4)                    -- ручка
+    -- решётка, фара, бампер
+    for i = 0, 2 do R(56.2, 16.5 + i * 1.6, 57, 17.3 + i * 1.6, cabDk) end
+    local lamp = moving and V4(1, 0.92, 0.55, 1) or V4(1, 0.95, 0.8, 0.85)
+    R(55.4, 21, 57.4, 22.8, U32(lamp), 0.5)
+    if moving then dl:AddCircleFilled(P(58.6, 21.9), 2.6 * s, U32(V4(1, 0.9, 0.5, 0.18)), 20) end
+    R(52, 24.4, 58, 26.8, metal, 0.8)
+    -- колёса со спицами (крутятся, когда бот едет)
+    local ang = moving and time * 9 or 0
+    for _, wx in ipairs({ 7, 14.5, 44, 52.5 }) do
+        local c = P(wx, 28.2)
+        dl:AddCircleFilled(c, 4.0 * s, dark, 24)
+        dl:AddCircleFilled(c, 2.2 * s, metal, 20)
+        for k = 0, 2 do
+            local a = ang + k * 2.094
+            dl:AddLine(c, vec(c.x + math.cos(a) * 2.0 * s, c.y + math.sin(a) * 2.0 * s), dark, math.max(1, s * 0.45))
+        end
+        dl:AddCircleFilled(c, 0.7 * s, dark, 10)
     end
 end
-local function iconTruck(dl, c, col) drawTruck(dl, c.x - 9.3, c.y - 6, 0.32, col, col) end
+
+-- Маленькая иконка грузовика для меню слева (одним цветом)
+local function iconTruck(dl, c, col)
+    local x, y = c.x - 10, c.y - 6
+    dl:AddRectFilled(vec(x, y), vec(x + 12, y + 8.5), col, 1.5)            -- прицеп
+    dl:AddRectFilled(vec(x + 13, y + 3), vec(x + 19, y + 8.5), col, 1.5)   -- кабина
+    dl:AddRectFilled(vec(x + 18, y + 5.5), vec(x + 20, y + 8.5), col, 1)   -- капот
+    for _, wx in ipairs({ 3.5, 9, 15, 18.5 }) do
+        dl:AddCircleFilled(vec(x + wx, y + 10.5), 2.1, col, 12)
+    end
+end
 
 local function iconInfo(dl, c, col)
     dl:AddCircle(c, 7.5, col, 20, 2)
@@ -2504,7 +2566,7 @@ local function drawFarmTab()
     local h  = 92
     dl:AddRectFilled(p, vec(p.x + w, p.y + h), U32(V4(ACCENT.x, ACCENT.y, ACCENT.z, LIGHT and 0.16 or 0.10)), 10)
     local sway = bot.active and math.sin(imgui.GetTime() * 12) * 0.6 or 0
-    drawTruck(dl, p.x + 14, p.y + 14 + sway, 2.3, U32(V4(0.85, 0.87, 0.92, 1)), U32(ACCENT))
+    drawTruck(dl, p.x + 12, p.y + 12 + sway, 2.25, bot.active)
     dl:AddText(vec(p.x + 170, p.y + 22), U32(TEXT), 'Статус:')
     local scol = bot.active and readable(GREEN) or (cfg.bot.enabled == true and readable(YELLOW) or DIM)
     dl:AddText(vec(p.x + 170, p.y + 44), U32(scol), tostring(bot.status or ''))
