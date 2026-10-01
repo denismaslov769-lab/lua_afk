@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, авто спавн, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Бот делает в 4 раза меньше проверок препятствий и запросов дорог за кадр (как в стабильных версиях) - против вылетов игры во время езды.
+-- @changelog: Диагностика вылета при открытом меню: подробные записи в moonloader.log.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.0.1')
+script_version('2.0.2')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.0.1'
+local SCRIPT_VERSION = '2.0.2'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1300,17 +1300,22 @@ imgui.OnFrame(
     function() return menu.window[0] end,
     function()
         menu.frames = menu.frames + 1
-        if menu.frames == 1 then log('[menu] первый кадр меню') end
+        -- Диагностика вылетов: каждые 30 кадров пишем в moonloader.log начало и конец кадра
+        local trace = menu.frames <= 3 or menu.frames % 30 == 0
+        local function step(t) if trace then log('[menu] кадр ' .. menu.frames .. ': ' .. t) end end
+        step('начало')
         local sw, sh = getScreenResolution()
         imgui.SetNextWindowPos(vec(sw / 2, sh / 2), imgui.Cond.FirstUseEver, vec(0.5, 0.5))
         imgui.SetNextWindowSize(vec(700, 480), imgui.Cond.Always)
         imgui.Begin('##lua_afk_menu', menu.window,
             imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoCollapse)
 
+        step('окно')
         safe('частицы', function()
             drawParticles(imgui.GetWindowDrawList(), imgui.GetWindowPos(), imgui.GetWindowSize())
         end)
 
+        step('панель')
         imgui.BeginChild('##sidebar', vec(190, 0), true)
         safe('меню слева', function()
             centerText('lua_afk', ACCENT)
@@ -1328,6 +1333,7 @@ imgui.OnFrame(
 
         imgui.BeginChild('##content', vec(0, 0), true)
         local tab = TABS[menu.tab] or TABS[1]
+        step('вкладка ' .. menu.tab)
         safe(tab.name, function()
             imgui.TextColored(ACCENT, tab.name)
             tab.draw()
@@ -1335,7 +1341,7 @@ imgui.OnFrame(
         imgui.EndChild()
 
         imgui.End()
-        if menu.frames == 1 then log('[menu] первый кадр нарисован') end
+        step('конец')
     end
 )
 
@@ -1431,8 +1437,13 @@ function main()
     lua_thread.create(botThread)
     lua_thread.create(updateScheduler)
 
+    local beat = os.clock()
     while true do
         wait(0)
+        if menu.window[0] and os.clock() - beat > 1 then
+            beat = os.clock()
+            log('[main] жив, меню открыто, кадров: ' .. menu.frames)
+        end
         if upd.state == 'installing' and (upd.shown >= 0.999 or not upd.window[0]) then
             wait(500)
             if installUpdate() then return end
