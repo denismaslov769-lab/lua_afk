@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Новый виджет бота во вкладке Авто фарм (дорога, скорость, расстояние, прицеп, прогресс, кнопка запуска). Частицы Arizona и Hearts. ПКМ - Убрать фон у своих частиц. Сцепка: прицеп далеко или за забором - бот едет к нему в объезд и быстрее, без качелей вперёд-назад. Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
+-- @changelog: Сцепка: мало места перед прицепом - бот подъезжает ближе и сдаёт с короткого расстояния, не крутится бесконечно (останавливается с подсказкой). Новый виджет бота во вкладке Авто фарм (дорога, скорость, расстояние, прицеп, прогресс, кнопка запуска). Частицы Arizona и Hearts. ПКМ - Убрать фон у своих частиц. Сцепка: прицеп далеко или за забором - бот едет к нему в объезд и быстрее, без качелей вперёд-назад. Меню на правую кнопку мыши по файлам фона и частиц: поставить, убрать фон, удалить из папки. Кнопка Убрать фон. Меню: автоконтраст для любых тем (светлые темы теперь читаются), новая вкладка Настройки (шестерня), свой фон меню - картинки, GIF, видео и папки с кадрами, свои картинки для падающих частиц. Авто спавн удалён.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.4.4')
+script_version('2.4.5')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.4.4'
+local SCRIPT_VERSION = '2.4.5'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1080,6 +1080,7 @@ local function hitchStart()
     if not TRACTORS[getCarModel(car)] then msg('Нужен тягач: Linerunner, Tanker или Roadtrain.') return end
     if isTrailerAttachedToCab(trailer.handle, car) then msg('Прицеп уже прицеплен.') return end
     hitch.active, hitch.phase, hitch.st, hitch.tries, hitch.start = true, 'approach', {}, 0, os.clock()
+    hitch.spin, hitch.spinLast, hitch.freeT = 0, nil, nil
     hitch.status = 'Сцепка: подъезд'
     msg('Бот: еду цеплять прицеп. Отмена: /lhitch или W / S.')
 end
@@ -1165,6 +1166,33 @@ local function hitchControl(car)
     end
     local s = senseFront(car, 8)
     local reach = g.front + g.back + 14                      -- стартовая точка перед прицепом (запас на выравнивание)
+    -- Сколько свободно перед прицепом (стена, забор, столб): если меньше нужного,
+    -- точку подъезда ставим ближе - сдавать задом будем с короткого расстояния.
+    if not hitch.freeT or now - hitch.freeT > 0.5 then
+        hitch.freeT = now
+        local _, _, kz = getCarCoordinates(tr)
+        local L = reach + g.front + 6
+        local best = L
+        for _, side in ipairs({ -1.1, 0, 1.1 }) do           -- три луча по ширине фуры
+            local ox, oy = tfy * side, -tfx * side
+            local x1, y1 = kx + tfx * 1.5 + ox, ky + tfy * 1.5 + oy
+            local hit, cp = los(x1, y1, kz + 0.7, x1 + tfx * L, y1 + tfy * L, kz + 0.7, false)
+            if hit and cp and cp.pos then best = math.min(best, 1.5 + getDistanceBetweenCoords2d(x1, y1, cp.pos[1], cp.pos[2])) end
+        end
+        hitch.free = best
+    end
+    local maxP = hitch.free - g.front - 1.0                  -- дальше этого центр фуры не встанет
+    local tight = maxP < reach
+    if tight then
+        if maxP < g.back + 2.5 then
+            return hitchStop(string.format('Бот: перед прицепом всего %.0f м свободно - фура не встанет. Отодвиньте прицеп или уберите препятствие.', hitch.free))
+        end
+        reach = maxP
+    end
+    -- Крутимся на месте слишком долго - места для разворота нет
+    if hitch.spin and hitch.spin > 25 then
+        return hitchStop('Бот: не хватает места развернуться у прицепа. Отъедьте на свободное место и попробуйте снова.')
+    end
     local ax, ay = kx + tfx * reach, ky + tfy * reach
     -- Допустимое смещение вбок растёт с расстоянием: издалека задний ход сам
     -- выведет седло на линию прицепа (конус ~20 градусов от линии).
@@ -1175,7 +1203,8 @@ local function hitchControl(car)
     -- (только если до прицепа не дальше 45 м и между седлом и прицепом нет забора/стены)
     if (hitch.phase == 'approach' or hitch.phase == 'align') and along < 45
         and ((along > 8 and math.abs(e) < eTol and headErr < 30)
-          or (along > 0 and math.abs(e) < 1 and headErr < 10))
+          or (along > 0 and math.abs(e) < 1 and headErr < 10)
+          or (tight and along > 2 and math.abs(e) < 1.6 and headErr < 15))
         and clearLine(hx, hy, cz + 0.8, kx, ky, cz + 0.8) then
         hitch.phase, hitch.st = 'reverse', {}
         log(string.format('[hitch] на линии, сдаю назад: вдоль %.1f, вбок %.2f, курс %.0f', along, e, headErr))
@@ -1228,13 +1257,15 @@ local function hitchControl(car)
             tx, ty = kx + tfx * p + nx * sgn * 10, ky + tfy * p + ny * sgn * 10
         else
             -- точка на линии впереди (не ближе reach к шкворню), упреждение 12 м
-            local p = math.max(proj + 12, reach)
+            local p = math.min(math.max(proj + 12, reach), math.max(reach, maxP))
             tx, ty = kx + tfx * p, ky + tfy * p
         end
         local lx, ly = toLocal(car, tx, ty)
         local angD = math.deg(math.atan2(lx, ly))
         if math.abs(angD) > 100 then
             -- точка сзади (смотрим не туда) - разворот, пока не повернёмся к ней
+            if hitch.spinLast and now - hitch.spinLast < 0.2 then hitch.spin = hitch.spin + (now - hitch.spinLast) end
+            hitch.spinLast = now
             turnToHeading(car, st, angD, s, now, speed)
             return
         end
@@ -1260,6 +1291,8 @@ local function hitchControl(car)
         local lx, ly = toLocal(car, cx + tfx * 60, cy + tfy * 60)
         local hang = math.deg(math.atan2(lx, ly))
         if math.abs(hang) < 20 and speed < 1.5 then hitch.phase, hitch.st = 'reverse', {} return end
+        if hitch.spinLast and now - hitch.spinLast < 0.2 then hitch.spin = hitch.spin + (now - hitch.spinLast) end
+        hitch.spinLast = now
         if turnToHeading(car, hitch.st, hang, s, now, speed) then
             keys(0, 0, (speed > 0.5) and 0.6 or 0)
             if speed < 0.5 then hitch.phase, hitch.st = 'reverse', {} end
