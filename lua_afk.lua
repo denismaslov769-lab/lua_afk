@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Если сервер пишет «Вы уже взяли груз, отвезите сначала его!», бот сразу едет цеплять уже выданный прицеп.
+-- @changelog: Сцепка в тесноте: вместо кружения вокруг прицепа бот переходит в режим «мало места» - доворачивается вперёд-назад в несколько приёмов и сдаёт седлом прямо на шкворень.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.17')
+script_version('2.5.18')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.17'
+local SCRIPT_VERSION = '2.5.18'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1657,7 +1657,7 @@ local function hitchStart()
     if not TRACTORS[getCarModel(car)] then msg('Нужен тягач: Linerunner, Tanker или Roadtrain.') return end
     if isTrailerAttachedToCab(trailer.handle, car) then msg('Прицеп уже прицеплен.') return end
     hitch.active, hitch.phase, hitch.st, hitch.tries, hitch.start = true, 'approach', {}, 0, os.clock()
-    hitch.spin, hitch.spinLast, hitch.freeT, hitch.reversed = 0, nil, nil, nil
+    hitch.spin, hitch.spinLast, hitch.freeT, hitch.reversed, hitch.tightMode, hitch.tt = 0, nil, nil, nil, nil, nil
     hitch.status = 'Сцепка: подъезд'
     msg('Бот: еду цеплять прицеп. Отмена: /lhitch или W / S.')
 end
@@ -2129,6 +2129,71 @@ local function turnToHeading(car, st, ang, s, now, speed)
     return false
 end
 
+-- Режим «мало места»: не ставим фуру на длинную линию перед прицепом (места нет -
+-- бот кружится), а работаем от шкворня. Шкворень сзади - сдаём седлом прямо на него.
+-- Сбоку/спереди - доворачиваемся в несколько приёмов: вперёд с рулём от прицепа,
+-- назад с рулём к нему (зад фуры каждый раз заходит ближе к шкворню).
+bot.hitchTight = function(car, tr, g, kx, ky, hx, hy, tfx, tfy, dHK, headErr, speed, vf, s, now)
+    local T = hitch.tt
+    if not T then T = { phase = 'eval', since = now }; hitch.tt = T end
+    hitch.start = math.max(hitch.start, now - 100)          -- в тесноте даём больше времени
+    T.n = T.n or 0
+    if T.n > 40 then return hitchStop('Бот: не получилось прицепиться в тесноте. Подъедьте к прицепу задом вручную и нажмите /lhitch.') end
+    -- шкворень в координатах фуры: kl > 0 - справа, kf < 0 - сзади
+    local kl, kf = toLocal(car, kx, ky)
+    local bang = math.deg(math.atan2(kl, -(kf + g.back)))   -- угол шкворня от зада фуры: 0 - ровно сзади
+    local side = (kl >= 0) and 1 or -1
+    local t = now - T.since
+    if speed > 0.4 then T.moved = now end
+    local stalled = t > 1.0 and now - (T.moved or T.since) > 0.9
+    local function switch(ph)
+        T.phase, T.since, T.moved, T.n = ph, now, nil, T.n + 1
+        log(string.format('[hitch] теснота: %s, до шкворня %.1f, угол от зада %.0f, курс %.0f', ph, dHK, bang, headErr))
+    end
+    if T.phase == 'eval' then
+        keys(0, (vf < -0.3) and 0.6 or 0, (vf > 0.3) and 0.8 or 0)
+        if speed < 0.5 then
+            if math.abs(bang) < 50 and not (dHK < 8 and headErr > 50) then switch('back')
+            else switch('fwd') end
+        end
+        hitch.status = 'Сцепка (тесно): осматриваюсь'
+        return
+    end
+    if T.phase == 'back' then
+        -- седлом прямо на шкворень; руль назад вправо - зад уходит вправо
+        if vf > 0.5 then keys(0, 0, 1) return end
+        local steer = clamp(bang / 22, -1, 1)
+        -- у самого прицепа доворачиваем ещё и по курсу прицепа
+        if dHK < 7 then
+            local fx, fy = carBasis(car)
+            local psi = math.deg(math.atan2(fx * tfy - fy * tfx, fx * tfx + fy * tfy))
+            steer = clamp(steer + psi / 40, -1, 1)
+        end
+        local v = clamp(0.8 + dHK * 0.15, 0.8, 2.2)
+        local diff = v - speed
+        keys(steer, (diff < -0.3) and 0.4 or 0, (diff > 0.2) and 0.55 or 0)
+        hitch.status = string.format('Сцепка (тесно): сдаю на шкворень, %.1f м', dHK)
+        -- ушли в сторону или упёрлись - доворот вперёд
+        if t > 0.6 and (math.abs(bang) > 65 or stalled or (dHK < 6 and headErr > 50)) then switch('fwd') end
+        return
+    end
+    -- fwd: едем вперёд с рулём ОТ шкворня - нос уходит в сторону, зад поворачивается к прицепу
+    if vf < -0.5 then keys(0, 0.8, 0) return end
+    local fg = minOf(s.fl, s.fc, s.fr)
+    local steer = -side
+    -- курс сильно не тот (стоим рядом, но боком) - выравниваемся по прицепу
+    if dHK < 8 and headErr > 50 then
+        local lx, ly = toLocal(car, hx + tfx * 50, hy + tfy * 50)
+        steer = clamp(math.deg(math.atan2(lx, ly)) / 20, -1, 1)
+    end
+    keys(steer, (speed < 2.2) and 0.45 or 0, 0)
+    hitch.status = 'Сцепка (тесно): доворачиваюсь вперёд'
+    if t > 0.6 and ((fg and fg < 1.5) or stalled or t > 3.0 or (math.abs(bang) < 30 and t > 1.2)) then
+        keys(0, 0, 1)
+        switch('back')
+    end
+end
+
 local function hitchControl(car)
     local now = os.clock()
     if not trailerExists() then return hitchStop('Прицеп пропал, сцепка отменена.') end
@@ -2157,7 +2222,8 @@ local function hitchControl(car)
     -- Рядом и ровно - цепляем (с запасом: точки седла и шкворня у моделей примерные)
     local stuck = hitch.phase == 'reverse' and speed < 0.3 and now - (hitch.st.moved or now) > 0.7
     -- attachTrailerToCab цепляет принудительно, так что точность до сантиметра не нужна
-    if ((dHK < 4.0 and math.abs(e) < 2.2) or (dHK < 6.0 and stuck)) and headErr < 30 then
+    local hTol = hitch.tightMode and 45 or 30
+    if ((dHK < 4.0 and math.abs(e) < 2.2) or (dHK < 6.0 and stuck) or (hitch.tightMode and dHK < 3.0)) and headErr < hTol then
         -- Тормозим против хода: на заднем ходу S - это газ назад, поэтому жмём W.
         if vf < -0.3 then keys(0, 0.6, 0)
         elseif vf > 0.3 then keys(0, 0, 0.6)
@@ -2197,15 +2263,19 @@ local function hitchControl(car)
     if tight then
         -- Нехватку места проверяем только при подъезде. Если уже сдаём назад или
         -- поправляемся, фура сама стоит перед прицепом - место, значит, есть.
-        if maxP < g.back + 2.5 and hitch.phase == 'approach' and not hitch.reversed then
-            return hitchStop(string.format('Бот: перед прицепом всего %.0f м свободно - фура не встанет. Отодвиньте прицеп или уберите препятствие.', hitch.free))
+        if maxP < g.back + 2.5 and hitch.phase == 'approach' and not hitch.reversed and not hitch.tightMode then
+            hitch.tightMode, hitch.tt = true, { phase = 'eval', since = now }
+            log(string.format('[hitch] перед прицепом %.0f м - режим «мало места»', hitch.free))
         end
         reach = maxP
     end
     -- Крутимся на месте слишком долго - места для разворота нет
-    if hitch.spin and hitch.spin > 25 and (hitch.phase == 'approach' or hitch.phase == 'align') and not hitch.reversed then
-        return hitchStop('Бот: не хватает места развернуться у прицепа. Отъедьте на свободное место и попробуйте снова.')
+    -- Крутимся вокруг прицепа больше 8 с - тоже тесно: переходим в режим «мало места»
+    if not hitch.tightMode and hitch.spin and hitch.spin > 8 and (hitch.phase == 'approach' or hitch.phase == 'align') then
+        hitch.tightMode, hitch.tt = true, { phase = 'eval', since = now }
+        log(string.format('[hitch] кружусь у прицепа %.0f с - режим «мало места»', hitch.spin))
     end
+    if hitch.tightMode then return bot.hitchTight(car, tr, g, kx, ky, hx, hy, tfx, tfy, dHK, headErr, speed, vf, s, now) end
     local ax, ay = kx + tfx * reach, ky + tfy * reach
     -- Допустимое смещение вбок растёт с расстоянием: издалека задний ход сам
     -- выведет седло на линию прицепа (конус ~20 градусов от линии).
@@ -2351,6 +2421,7 @@ local function hitchControl(car)
         if hitch.tries > 5 then return hitchStop('Бот: не получилось подъехать к прицепу задом (мешает препятствие).') end
         log(string.format('[hitch] упёрся задом: до шкворня %.1f', dHK))
         hitch.phase, hitch.st = 'approach', { fails = 2 }
+        if hitch.tries >= 2 and dHK < 25 then hitch.tightMode, hitch.tt = true, { phase = 'eval', since = now } end
         return
     end
     -- проехали шкворень, но стоим почти на линии - короткая поправка вперёд
