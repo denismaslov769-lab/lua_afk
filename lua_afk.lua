@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Бот дальнобойщика автоматически выбирает первый груз в CEF-окне «Выбор груза» и продолжает к выданному прицепу.
+-- @changelog: На точке получения груза бот ждёт 0,3 секунды, нажимает H, выбирает первый пункт CEF и ищет только новый прицеп, появившийся после выбора.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.10')
+script_version('2.5.11')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.10'
+local SCRIPT_VERSION = '2.5.11'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1707,29 +1707,31 @@ do
     local ok, lib = pcall(ffi.load, 'user32')
     if ok then cefUser32 = lib end
 end
-local cefEnterBusy = false
-local function pressCefEnter()
-    if cefEnterBusy then return false end
-    cefEnterBusy = true
+local cefKeyBusy = false
+local function pressCefKey(vk, scan)
+    if cefKeyBusy then return false end
+    cefKeyBusy = true
     lua_thread.create(function()
         local key = rawget(_G, 'setVirtualKeyDown')
         if cefUser32 then
             -- В отличие от одной лишь подмены состояния клавиши, Windows-событие
             -- доходит до Chromium/CEF.
-            pcall(cefUser32.keybd_event, 0x0D, 0x1C, 0, 0)
+            pcall(cefUser32.keybd_event, vk, scan, 0, 0)
             wait(90)
-            pcall(cefUser32.keybd_event, 0x0D, 0x1C, 0x0002, 0)
+            pcall(cefUser32.keybd_event, vk, scan, 0x0002, 0)
         elseif type(key) == 'function' then
-            pcall(key, 0x0D, true)
+            pcall(key, vk, true)
             wait(90)
-            pcall(key, 0x0D, false)
+            pcall(key, vk, false)
         else
-            log('[job] setVirtualKeyDown недоступен - не могу выбрать груз в CEF')
+            log('[job] setVirtualKeyDown недоступен - не могу нажать клавишу работы')
         end
-        cefEnterBusy = false
+        cefKeyBusy = false
     end)
     return true
 end
+local function pressCefEnter() return pressCefKey(0x0D, 0x1C) end
+local function pressJobAction() return pressCefKey(0x48, 0x23) end -- английская H
 
 bot.jobTick = function()
     local J = bot.job
@@ -1779,9 +1781,38 @@ bot.jobTick = function()
                 -- приехали к запомненной точке, а надписи нет - она могла сдвинуться, ищем ещё
                 J.status = 'Работа: на базе, ищу надпись «Получить загруженный прицеп»'
             else
-                go('take', 'Работа: на месте. Выберите груз - бот возьмёт выданный прицеп.')
-                J.known, J.cursorT = bot.trailerSnapshot(), nil
+                go('open', 'Работа: приехал. Через 0,3 секунды нажму H и открою выбор груза.')
+                J.known, J.actionTries = bot.trailerSnapshot(), 0
             end
+        end
+    elseif J.phase == 'open' then
+        if hooked then return go('gate', 'Работа: прицеп уже прицеплен, еду к воротам.') end
+        J.known = J.known or bot.trailerSnapshot()
+        local menu = sampIsDialogActive() or sampIsCursorActive()
+        if menu then
+            go('take', 'Работа: меню груза открыто, выбираю первый пункт.')
+            J.cursorT, J.menuSeen, J.pickTries = now, now, 0
+            return
+        end
+        local elapsed = now - J.t
+        if elapsed < 0.3 then
+            J.status = 'Работа: остановился у груза, жду 0,3 секунды'
+        else
+            J.actionTries = J.actionTries or 0
+            if J.actionTries < 3 and now >= (J.nextAction or 0) then
+                if pressJobAction() then
+                    J.actionTries = J.actionTries + 1
+                    J.nextAction = now + 2.0
+                    J.status = string.format('Работа: нажимаю H, попытка %d', J.actionTries)
+                    log(string.format('[job] нажимаю H у точки получения груза, попытка %d', J.actionTries))
+                end
+            else
+                J.status = 'Работа: жду открытия меню груза'
+            end
+        end
+        if elapsed > 8 then
+            go('label', 'Работа: меню груза не открылось, подъезжаю к точке ещё раз.')
+            J.known = nil
         end
     elseif J.phase == 'take' then
         if hooked then return go('gate', 'Работа: прицеп прицеплен, еду к воротам.') end
@@ -1806,9 +1837,9 @@ bot.jobTick = function()
             and (J.pickTries and J.pickTries > 0 and 'Работа: выбираю груз №1' or 'Работа: открылось меню груза')
             or 'Работа: жду прицеп'
         if not menu and now - J.t > 1.5 then
-            -- сначала ждём новый (выданный) прицеп; старый ближайший - только если нового нет 10 с
-            local since = J.cursorT or J.t
-            local v = bot.findTrailer(car, J.known, now - since < 10)
+            -- Берём только новый прицеп, которого не было до нажатия H.
+            -- Старый свободный прицеп рядом не является выданным нам грузом.
+            local v = bot.findTrailer(car, J.known, true)
             if v then
                 trailer.handle, trailer.server = v, true
                 J.tries = 0
@@ -1826,9 +1857,13 @@ bot.jobTick = function()
         end
         if not hitch.active and now - J.t > 2 then
             J.tries = (J.tries or 0) + 1
-            if J.tries > 3 then go('take', 'Работа: не получилось прицепиться, ищу прицеп заново.'); J.known = {}; return end
+            if J.tries > 3 then
+                go('take', 'Работа: не получилось прицепиться, жду новый прицеп.')
+                J.known = bot.trailerSnapshot()
+                return
+            end
             if not trailerExists() then
-                local v = bot.findTrailer(car, J.known)
+                local v = bot.findTrailer(car, J.known, true)
                 if not v then return go('take') end
                 trailer.handle, trailer.server = v, true
             end
