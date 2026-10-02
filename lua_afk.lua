@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Сцепка сбоку: если седло фуры уже у шкворня (до 3,5 м) и фура стоит под углом до 60°, бот сразу цепляет прицеп, а не ездит взад-вперёд.
+-- @changelog: Анти-отцеп: если прицеп отцепился в рейсе, бот сразу цепляет его обратно; если прицеп уже далеко - едет и цепляет заново.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.29')
+script_version('2.5.30')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.29'
+local SCRIPT_VERSION = '2.5.30'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -2097,6 +2097,41 @@ bot.jobTick = function()
     local hooked = bot.hookedTrailer(car)
     if hooked and not (trailer.handle == hooked) then trailer.handle, trailer.server = hooked, true end
     J.hooked = hooked and true or false
+    -- Анти-отцеп: в рейсе (после сцепки) прицеп отвалился - сразу цепляем обратно
+    -- (после последнего чекпоинта сервер сам снимает прицеп - тогда не цепляем)
+    local rideP = J.phase == 'leave' or J.phase == 'gate' or J.phase == 'honk'
+        or (J.phase == 'cp' and (bot.cp ~= nil or not J.hadCp))
+    if hooked then
+        J.rideTrailer, J.reTries = hooked, 0
+    elseif rideP then
+        local v = (J.rideTrailer and doesVehicleExist(J.rideTrailer)) and J.rideTrailer
+            or ((J.given and doesVehicleExist(J.given)) and J.given) or nil
+        if v then
+            local cx, cy, cz = getCarCoordinates(car)
+            local x, y, z = getCarCoordinates(v)
+            local d = getDistanceBetweenCoords3d(cx, cy, cz, x, y, z)
+            if d <= 18 and (J.reTries or 0) < 5 then
+                if now >= (J.reNext or 0) then
+                    J.reNext, J.reTries = now + 0.4, (J.reTries or 0) + 1
+                    attachTrailerToCab(v, car)
+                    trailer.handle, trailer.server, J.given = v, true, v
+                    log(string.format('[job] анти-отцеп: прицеп отцепился (%.1f м) - цепляю обратно, попытка %d', d, J.reTries))
+                    if J.reTries == 1 then msg('Работа: прицеп отцепился - цепляю обратно.') end
+                end
+                J.status = 'Работа: цепляю отцепившийся прицеп'
+                if J.phase ~= 'leave' then return end
+                J.lostT = nil                      -- в выезде не уходим в полную сцепку
+            elseif now >= (J.reNext or 0) then
+                -- далеко или моментально не вышло - полноценная сцепка с подъездом
+                J.reTries = 0
+                trailer.handle, trailer.server, J.given = v, true, v
+                log(string.format('[job] анти-отцеп: прицеп в %.0f м - еду цеплять заново', d))
+                go('hitch', 'Работа: прицеп отцепился - еду цеплять заново.')
+                J.t = now - 3
+                return
+            end
+        end
+    end
     -- Надпись ворот видна только вблизи: запоминаем её всякий раз, когда проезжаем рядом
     if not J.gateScan or now > J.gateScan then
         J.gateScan = now + 2
