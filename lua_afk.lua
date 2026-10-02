@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Анти-отцеп: если прицеп отцепился в рейсе, бот сразу цепляет его обратно; если прицеп уже далеко - едет и цепляет заново.
+-- @changelog: Руль стал резче вперёд и назад: бот выкручивает руль сильнее и раньше, меньше пропускает чекпоинты и точнее подходит к прицепу.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.30')
+script_version('2.5.31')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.30'
+local SCRIPT_VERSION = '2.5.31'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1548,7 +1548,7 @@ local function botControl(car, tx, ty, tz, dist)
     if bot.wx then
         local lx, ly = toLocal(car, bot.wx, bot.wy)
         local ang = math.atan2(lx, ly)
-        steer = clamp(ang / 0.5, -1, 1)
+        steer = clamp(ang / 0.3, -1, 1)                    -- полный руль уже при ~17 градусах
         v = (vmax >= SPEED_NO_LIMIT) and 999 or vmax
         -- Поворот: скорость по радиусу дуги до точки
         local wd = math.max(5, math.sqrt(lx * lx + ly * ly))
@@ -1627,12 +1627,12 @@ local function botControl(car, tx, ty, tz, dist)
     local nearR = s.cr and s.cr < gap and s.cr or nil
     if nearL then
         v = math.min(v, 4 + nearL * 4)
-        if steer < 0 then steer = steer * 0.25 end
+        if steer < 0 then steer = steer * 0.6 end
         if not nearR then steer = steer + 0.35 end
     end
     if nearR then
         v = math.min(v, 4 + nearR * 4)
-        if steer > 0 then steer = steer * 0.25 end
+        if steer > 0 then steer = steer * 0.6 end
         if not nearL then steer = steer - 0.35 end
     end
     steer = clamp(steer, -1, 1)
@@ -1936,7 +1936,7 @@ bot.jobApproach = function(car)
             log(string.format('[job] напрямую к %s не проехать (%.0f м) - еду автопилотом', isCp and 'чекпоинту' or 'воротам', d))
             return
         end
-        local steer = clamp(math.atan2(lx, ly) / 0.6, -1, 1)
+        local steer = clamp(math.atan2(lx, ly) / 0.35, -1, 1)
         local vt
         if isCp then
             -- чекпоинт - на ходу: скорость не зависит от расстояния до него
@@ -1982,12 +1982,12 @@ bot.jobApproach = function(car)
     local lx, ly = toLocal(car, J.x, J.y)
     -- Проехали точку (она сзади и рядом) - аккуратно сдаём назад прямо на неё
     if ly < 0 and d < 6 then
-        local rs = clamp(math.atan2(lx, -ly) / 0.5, -1, 1)
+        local rs = clamp(math.atan2(lx, -ly) / 0.3, -1, 1)
         keys(rs, 0, (speed < 1.2) and 0.45 or 0)
         bot.status = string.format('Работа: сдаю назад к надписи, %.1f м', d)
         return
     end
-    local steer = clamp(math.atan2(lx, ly) / 0.5, -1, 1)
+    local steer = clamp(math.atan2(lx, ly) / 0.3, -1, 1)
     -- у самой точки ползём, чтобы остановиться ближе 1 метра
     local vt = clamp(d * 0.45, 0.7, 7)
     if math.abs(steer) > 0.8 then vt = math.min(vt, 2.5) end
@@ -2051,7 +2051,7 @@ bot.jobLeave = function(car)
     local steer = 0
     if gx ~= 0 or gy ~= 0 then
         local lx, ly = toLocal(car, gx, gy)
-        steer = clamp(math.atan2(lx, ly) / 1.0, -0.6, 0.6)
+        steer = clamp(math.atan2(lx, ly) / 0.5, -1, 1)
     end
     local fs = senseFront(car, 8)
     local fg = minOf(fs.fl, fs.fc, fs.fr)
@@ -2490,12 +2490,12 @@ bot.hitchTight = function(car, tr, g, kx, ky, hx, hy, tfx, tfy, dHK, headErr, sp
     if T.phase == 'back' then
         -- седлом прямо на шкворень; руль назад вправо - зад уходит вправо
         if vf > 0.5 then keys(0, 0, 1) return end
-        local steer = clamp(bang / 22, -1, 1)
+        local steer = clamp(bang / 12, -1, 1)
         -- у самого прицепа доворачиваем ещё и по курсу прицепа
         if dHK < 7 then
             local fx, fy = carBasis(car)
             local psi = math.deg(math.atan2(fx * tfy - fy * tfx, fx * tfx + fy * tfy))
-            steer = clamp(steer + psi / 40, -1, 1)
+            steer = clamp(steer + psi / 25, -1, 1)
         end
         local v = clamp(0.8 + dHK * 0.12, 0.8, 2.0)
         local diff = v - speed
@@ -2709,7 +2709,7 @@ local function hitchControl(car)
         local v = clamp(dA * 0.4, 6, 12)                     -- далеко - быстрее
         if math.abs(angD) > 25 then v = math.min(v, 4) end   -- крутой поворот - медленно
         if s.fc then v = math.min(v, math.sqrt(2 * 5 * math.max(0, s.fc - 2.5))) end
-        local steer = clamp(angD / 28, -1, 1)
+        local steer = clamp(angD / 15, -1, 1)
         local diff = v - speed
         keys(steer, (diff > 0.3) and clamp(diff / 5, 0.25, 0.8) or 0, (diff < -2) and 0.5 or 0)
         if now - (hitch.logT or 0) > 1 then
@@ -2742,7 +2742,7 @@ local function hitchControl(car)
         -- вперёд: чтобы седло ушло влево (e > 0), нос влево; руль вперёд = поворот носа
         local psi = math.deg(math.atan2(fx * tfy - fy * tfx, fx * tfx + fy * tfy))
         local psiD = clamp(-math.deg(math.atan2(e, 6)), -30, 30)
-        local steer = clamp((psiD - psi) / 12, -1, 1)
+        local steer = clamp((psiD - psi) / 7, -1, 1)
         if along - st.from > 7 or (math.abs(e) < 0.4 and headErr < 6 and along - st.from > 3)
             or (s.fc and s.fc < 2) then
             keys(0, 0, (speed > 0.5) and 0.7 or 0)
@@ -2809,7 +2809,7 @@ local function hitchControl(car)
     -- у самого прицепа нужный угол сужается, чтобы подъехать почти ровно
     local psiMax = math.min(35, 10 + math.max(0, along) * 2.5)
     local psiD = clamp(math.deg(math.atan2(e, math.max(3, along * 0.7))), -psiMax, psiMax)
-    local steer = clamp((psi - psiD) / 12, -1, 1)
+    local steer = clamp((psi - psiD) / 7, -1, 1)
     -- далеко - быстрее, у самого прицепа - аккуратно
     -- плавный профиль: скорость, с которой ещё успеваем затормозить до шкворня
     local v = clamp(0.8 + math.sqrt(2 * 0.6 * math.max(0, dHK - 2)), 0.8, 6.0)
