@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Бот больше не замирает перед препятствием: ищет, с какой стороны свободнее, и медленно объезжает. С прицепом отъезд назад больше не срывается из-за собственного прицепа и идёт ровно, без складывания.
+-- @changelog: Сцепка сбоку: если седло фуры уже у шкворня (до 3,5 м) и фура стоит под углом до 60°, бот сразу цепляет прицеп, а не ездит взад-вперёд.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.28')
+script_version('2.5.29')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.28'
+local SCRIPT_VERSION = '2.5.29'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -2516,7 +2516,12 @@ local function hitchControl(car)
     local stuck = hitch.phase == 'reverse' and speed < 0.3 and now - (hitch.st.moved or now) > 0.7
     -- attachTrailerToCab цепляет принудительно, так что точность до сантиметра не нужна
     local hTol = hitch.tightMode and 45 or 30
-    if ((dHK < 4.0 and math.abs(e) < 2.2) or (dHK < 6.0 and stuck) or (hitch.tightMode and dHK < 3.0)) and headErr < hTol then
+    -- Сбоку тоже можно: если седло уже у шкворня, а фура под углом до 60° -
+    -- цепляем сразу (attachTrailerToCab сам доставит прицеп), не ездим взад-вперёд.
+    -- Если уже несколько приёмов вперёд-назад, допуск ещё шире.
+    local tries = (hitch.tt and hitch.tt.n) or 0
+    local side = (dHK < 3.5 and headErr < 60) or (tries >= 4 and dHK < 5.0 and headErr < 60)
+    if side or (((dHK < 4.0 and math.abs(e) < 2.2) or (dHK < 6.0 and stuck) or (hitch.tightMode and dHK < 3.0)) and headErr < hTol) then
         -- Тормозим против хода: на заднем ходу S - это газ назад, поэтому жмём W.
         if vf < -0.3 then keys(0, 0.6, 0)
         elseif vf > 0.3 then keys(0, 0, 0.6)
