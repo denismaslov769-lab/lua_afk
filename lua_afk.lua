@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Ворота дальше 100 м и чекпоинт уже есть - бот не едет к воротам, а сразу едет по чекпоинтам.
+-- @changelog: Ворота дальше 60 м - бот не едет к воротам, а сразу едет по чекпоинтам (если чекпоинта ещё нет - сигналит на месте и ждёт его).
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.35')
+script_version('2.5.36')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.35'
+local SCRIPT_VERSION = '2.5.36'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -2112,6 +2112,7 @@ bot.jobTick = function()
         J.phase, J.t, J.x, J.y, J.z, J.r, J.scan = phase, now, nil, nil, nil, nil, nil
         J.direct, J.ap, J.reached = nil, nil, nil
         J.lv, J.leaveDone, J.leaveStatus, J.lostT = nil, nil, nil, nil
+        if phase == 'label' or phase == 'hitch' then J.skipGate = nil end
         bot.tx, bot.arrived, bot.route = nil, false, nil
         if text then msg(text) end
         log('[job] этап: ' .. phase)
@@ -2376,10 +2377,13 @@ bot.jobTick = function()
             end
             J.status = x and string.format('Работа: еду к воротам%s, %d м', cached and ' (запомненная точка)' or '', math.floor(d)) or 'Работа: не знаю, где ворота - проедьте мимо надписи «Посигнальте» или встаньте у ворот и введите /lgate'
             if not x and bot.cp then return go('cp', 'Работа: еду по чекпоинтам.') end
-            -- ворота дальше 100 м, а чекпоинт уже есть - к воротам не едем, сразу по чекпоинтам
-            if x and d > 100 and bot.cp then
-                log(string.format('[job] ворота в %.0f м (> 100) - сразу к чекпоинту', d))
-                return go('cp', 'Работа: ворота далеко - еду сразу по чекпоинтам.')
+            -- ворота дальше 60 м - к воротам не едем, сразу по чекпоинтам
+            -- (чекпоинта ещё нет - один раз сигналим на месте и ждём его, к воротам не возвращаемся)
+            if x and d > 60 then
+                log(string.format('[job] ворота в %.0f м (> 60) - к воротам не еду, сразу к чекпоинту (чекпоинт %s)', d, bot.cp and 'есть' or 'нет'))
+                if not bot.cp then J.hornUntil = now + 1.2 end
+                J.skipGate = true
+                return go('cp', bot.cp and 'Работа: ворота далеко - еду сразу по чекпоинтам.' or 'Работа: ворота далеко - жду чекпоинт.')
             end
             -- ворота ни разу не видели и чекпоинта нет - сигналим на месте, дальше ждём чекпоинт
             if not x and now - J.t > 6 then
@@ -2456,7 +2460,7 @@ bot.jobTick = function()
             if now - (J.lastCp or J.t) > 20 then
                 if not hooked then return go('label', 'Работа: рейс окончен, еду за новым прицепом.') end
                 -- чекпоинта нет, а прицеп ещё на нас - может ворота не открылись
-                if not J.hadCp and (J.honks or 0) < 3 then return go('gate') end
+                if not J.hadCp and not J.skipGate and (J.honks or 0) < 3 then return go('gate') end
             end
         end
     end
