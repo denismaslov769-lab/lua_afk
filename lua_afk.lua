@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Руль стал резче вперёд и назад: бот выкручивает руль сильнее и раньше, меньше пропускает чекпоинты и точнее подходит к прицепу.
+-- @changelog: Быстрая сцепка: если прицеп рядом (до 25 м), бот не разворачивается к передней части прицепа, а подъезжает к шкворню как стоит (вперёд или задом) и сразу цепляет под любым углом.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.31')
+script_version('2.5.32')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.31'
+local SCRIPT_VERSION = '2.5.32'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1732,6 +1732,7 @@ local function hitchStart(force)
     if isTrailerAttachedToCab(trailer.handle, car) then msg('Прицеп уже прицеплен.') return end
     hitch.active, hitch.phase, hitch.st, hitch.tries, hitch.start = true, 'approach', {}, 0, os.clock()
     hitch.spin, hitch.spinLast, hitch.freeT, hitch.reversed, hitch.tightMode, hitch.tt = 0, nil, nil, nil, nil, nil
+    hitch.quick, hitch.quickFail = nil, nil
     hitch.status = 'Сцепка: подъезд'
     msg('Бот: еду цеплять прицеп. Отмена: /lhitch или W / S.')
 end
@@ -2612,6 +2613,50 @@ local function hitchControl(car)
     if not hitch.tightMode and hitch.spin and hitch.spin > 8 and dHK < 18 and (hitch.phase == 'approach' or hitch.phase == 'align') then
         hitch.tightMode, hitch.tt = true, { phase = 'eval', since = now }
         log(string.format('[hitch] кружусь у прицепа %.0f с - режим «мало места»', hitch.spin))
+    end
+    -- Быстрая сцепка: прицеп рядом - подъезжаем к шкворню как стоим и цепляем под любым
+    -- углом (attachTrailerToCab сам ставит прицеп на седло). Без разворотов и выравнивания.
+    if not hitch.quickFail and (hitch.quick or (dHK < 25 and hitch.phase == 'approach' and not hitch.reversed)) then
+        local Q = hitch.quick
+        if not Q then
+            Q = { t = now, best = 1e9, bestT = now }
+            hitch.quick = Q
+            log(string.format('[hitch] быстрая сцепка: до шкворня %.1f м', dHK))
+        end
+        local dC = getDistanceBetweenCoords2d(cx, cy, kx, ky)     -- центр фуры - шкворень
+        local d = math.min(dC, dHK)
+        if d < Q.best - 0.3 then Q.best, Q.bestT = d, now end
+        local fsQ = senseFront(car, 6)
+        local frontQ = minOf(fsQ.fl, fsQ.fc, fsQ.fr)
+        local stuckQ = now - Q.bestT > 2.5
+        if d < 5 or ((stuckQ or (frontQ and frontQ < 1.2)) and d < 9) then
+            if vf < -0.3 then keys(0, 0.6, 0) elseif vf > 0.3 then keys(0, 0, 0.7) else keys(0, 0, 0) end
+            if speed < 2 then
+                attachTrailerToCab(tr, car)
+                hitch.status = 'Сцепка: цепляю'
+                log(string.format('[hitch] быстрая сцепка: цепляю, до шкворня %.1f (центр %.1f), курс %.0f', dHK, dC, headErr))
+            end
+            return
+        end
+        if stuckQ or now - Q.t > 20 then
+            hitch.quick, hitch.quickFail = nil, true
+            log('[hitch] быстрая сцепка не вышла - обычная сцепка')
+        else
+            -- шкворень впереди - едем носом, сзади - задом (седлом к нему)
+            local lx, ly = toLocal(car, kx, ky)
+            local v = clamp(d * 0.3, 1.2, 3)
+            if ly >= -2 then
+                local st = clamp(math.atan2(lx, ly) / 0.3, -1, 1)
+                if vf < -0.3 then keys(0, 0.6, 0) return end
+                keys(st, (speed < v) and 0.45 or 0, (speed > v + 1) and 0.5 or 0)
+            else
+                local st = clamp(math.atan2(lx, -ly) / 0.3, -1, 1)
+                if vf > 0.3 then keys(0, 0, 0.7) return end
+                keys(st, (speed > v + 1) and 0.4 or 0, (speed < v) and 0.5 or 0)
+            end
+            hitch.status = string.format('Сцепка: подъезжаю к шкворню, %.1f м', d)
+            return
+        end
     end
     -- Прицеп рядом (типично - выдан у точки груза, а места вокруг мало): сразу работаем
     -- в несколько приёмов от шкворня, без подъезда на длинную линию и разворотов.
