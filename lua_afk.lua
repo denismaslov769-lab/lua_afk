@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Сцепка рядом с прицепом (до 20 м) - сразу в несколько приёмов: сдаёт назад, подворачивая зад к прицепу, потом чуть вперёд с доворотом и снова назад. Без разворотов на месте.
+-- @changelog: После сцепки бот аккуратно сдаёт назад вместе с прицепом (держит прицеп ровно, не складывает) и медленно выезжает, чтобы прицеп не отцепился, а потом едет к воротам.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.26')
+script_version('2.5.27')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.26'
+local SCRIPT_VERSION = '2.5.27'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1954,6 +1954,72 @@ bot.jobApproach = function(car)
     bot.status = string.format('Работа: подъезжаю к надписи, %.1f м', d)
 end
 
+-- Выезд после сцепки: 1) назад до ~7 м, держа прицеп ровно (руль в сторону, куда
+-- ушёл прицеп - седло встаёт на его линию); 2) медленно вперёд ~12 м без рывков.
+bot.jobLeave = function(car)
+    local J = bot.job
+    local now = os.clock()
+    local tr = J.trailerV or J.given
+    local speed = getCarSpeed(car)
+    if not tr or not doesVehicleExist(tr) then J.leaveDone = true return end
+    local L = J.lv
+    local cx, cy = getCarCoordinates(car)
+    if not L then
+        L = { phase = 'settle', t = now, x = cx, y = cy }
+        J.lv = L
+    end
+    local fx, fy = carBasis(car)
+    local svx, svy = getCarSpeedVector(car)
+    local vf = svx * fx + svy * fy
+    local trx, try = getCarCoordinates(tr)
+    local tlx = toLocal(car, trx, try)                       -- прицеп вбок от оси фуры (> 0 справа)
+    local moved = getDistanceBetweenCoords2d(cx, cy, L.x, L.y)
+    if speed > 0.3 then L.movedT = now end
+    local stalled = now - (L.movedT or L.t) > 1.5 and now - L.t > 1.5
+    if L.phase == 'settle' then
+        -- полная остановка: сцепка успевает «схватиться»
+        keys(0, (vf < -0.3) and 0.5 or 0, (vf > 0.3) and 0.6 or 0)
+        J.leaveStatus = 'Работа: прицеп прицеплен, останавливаюсь'
+        if speed < 0.3 and now - L.t > 0.8 then L.phase, L.t, L.x, L.y, L.movedT = 'back', now, cx, cy, nil end
+        return
+    end
+    if L.phase == 'back' then
+        local tg = geo(tr)
+        local x1, y1, z1 = getOffsetFromCarInWorldCoords(tr, 0, -(tg.back + 0.3), 0.8)
+        local x2, y2, z2 = getOffsetFromCarInWorldCoords(tr, 0, -(tg.back + 3.0), 0.8)
+        local wall = not clearLine(x1, y1, z1, x2, y2, z2)
+        if moved > 7 or wall or stalled or math.abs(tlx) > 3.0 or now - L.t > 10 then
+            keys(0, (vf < -0.3) and 0.5 or 0, 0)
+            if speed < 0.3 then
+                log(string.format('[job] выезд: назад %.1f м (%s), еду вперёд', moved, wall and 'сзади преграда' or (math.abs(tlx) > 3 and 'прицеп уводит' or 'хватит')))
+                L.phase, L.t, L.x, L.y, L.movedT = 'fwd', now, cx, cy, nil
+            end
+            return
+        end
+        if vf > 0.3 then keys(0, 0, 0.6) return end
+        local steer = clamp(tlx / 1.2, -1, 1)
+        keys(steer, (speed > 1.6) and 0.4 or 0, (speed < 1.2) and 0.45 or 0)
+        J.leaveStatus = string.format('Работа: сдаю назад с прицепом, %.1f м', moved)
+        return
+    end
+    -- вперёд: медленно, плавный газ, руль к воротам (если известны), без рывков
+    local gx, gy = num(cfg.bot.jobGx, 0), num(cfg.bot.jobGy, 0)
+    local steer = 0
+    if gx ~= 0 or gy ~= 0 then
+        local lx, ly = toLocal(car, gx, gy)
+        steer = clamp(math.atan2(lx, ly) / 1.0, -0.6, 0.6)
+    end
+    local fs = senseFront(car, 8)
+    local fg = minOf(fs.fl, fs.fc, fs.fr)
+    if fg and fg < 3 then steer = (fs.fl and not fs.fr) and 0.6 or (fs.fr and not fs.fl) and -0.6 or steer end
+    local vt = 3.0
+    if fg then vt = math.min(vt, math.max(0, (fg - 2) * 0.8)) end
+    if vf < -0.3 then keys(0, 0.4, 0) return end
+    keys(steer, (speed < vt) and 0.35 or 0, (speed > vt + 1) and 0.4 or 0)
+    J.leaveStatus = string.format('Работа: аккуратно выезжаю, %.0f м', moved)
+    if moved > 12 or now - L.t > 15 or (stalled and now - L.t > 3) then J.leaveDone = true end
+end
+
 local function pressCefEnter() return pressCefKey(0x0D, 0x1C) end
 local function pressJobAction() return pressCefKey(0x48, 0x23) end -- английская H
 
@@ -1979,6 +2045,7 @@ bot.jobTick = function()
     local function go(phase, text)
         J.phase, J.t, J.x, J.y, J.z, J.r, J.scan = phase, now, nil, nil, nil, nil, nil
         J.direct, J.ap, J.reached = nil, nil, nil
+        J.lv, J.leaveDone, J.leaveStatus, J.lostT = nil, nil, nil, nil
         bot.tx, bot.arrived, bot.route = nil, false, nil
         if text then msg(text) end
         log('[job] этап: ' .. phase)
@@ -2146,7 +2213,9 @@ bot.jobTick = function()
         J.status = hitch.status ~= '' and hitch.status or 'Работа: цепляю прицеп'
         if hooked then
             if hitch.active then hitchStop() end
-            return go('gate', 'Работа: прицеп прицеплен, еду к воротам.')
+            go('leave', 'Работа: прицеп прицеплен - аккуратно сдаю назад и выезжаю.')
+            J.trailerV = hooked
+            return
         end
         if not hitch.active and now - J.t > 2 then
             J.tries = (J.tries or 0) + 1
@@ -2168,6 +2237,23 @@ bot.jobTick = function()
             J.t = now
             hitchStart(true)
         end
+    elseif J.phase == 'leave' then
+        -- управление - в bot.jobLeave (основной цикл); здесь только контроль сцепки
+        if not hooked then
+            J.lostT = J.lostT or now
+            if now - J.lostT > 1.5 then
+                log('[job] прицеп отцепился при выезде - цепляю снова')
+                go('hitch', 'Работа: прицеп отцепился - цепляю снова.')
+                if J.given and doesVehicleExist(J.given) then trailer.handle, trailer.server = J.given, true end
+                J.t = now - 3
+                return
+            end
+        else
+            J.lostT = nil
+            J.trailerV = hooked
+        end
+        if J.leaveDone then return go('gate', 'Работа: выехал, еду к воротам.') end
+        J.status = J.leaveStatus or 'Работа: выезжаю с прицепом'
     elseif J.phase == 'gate' then
         if not J.scan or now > J.scan then
             J.scan = now + 1
@@ -2704,7 +2790,10 @@ local function botThread()
                 botRelease(); bot.status = 'Сядьте за руль'
             else
                 local x, y, z, name = botTarget()
-                if bot.job and (bot.job.phase == 'label' or bot.job.phase == 'gate' or (bot.job.phase == 'cp' and bot.cp)) and bot.job.direct and bot.job.x then
+                if bot.job and bot.job.phase == 'leave' then
+                    bot.jobLeave(car)
+                    bot.status = bot.job.leaveStatus or 'Выезжаю с прицепом'
+                elseif bot.job and (bot.job.phase == 'label' or bot.job.phase == 'gate' or (bot.job.phase == 'cp' and bot.cp)) and bot.job.direct and bot.job.x then
                     bot.jobApproach(car)
                 elseif not x then
                     botRelease(); bot.status = (bot.job and bot.job.status) or 'Нет метки'; bot.arrived = false
