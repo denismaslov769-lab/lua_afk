@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Ворота дальше 60 м - бот не едет к воротам, а сразу едет по чекпоинтам (если чекпоинта ещё нет - сигналит на месте и ждёт его).
+-- @changelog: Рейдж-режим /lrage: бот телепортируется к метке быстрыми короткими шагами (/lrage 8 80 - шаг и пауза), прицеп переносится следом. Ворота: если чекпоинт уже есть - сразу к нему; /lgateskip - вообще не ехать к воротам.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.36')
+script_version('2.5.37')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.36'
+local SCRIPT_VERSION = '2.5.37'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1707,6 +1707,47 @@ local function trailerExists()
     return trailer.handle ~= nil and doesVehicleExist(trailer.handle)
 end
 
+-- Рейдж-режим (/lrage): бот не едет, а быстро телепортируется к метке короткими
+-- шагами (по cfg.bot.rageStep м раз в cfg.bot.rageDelay мс). Прицеп переносится следом.
+bot.rageTick = function(car, x, y, z)
+    if cfg.bot.rage ~= true or not x then return false end
+    local J = bot.job
+    if hitch.active or (J and (J.phase == 'leave' or J.phase == 'hitch' or J.phase == 'honk')) then return false end
+    local cx, cy, cz = getCarCoordinates(car)
+    local dist = getDistanceBetweenCoords2d(cx, cy, x, y)
+    -- чекпоинт - прямо в него, остальное - до радиуса прибытия (дальше обычная логика)
+    local stopR = (J and J.phase == 'cp') and 1 or math.max(3, ((J and J.r) or num(cfg.bot.radius, 12)) - 2)
+    if dist <= stopR then return false end
+    local now = os.clock()
+    keys(0, 0, 0)
+    bot.status = string.format('Рейдж: телепорт к метке, %d м', math.floor(dist))
+    bot.bestTime, bot.progT = now, now
+    if now < (bot.rageNext or 0) then return true end
+    bot.rageNext = now + clamp(num(cfg.bot.rageDelay, 80), 20, 2000) / 1000
+    local step = math.min(clamp(num(cfg.bot.rageStep, 8), 1, 50), dist - stopR + 0.5)
+    local dx, dy = (x - cx) / dist, (y - cy) / dist
+    local nx, ny = cx + dx * step, cy + dy * step
+    local tzz = (z and fin(z) and math.abs(z - cz) < 200) and z or cz
+    local zi = cz + (tzz - cz) * math.min(1, step / dist)
+    local gz = getGroundZFor3dCoord(nx, ny, math.max(cz, zi) + 3)
+    if not gz or not fin(gz) or gz < -50 or math.abs(gz - zi) > 15 then gz = zi - 0.5 end
+    local hd = getHeadingFromVector2d(dx, dy)
+    -- прицеп: запоминаем, чтобы перенести следом
+    local tr = J and J.hooked and bot.hookedTrailer(car)
+    pcall(setCarCoordinates, car, nx, ny, gz + 1.0)
+    pcall(setCarHeading, car, hd)
+    pcall(setCarForwardSpeed, car, 0)
+    if tr and doesVehicleExist(tr) then
+        local bx, by = nx - dx * 10, ny - dy * 10
+        local bz = getGroundZFor3dCoord(bx, by, gz + 3)
+        if not bz or not fin(bz) or math.abs(bz - gz) > 10 then bz = gz end
+        pcall(setCarCoordinates, tr, bx, by, bz + 1.0)
+        pcall(setCarHeading, tr, hd)
+        pcall(attachTrailerToCab, tr, car)
+    end
+    return true
+end
+
 local function deleteTrailer()
     if trailer.server then trailer.handle, trailer.server = nil, nil return end   -- прицеп сервера не удаляем
     if trailerExists() then pcall(deleteCar, trailer.handle) end
@@ -2377,10 +2418,10 @@ bot.jobTick = function()
             end
             J.status = x and string.format('Работа: еду к воротам%s, %d м', cached and ' (запомненная точка)' or '', math.floor(d)) or 'Работа: не знаю, где ворота - проедьте мимо надписи «Посигнальте» или встаньте у ворот и введите /lgate'
             if not x and bot.cp then return go('cp', 'Работа: еду по чекпоинтам.') end
-            -- ворота дальше 60 м - к воротам не едем, сразу по чекпоинтам
-            -- (чекпоинта ещё нет - один раз сигналим на месте и ждём его, к воротам не возвращаемся)
-            if x and d > 60 then
-                log(string.format('[job] ворота в %.0f м (> 60) - к воротам не еду, сразу к чекпоинту (чекпоинт %s)', d, bot.cp and 'есть' or 'нет'))
+            -- ворота дальше 60 м, чекпоинт уже есть или включено /lgateskip - к воротам не едем,
+            -- сразу по чекпоинтам (чекпоинта ещё нет - сигналим на месте и ждём его)
+            if x and (d > 60 or bot.cp or cfg.bot.jobSkipGate == true) then
+                log(string.format('[job] ворота в %.0f м - к воротам не еду, сразу к чекпоинту (чекпоинт %s%s)', d, bot.cp and 'есть' or 'нет', cfg.bot.jobSkipGate == true and ', /lgateskip' or ''))
                 if not bot.cp then J.hornUntil = now + 1.2 end
                 J.skipGate = true
                 return go('cp', bot.cp and 'Работа: ворота далеко - еду сразу по чекпоинтам.' or 'Работа: ворота далеко - жду чекпоинт.')
@@ -2967,7 +3008,9 @@ local function botThread()
                 botRelease(); bot.status = 'Сядьте за руль'
             else
                 local x, y, z, name = botTarget()
-                if bot.job and bot.job.phase == 'leave' then
+                if bot.rageTick(car, x, y, z) then
+                    -- рейдж-режим: телепорт шагами, управление не нужно
+                elseif bot.job and bot.job.phase == 'leave' then
                     bot.jobLeave(car)
                     bot.status = bot.job.leaveStatus or 'Выезжаю с прицепом'
                 elseif bot.job and (bot.job.phase == 'label' or bot.job.phase == 'gate' or (bot.job.phase == 'cp' and bot.cp)) and bot.job.direct and bot.job.x then
@@ -5166,6 +5209,25 @@ function main()
         end
     end)
     sampRegisterChatCommand('lhitch', function() hitchStart() end)
+    sampRegisterChatCommand('lgateskip', function()
+        cfg.bot.jobSkipGate = not (cfg.bot.jobSkipGate == true)
+        saveCfg()
+        msg(cfg.bot.jobSkipGate and 'Ворота: бот НЕ едет к воротам, сразу по чекпоинтам.' or 'Ворота: бот снова едет к воротам (если ближе 60 м и чекпоинта нет).')
+    end)
+    -- /lrage - вкл/выкл; /lrage 8 80 - шаг 8 м, пауза 80 мс
+    sampRegisterChatCommand('lrage', function(arg)
+        local a, b = (arg or ''):match('^%s*([%d%.]+)%s*([%d%.]*)')
+        if a then
+            cfg.bot.rageStep = clamp(tonumber(a) or 8, 1, 50)
+            if b and b ~= '' then cfg.bot.rageDelay = clamp(tonumber(b) or 80, 20, 2000) end
+            cfg.bot.rage = true
+        else
+            cfg.bot.rage = not (cfg.bot.rage == true)
+        end
+        saveCfg()
+        msg(cfg.bot.rage and string.format('Рейдж-режим ВКЛ: телепорт по %.0f м каждые %.0f мс.', num(cfg.bot.rageStep, 8), num(cfg.bot.rageDelay, 80))
+            or 'Рейдж-режим выключен - бот снова едет сам.')
+    end)
     sampRegisterChatCommand('lgate', function()
         local x, y, z = getCharCoordinates(PLAYER_PED)
         cfg.bot.jobGx, cfg.bot.jobGy, cfg.bot.jobGz = x, y, z
