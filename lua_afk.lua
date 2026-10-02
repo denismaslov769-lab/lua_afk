@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Ворота: бот сигналит на ходу и не останавливается; если уже проехал ворота - не сигналит. Повторный сигнал - только когда ворота впереди и закрыты.
+-- @changelog: Столбы, светофоры, знаки: датчики видят мелкие объекты карты, 9 лучей по ширине фуры смотрят в сторону поворота. Повороты: скорость ограничена по углу (90° ~17 км/ч, с прицепом ~14), с прицепом тормозит раньше.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.33')
+script_version('2.5.34')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.33'
+local SCRIPT_VERSION = '2.5.34'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -430,12 +430,13 @@ end
 -- Все лучи начинаются СНАРУЖИ машины (не изнутри кузова и не у земли) - так
 -- processLineOfSight работает стабильно. Битые и нулевые лучи не пускаем.
 local function fin(v) return type(v) == 'number' and v == v and v > -1e5 and v < 1e5 end
-local function los(x1, y1, z1, x2, y2, z2, cars)
+local function los(x1, y1, z1, x2, y2, z2, cars, dummies)
     if not (fin(x1) and fin(y1) and fin(z1) and fin(x2) and fin(y2) and fin(z2)) then return false end
     local dx, dy, dz = x2 - x1, y2 - y1, z2 - z1
     local l2 = dx * dx + dy * dy + dz * dz
     if l2 < 0.04 or l2 > 150 * 150 then return false end
-    return processLineOfSight(x1, y1, z1, x2, y2, z2, true, cars, cars, true, false, false, false, false)
+    -- dummies: столбы, светофоры, знаки, фонари (мелкие объекты карты)
+    return processLineOfSight(x1, y1, z1, x2, y2, z2, true, cars, cars, true, dummies == true, false, false, false)
 end
 
 -- Прямая видимость (здания и объекты)
@@ -448,33 +449,44 @@ end
 local function cast(car, ax, ay, bx, by, cars, hz)
     local x1, y1, z1 = getOffsetFromCarInWorldCoords(car, ax, ay, hz or 0.3)
     local x2, y2, z2 = getOffsetFromCarInWorldCoords(car, bx, by, hz or 0.3)
-    local hit, cp = los(x1, y1, z1, x2, y2, z2, cars)
+    local hit, cp = los(x1, y1, z1, x2, y2, z2, cars, true)
     if not hit or not cp or not cp.pos then return nil end
     if cp.normal and cp.normal[3] and cp.normal[3] > 0.7 then return nil end
     return getDistanceBetweenCoords2d(x1, y1, cp.pos[1], cp.pos[2])
 end
 
--- Датчики спереди: fl/fc/fr - лучи вперёд от бампера длиной len,
--- cl/cr - лучи от передних углов наружу (видят угол дома или столб на повороте)
-local function senseFront(car, len)
+-- Датчики спереди: 9 лучей по всей ширине (шаг ~0.3 м - тонкий столб между
+-- лучами не проскочит), направлены туда, куда бот поворачивает (ang, рад).
+-- fc - всё, что по ширине машины (тормозим), fl/fr - слева/справа (подруливаем),
+-- cl/cr - лучи от передних углов наружу (угол дома или столб на повороте)
+local function senseFront(car, len, ang)
     local g = geo(car)
-    local h, f = g.half - 0.2, g.front + 0.2
-    local s = {
-        fl = cast(car, -h, f, -h * 1.15, f + len, true),
-        fc = cast(car, 0, f, 0, f + len, true),
-        fr = cast(car, h, f, h * 1.15, f + len, true),
-    }
-    -- Второй ряд лучей на высоте кабины: шлагбаумы, навесы, объекты сервера,
-    -- которые нижний луч проходит под ними или между опорами
-    s.fl = minOf(s.fl, cast(car, -h, f, -h * 1.15, f + len, false, 1.6))
-    s.fc = minOf(s.fc, cast(car, 0, f, 0, f + len, false, 1.6))
-    s.fr = minOf(s.fr, cast(car, h, f, h * 1.15, f + len, false, 1.6))
+    local h, f = g.half - 0.1, g.front + 0.2
+    local sa, ca = math.sin(ang or 0), math.cos(ang or 0)
+    local s = {}
+    local function ray(x, l, hz, cars, a2)
+        local s2, c2 = sa, ca
+        if a2 then s2, c2 = math.sin(a2), math.cos(a2) end
+        return cast(car, x, f, x + s2 * l, f + c2 * l, cars, hz)
+    end
+    for k = -4, 4 do
+        local x = h * k / 4
+        local d = ray(x, len, nil, true)
+        -- второй ряд на высоте кабины: шлагбаумы, навесы, объекты сервера
+        if k % 2 == 0 then d = minOf(d, ray(x, len, 1.6, false)) end
+        -- в повороте ещё и прямо перед носом (то, во что упрёмся прямо сейчас)
+        if ang and math.abs(ang) > 0.08 and k % 2 == 0 then d = minOf(d, ray(x, 5, nil, true, 0)) end
+        if d then
+            s.fc = minOf(s.fc, d)
+            if k < 0 then s.fl = minOf(s.fl, d) elseif k > 0 then s.fr = minOf(s.fr, d) end
+        end
+    end
     for _, sd in ipairs({ -1, 1 }) do
         local ox, oy = sd * (g.half + 0.15), g.front - 0.3
         local best
-        for _, a in ipairs({ 50 }) do
+        for _, a in ipairs({ 25, 50 }) do
             local r = math.rad(a)
-            best = minOf(best, cast(car, ox, oy, ox + sd * math.sin(r) * 2.8, oy + math.cos(r) * 2.8, false))
+            best = minOf(best, cast(car, ox, oy, ox + sd * math.sin(r) * 3.2, oy + math.cos(r) * 3.2, false))
         end
         if sd < 0 then s.cl = best else s.cr = best end
     end
@@ -1256,6 +1268,8 @@ local function routeWaypoint(car, speed, tx, ty)
     -- скорость, и успеваем ли до него затормозить (с запасом для фуры с прицепом)
     local careful = num(cfg.bot.style, 0) == 1
     local aLat, decel = careful and 4.5 or 6.5, careful and 5 or 6.5
+    local hooked = bot.job and bot.job.hooked
+    if hooked then aLat, decel = aLat * 0.7, decel * 0.65 end     -- с прицепом медленнее и раньше
     local look = 40 + speed * speed / (2 * decel)
     local vcap, acc = nil, 0
     for i = bi + 3, n - 3 do
@@ -1270,7 +1284,10 @@ local function routeWaypoint(car, speed, tx, ty)
             local ang = math.acos(cosv)
             if ang > 0.05 then
                 local radius = (lu + lv) / 2 / ang
-                local vc = math.max(7, math.sqrt(aLat * radius))
+                -- окно ~24 м завышает радиус крутого поворота: ограничиваем ещё и по углу
+                -- (90 градусов - ~17 км/ч, с прицепом ~14 км/ч), иначе фуру выносит
+                local vAng = math.max(4, 14 - ang * 6) * (hooked and 0.85 or 1)
+                local vc = math.max(4, math.min(math.sqrt(aLat * radius), vAng))
                 local vAllow = math.sqrt(vc * vc + 2 * decel * math.max(0, acc - 4))
                 if not vcap or vAllow < vcap then vcap = vAllow end
             end
@@ -1456,7 +1473,13 @@ local function botControl(car, tx, ty, tz, dist)
     end
 
     local len = math.min(60, 6 + speed * speed / (2 * decel) + speed * 0.3)
-    local s = senseFront(car, len)
+    -- лучи смотрят туда, куда едем (на точку маршрута), а не строго по капоту
+    local sang
+    if bot.wx then
+        local lx0, ly0 = toLocal(car, bot.wx, bot.wy)
+        if ly0 > 1 then sang = clamp(math.atan2(lx0, ly0), -0.8, 0.8) * 0.6 end
+    end
+    local s = senseFront(car, len, sang)
 
     -- 2. Маршрут по дорогам GTA
     local rwx, rwy, rturn
