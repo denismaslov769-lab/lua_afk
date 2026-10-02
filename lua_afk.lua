@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Быстрая сцепка: если прицеп рядом (до 25 м), бот не разворачивается к передней части прицепа, а подъезжает к шкворню как стоит (вперёд или задом) и сразу цепляет под любым углом.
+-- @changelog: Ворота: бот сигналит на ходу и не останавливается; если уже проехал ворота - не сигналит. Повторный сигнал - только когда ворота впереди и закрыты.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.32')
+script_version('2.5.33')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.32'
+local SCRIPT_VERSION = '2.5.33'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -1927,9 +1927,7 @@ bot.jobApproach = function(car)
         local isCp = J.phase == 'cp'
         local lx, ly = toLocal(car, J.x, J.y)
         if not isCp and (d <= 7 or (ly < 0 and d <= 15) or (now - A.progT > 6 and d <= 20)) then
-            if speed > 0.4 then keys(0, 0, 1) else keys(0, 0, 0); J.reached = true end
-            bot.status = 'Работа: у ворот'
-            return
+            J.reached = true                    -- у ворот не тормозим: дальше сразу чекпоинты
         end
         if now - A.progT > 6 then
             -- не приближаемся - отдаём управление обычному автопилоту
@@ -2098,6 +2096,11 @@ bot.jobTick = function()
     local hooked = bot.hookedTrailer(car)
     if hooked and not (trailer.handle == hooked) then trailer.handle, trailer.server = hooked, true end
     J.hooked = hooked and true or false
+    -- Клаксон без остановки: держим кнопку, пока не выйдет время
+    if J.hornUntil then
+        if now < J.hornUntil then setGameKeyState(18, 255)
+        else setGameKeyState(18, 0); J.hornUntil = nil end
+    end
     -- Анти-отцеп: в рейсе (после сцепки) прицеп отвалился - сразу цепляем обратно
     -- (после последнего чекпоинта сервер сам снимает прицеп - тогда не цепляем)
     local rideP = J.phase == 'leave' or J.phase == 'gate' or J.phase == 'honk'
@@ -2357,10 +2360,21 @@ bot.jobTick = function()
                 return go('honk', 'Работа: не вижу ворота - сигналю на месте и жду чекпоинт.')
             end
         end
-        if (J.direct and J.reached) or (not J.direct and bot.arrived and J.x) then
-            J.honks = (J.honks or 0) + 1
-            J.direct = nil
-            go('honk', 'Работа: у ворот - сигналю.')
+        if J.x then
+            local px, py = getCharCoordinates(PLAYER_PED)
+            local gd = getDistanceBetweenCoords2d(px, py, J.x, J.y)
+            local _, gly = toLocal(car, J.x, J.y)
+            -- сигналим на ходу, пока ворота впереди и близко
+            if gd <= 25 and gly > 0 and not J.honked then
+                J.honked, J.hornUntil = true, now + 1.2
+                J.honks = (J.honks or 0) + 1
+                log(string.format('[job] сигналю воротам на ходу, %.0f м', gd))
+            end
+            -- у ворот или уже за ними - сразу по чекпоинтам, без остановки
+            if gd <= 7 or (gly < 0 and gd <= 20) or (J.direct and J.reached) or (not J.direct and bot.arrived) then
+                if not J.honked and gly > 0 then J.hornUntil = now + 1.2 end
+                go('cp', gly < 0 and 'Работа: ворота позади - еду по чекпоинтам.' or 'Работа: у ворот - еду по чекпоинтам.')
+            end
         end
     elseif J.phase == 'honk' then
         J.status = 'Работа: сигналю у ворот'
@@ -2395,14 +2409,16 @@ bot.jobTick = function()
             end
             -- Ворота закрылись перед фурой: стоим у ворот, впереди преграда - сигналим ещё раз
             local gx, gy = num(cfg.bot.jobGx, 0), num(cfg.bot.jobGy, 0)
-            if (gx ~= 0 or gy ~= 0) and getDistanceBetweenCoords2d(px, py, gx, gy) < 35 then
+            local _, gly = toLocal(car, gx, gy)
+            if (gx ~= 0 or gy ~= 0) and gly > -2 and getDistanceBetweenCoords2d(px, py, gx, gy) < 25 then
+                -- ворота впереди, стоим, перед носом преграда - закрыты: сигналим, не останавливая работу
                 local fs = senseFront(car, 10)
                 if getCarSpeed(car) < 0.6 and fs.fc and fs.fc < 8 then J.blockT = J.blockT or now else J.blockT = nil end
                 if J.blockT and now - J.blockT > 1.5 and now > (J.nextHonk or 0) then
-                    J.nextHonk, J.blockT = now + 6, nil
+                    J.nextHonk, J.blockT, J.hornUntil = now + 5, nil, now + 1.2
                     J.honks = (J.honks or 0) + 1
                     log('[job] ворота закрыты - сигналю ещё раз')
-                    return go('honk', 'Работа: ворота закрыты - сигналю.')
+                    msg('Работа: ворота закрыты - сигналю.')
                 end
             else
                 J.blockT = nil
