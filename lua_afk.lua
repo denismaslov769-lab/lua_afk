@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: Столбы, светофоры, знаки: датчики видят мелкие объекты карты, 9 лучей по ширине фуры смотрят в сторону поворота. Повороты: скорость ограничена по углу (90° ~17 км/ч, с прицепом ~14), с прицепом тормозит раньше.
+-- @changelog: Ворота дальше 100 м и чекпоинт уже есть - бот не едет к воротам, а сразу едет по чекпоинтам.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.34')
+script_version('2.5.35')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.34'
+local SCRIPT_VERSION = '2.5.35'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -2376,6 +2376,11 @@ bot.jobTick = function()
             end
             J.status = x and string.format('Работа: еду к воротам%s, %d м', cached and ' (запомненная точка)' or '', math.floor(d)) or 'Работа: не знаю, где ворота - проедьте мимо надписи «Посигнальте» или встаньте у ворот и введите /lgate'
             if not x and bot.cp then return go('cp', 'Работа: еду по чекпоинтам.') end
+            -- ворота дальше 100 м, а чекпоинт уже есть - к воротам не едем, сразу по чекпоинтам
+            if x and d > 100 and bot.cp then
+                log(string.format('[job] ворота в %.0f м (> 100) - сразу к чекпоинту', d))
+                return go('cp', 'Работа: ворота далеко - еду сразу по чекпоинтам.')
+            end
             -- ворота ни разу не видели и чекпоинта нет - сигналим на месте, дальше ждём чекпоинт
             if not x and now - J.t > 6 then
                 log('[job] ворота «Посигнальте» не найдены - сигналю на месте')
