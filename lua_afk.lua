@@ -1,11 +1,11 @@
 -- lua_afk.lua
 -- Скрипт для SA-MP (MoonLoader): меню, бот дальнобойщик, автообновление
 -- Требуется: MoonLoader, SAMPFUNCS, mimgui. Для чекпоинтов бота: SAMP.Lua (lib/samp/events)
--- @changelog: После сцепки бот аккуратно сдаёт назад вместе с прицепом (держит прицеп ровно, не складывает) и медленно выезжает, чтобы прицеп не отцепился, а потом едет к воротам.
+-- @changelog: Бот больше не замирает перед препятствием: ищет, с какой стороны свободнее, и медленно объезжает. С прицепом отъезд назад больше не срывается из-за собственного прицепа и идёт ровно, без складывания.
 
 script_name('lua_afk')
 script_author('denismaslov769-lab')
-script_version('2.5.27')
+script_version('2.5.28')
 
 local imgui    = require('mimgui')
 local encoding = require('encoding')
@@ -17,7 +17,7 @@ local hasSampev, sampev = pcall(require, 'lib.samp.events')
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 
-local SCRIPT_VERSION = '2.5.27'
+local SCRIPT_VERSION = '2.5.28'
 local REPO       = 'denismaslov769-lab/lua_afk'
 local SCRIPT_URL = 'https://raw.githubusercontent.com/' .. REPO .. '/main/lua_afk.lua'
 local API_COMMIT = 'https://api.github.com/repos/' .. REPO .. '/commits/main'
@@ -485,10 +485,12 @@ end
 local function senseRear(car)
     local g = geo(car)
     local h, b = g.half - 0.2, -(g.back + 0.2)
+    -- с прицепом луч назад всегда упирается в свой прицеп - машины не считаем
+    local cars = not (bot.job and bot.job.hooked)
     local s = {
-        bl = cast(car, -h, b, -h * 1.15, b - 4, true),
-        bc = cast(car, 0, b, 0, b - 4, true),
-        br = cast(car, h, b, h * 1.15, b - 4, true),
+        bl = cast(car, -h, b, -h * 1.15, b - 4, cars),
+        bc = cast(car, 0, b, 0, b - 4, cars),
+        br = cast(car, h, b, h * 1.15, b - 4, cars),
     }
     for _, sd in ipairs({ -1, 1 }) do
         local ox, oy = sd * (g.half + 0.15), -(g.back - 0.3)
@@ -1440,7 +1442,13 @@ local function botControl(car, tx, ty, tz, dist)
         if now > rc.till or (rearGap and rearGap < 0.8) or stalled then
             bot.recover, bot.wx, bot.nextPlan = nil, nil, 0
         else
-            keys(rc.steer, 0, (speed < 3.5) and 0.6 or 0)
+            local rs, rv = rc.steer, 3.5
+            if bot.job and bot.job.hooked and bot.job.given and doesVehicleExist(bot.job.given) then
+                -- с прицепом: назад медленно и так, чтобы прицеп шёл ровно
+                local tx0, ty0 = getCarCoordinates(bot.job.given)
+                rs, rv = clamp(toLocal(car, tx0, ty0) / 1.2, -1, 1), 1.5
+            end
+            keys(rs, 0, (speed < rv) and 0.6 or 0)
             bot.status = 'Отъезжаю от препятствия'
             bot.bestTime = now
             return
@@ -1572,6 +1580,42 @@ local function botControl(car, tx, ty, tz, dist)
     if s.fc then
         v = math.min(v, math.sqrt(2 * decel * math.max(0, s.fc - stopGap)))
         danger = s.fc < stopGap + 2
+    end
+    -- Преграда прямо по курсу, а мы почти стоим - не ждём вечно: смотрим косыми
+    -- лучами, где свободнее, и медленно объезжаем в ту сторону
+    if s.fc and s.fc < stopGap + 3 and speed < 1.5 then
+        local g0 = geo(car)
+        local f0 = g0.front + 0.2
+        local function freeAt(sd)
+            local best
+            for _, ang in ipairs({ 30, 50 }) do
+                local r = math.rad(ang)
+                local d = cast(car, sd * (g0.half - 0.2), f0, sd * (g0.half - 0.2) + sd * math.sin(r) * 12, f0 + math.cos(r) * 12, true)
+                best = math.max(best or 0, d or 12)
+            end
+            return best
+        end
+        local fl, fr = freeAt(-1), freeAt(1)
+        local sd = (fr > fl + 0.5) and 1 or (fl > fr + 0.5) and -1 or nil
+        if not sd then
+            -- одинаково: в сторону цели
+            local glx = toLocal(car, goalX, goalY)
+            sd = glx >= 0 and 1 or -1
+        end
+        local room = (sd > 0) and fr or fl
+        if room > s.fc + 2 and room > 4 then
+            bot.detour = { sd = sd, till = now + 2.5 }
+        end
+    end
+    if bot.detour then
+        if now > bot.detour.till or (not s.fc and now > bot.detour.till - 1.5) then
+            bot.detour = nil
+        else
+            steer = bot.detour.sd
+            v = math.max(math.min(v, 3), 2)
+            danger = false
+            bot.status = 'Объезжаю препятствие'
+        end
     end
     -- Боковые лучи бампера - немного сбавить и подрулить
     local side = minOf(s.fl, s.fr)
